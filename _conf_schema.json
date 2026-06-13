@@ -1,0 +1,20 @@
+{
+  "max_content_length": {
+    "description": "单条记录最大字符数",
+    "type": "int",
+    "default": 500,
+    "hint": "超长文本会被截断存储。"
+  },
+  "auto_cleanup_days": {
+    "description": "自动清理天数",
+    "type": "int",
+    "default": 0,
+    "hint": "自动删除超过此天数的记录。0 表示不清理。"
+  },
+  "debug_mode": {
+    "description": "调试模式",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 debug 日志以 info 级别输出。"
+  }
+}
