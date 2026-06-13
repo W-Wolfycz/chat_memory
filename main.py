@@ -100,6 +100,7 @@ class ChatMemoryPlugin(Star):
 
     @filter.on_llm_request()
     async def capture_user(self, event: AstrMessageEvent, req: ProviderRequest):
+        """LLM请求前提取用户消息文本，暂存到event extras（延迟到BOT回复时写入）"""
         if event.get_extra("chat_memory_captured"):
             return
 
@@ -126,6 +127,7 @@ class ChatMemoryPlugin(Star):
 
     @filter.on_decorating_result(priority=10)
     async def capture_bot(self, event: AstrMessageEvent):
+        """LLM回复确认有效后成对写入user+assistant消息，并检测/reset与/new命令"""
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
