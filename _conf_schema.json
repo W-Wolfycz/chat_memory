@@ -3,7 +3,7 @@
     "description": "单条记录最大字符数",
     "type": "int",
     "default": 500,
-    "hint": "超长文本会被截断存储。"
+    "hint": "超长文本会被截断存储。0 表示不限制（存储全文）。"
   },
   "auto_cleanup_days": {
     "description": "自动清理天数",
@@ -11,10 +11,23 @@
     "default": 0,
     "hint": "自动删除超过此天数的记录。0 表示不清理。"
   },
-  "debug_mode": {
-    "description": "调试模式",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后 debug 日志以 info 级别输出。"
+  "log_config": {
+    "description": "日志配置",
+    "type": "object",
+    "hint": "控制日志前缀格式与调试级别。",
+    "items": {
+      "log_with_bot_id": {
+        "description": "日志区分机器人实例",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，日志前缀从 [ChatMemory] 变为 [ChatMemory:机器人ID]，便于多 Bot 实例环境下定位问题。"
+      },
+      "debug_to_info": {
+        "description": "调试日志提级",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，所有 debug 级别日志以 info 级别输出，无需调整后端日志级别即可查看详细运行信息。"
+      }
+    }
   }
 }

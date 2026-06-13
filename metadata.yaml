@@ -2,3 +2,4 @@ name: chat_memory
 description: 独立对话记录存档，以 UMO + 用户ID 为维度存储对话历史，暴露查询接口供其他插件调用。
 version: 1.0.0
 author: Wolfycz
+repo: "https://github.com/W-Wolfycz/chat_memory"

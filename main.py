@@ -46,19 +46,35 @@ class ChatMemoryPlugin(Star):
 
         global _db, _max_len
 
-        self.max_len = max(1, config.get("max_content_length", 500))
+        self.max_len = config.get("max_content_length", 500)
         self.auto_cleanup_days = config.get("auto_cleanup_days", 0)
-        self.debug_mode = config.get("debug_mode", False)
 
-        data_dir = Path(context.get_data_dir()) / "chat_memory"
+        log_conf = config.get("log_config", {})
+        self.log_with_bot_id = log_conf.get("log_with_bot_id", False)
+        self.debug_to_info = log_conf.get("debug_to_info", False)
+
+        data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
         self.db = DBManager(data_dir)
         _db = self.db
         _max_len = self.max_len
 
         logger.info("[ChatMemory] 对话记录存档已启用")
 
+    def _tag(self, event=None) -> str:
+        if self.log_with_bot_id and event is not None:
+            try:
+                return f"[ChatMemory:{event.get_platform_id()}]"
+            except Exception:
+                pass
+        return "[ChatMemory]"
+
+    def _truncate(self, text: str) -> str:
+        if self.max_len <= 0:
+            return text
+        return text[:self.max_len]
+
     def _log(self, msg: str):
-        if self.debug_mode:
+        if self.debug_to_info:
             logger.info(msg)
         else:
             logger.debug(msg)
@@ -104,7 +120,7 @@ class ChatMemoryPlugin(Star):
         event.set_extra("chat_memory_cid", cid)
         event.set_extra("chat_memory_umo", umo)
         event.set_extra("chat_memory_uid", user_id)
-        event.set_extra("chat_memory_user_text", user_text[: self.max_len])
+        event.set_extra("chat_memory_user_text", self._truncate(user_text))
 
     # ── 捕获 BOT 回复 + 检测 reset/new ──────────────────
 
@@ -140,11 +156,11 @@ class ChatMemoryPlugin(Star):
 
         if user_text:
             asyncio.create_task(self._safe_insert(umo, cid, user_id, "user", user_text))
-            self._log(f"[ChatMemory] user -> {user_id}@{cid[:8]}: {user_text[:60]}...")
+            self._log(f"{self._tag(event)} user -> {user_id}@{cid[:8]}: {user_text[:60]}...")
 
-        content = bot_text[: self.max_len]
+        content = self._truncate(bot_text)
         asyncio.create_task(self._safe_insert(umo, cid, user_id, "assistant", content))
-        self._log(f"[ChatMemory] bot -> {user_id}@{cid[:8]}: {content[:60]}...")
+        self._log(f"{self._tag(event)} bot -> {user_id}@{cid[:8]}: {content[:60]}...")
 
     # ── reset / new 处理 ─────────────────────────────
 
@@ -169,10 +185,10 @@ class ChatMemoryPlugin(Star):
             # /reset: CID 不变，清空该对话存档
             deleted = await self.db.delete_by_conversation(umo, cid)
             if deleted > 0:
-                logger.info(f"[ChatMemory] /reset（CID={cid[:8]}），清除 {deleted} 条存档记录")
+                logger.info(f"{self._tag(event)} /reset（CID={cid[:8]}），清除 {deleted} 条存档记录")
         else:
             # /new: 新 CID 已创建，旧记录自然保留，无需操作
-            self._log(f"[ChatMemory] /new（CID={cid[:8]}），新对话开始")
+            self._log(f"{self._tag(event)} /new（CID={cid[:8]}），新对话开始")
 
     # ── 公开实例方法（供 context.get_registered_star 调用）───
 
