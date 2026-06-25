@@ -1,13 +1,14 @@
 # ChatMemory
 
-独立对话记录存档插件。以 `UMO + conversation_id + user_id` 为维度，将每轮对话的文本存入本地 SQLite 数据库，不干预 AstrBot 自带的上下文管理，仅存档 + 暴露查询接口供其他插件调用。
+独立对话记录存档插件。以 `UMO + conversation_id + user_id` 为维度，将每轮对话的文本存入本地 SQLite 数据库，不干预 AstrBot 自带的上下文管理，仅存档 + 暴露查询接口供其他插件调用。查询接口既支持按用户隔离读取（私聊/单用户上下文），也支持按整群会话读取（群聊场景下混合所有发言人的历史）。
 
 ## 特性
 
 - **零干预**：不修改 AstrBot 的上下文传递链路，纯旁路存档
 - **成对写入**：用户消息与 BOT 回复在 `on_decorating_result` 阶段成对落库，避免单边记录（BOT 回复中断时丢弃整轮）
 - **命令感知**：自动识别 `/reset`（清空当前 CID 存档）与 `/new`（保留旧 CID 记录）
-- **双接口**：既支持模块级 `import`，也支持 `context.get_registered_star()` 实例方法调用
+- **双维度查询**：`user_id` 传值时按用户过滤；为空时返回整群混合历史（群聊上下文场景）。返回的每条记录都带 `user_id` 字段，便于区分发言人
+- **跨插件查询**：通过 `context.get_registered_star("chat_memory")` 暴露查询接口
 
 ## 工作机制
 
@@ -58,34 +59,51 @@ CREATE TABLE chat_memory_records (
 
 ## 供其他插件调用
 
-### 方式一：模块级 import
+> ⚠️ **不要直接 `from chat_memory.main import ...`**：AstrBot 的插件加载机制不保证模块级 import 可用（实测多数环境下会失败）。统一用下方 `get_registered_star` 的方式。
+
+### 推荐：实例方法（通过 `get_registered_star`）
 
 ```python
-from chat_memory.main import query_history, query_latest, count_records
+def _resolve_chat_memory(context):
+    """定位 chat_memory 插件实例。AstrBot 注册表 → sys.modules fallback。"""
+    try:
+        star = context.get_registered_star("chat_memory")
+        if star is not None:
+            # 不同 AstrBot 版本包装层级可能不同，依次尝试
+            for candidate in (star, getattr(star, "star", None), getattr(star, "star_cls", None)):
+                if candidate is not None and hasattr(candidate, "query_history"):
+                    return candidate
+    except Exception:
+        pass
+    import sys
+    mod = sys.modules.get("chat_memory.main") or sys.modules.get("chat_memory")
+    if mod is not None and hasattr(mod, "query_history"):
+        return mod
+    return None
 
-history = await query_history(umo, conversation_id, user_id, limit=20)
-# 返回 [{"role": "user", "content": "...", "created_at": "..."}, ...]
-```
 
-### 方式二：实例方法（通过 `get_registered_star`）
-
-```python
-star = context.get_registered_star("chat_memory")
-if star:
-    plugin = star.star_cls
-    history = await plugin.query_history(umo, conversation_id, user_id, limit=20)
-    count = await plugin.count_records(umo, conversation_id, user_id)
+cm = _resolve_chat_memory(context)
+if cm is not None:
+    # 查指定用户的历史
+    history = await cm.query_history(umo, conversation_id, user_id, limit=20)
+    # 群聊场景：不传 user_id 即可拿整群所有用户的混合历史
+    group_history = await cm.query_history(umo, conversation_id, limit=20)
+    count = await cm.count_records(umo, conversation_id, user_id)
 ```
 
 ### API 一览
 
 | 函数 | 参数 | 返回 |
 |---|---|---|
-| `query_history` | `umo, conversation_id, user_id, limit=20` | `list[dict]`，按时间正序 |
-| `query_latest` | `umo, conversation_id, user_id, limit=10` | `list[dict]`，最近 N 条 |
-| `count_records` | `umo, conversation_id, user_id` | `int` |
+| `query_history` | `umo, conversation_id, user_id=None, limit=20` | `list[dict]`，按时间正序 |
+| `query_latest` | `umo, conversation_id, user_id=None, limit=10` | `list[dict]`，最近 N 条 |
+| `count_records` | `umo, conversation_id, user_id=None` | `int` |
 
-每条记录格式：`{"role": "user"|"assistant", "content": str, "created_at": str}`
+**`user_id` 行为**：传值时按该用户过滤；为 `None` / 空字符串时**不按用户过滤**，返回该会话下所有用户的混合记录（群聊场景：整个群的历史）。
+
+每条记录格式：`{"role": "user"|"assistant", "content": str, "user_id": str, "created_at": str}`
+
+`user_id` 字段始终存在（即使按用户过滤时也带回），便于调用方区分发言人；老代码只读 `role` / `content` 不受影响（**纯增字段，向后兼容**）。
 
 ## 依赖
 

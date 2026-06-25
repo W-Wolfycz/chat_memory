@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.0 — 2026-06-26
+
+### 新增
+
+- **群聊场景：按会话维度查询**。`query_history` / `query_latest` / `count_records` 的 `user_id` 参数改为可选（默认 `None`），为空时返回该会话下**所有用户**的混合记录（不再按用户过滤）。群聊场景下整群共享一个 `(umo, conversation_id)`，便于插件拉取整个群的对话上下文。
+- 返回 dict 新增 `user_id` 字段（始终存在），便于调用方区分发言人。
+
+### 变更
+
+- **README 调整推荐调用方式**：移除模块级 `from chat_memory.main import ...` 推荐路径。AstrBot 的插件加载机制不保证模块级 import 可用（实测多数环境下失败），统一推荐 `context.get_registered_star("chat_memory")` + `sys.modules` fallback 的稳健解析方式。
+
+### 兼容性
+
+- **纯增字段、向后兼容**，可平滑升级：
+  - 老调用方按位置或关键字传 `user_id` 仍正常工作，行为完全不变（仍按用户过滤）
+  - 返回 dict 只多了 `user_id` 字段，老代码用 `record.get("role")` / `record.get("content")` / `record.get("created_at")` 完全不受影响
+
+### 内部
+
+- `query_latest` / `query` 在 `user_id` 为空时跳过 `WHERE user_id = ?` 条件，复用同一索引前缀 `(umo, conversation_id)`
+- `count` 在 `user_id` 为空时直接转调既有的 `count_conversation`，避免重复 SQL
+
 ## 1.0.0 — 2026-06-13
 
 ### 新增

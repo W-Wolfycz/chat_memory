@@ -19,22 +19,34 @@ _db: Optional[DBManager] = None
 _max_len: int = 500
 
 
-async def query_history(umo: str, conversation_id: str, user_id: str, limit: int = 20) -> list[dict]:
-    """查询指定用户在指定会话+对话的对话历史。返回 [{role, content, created_at}, ...]"""
+async def query_history(
+    umo: str, conversation_id: str, user_id: Optional[str] = None, limit: int = 20
+) -> list[dict]:
+    """查询指定会话+对话的对话历史。
+
+    ``user_id`` 为 None / 空字符串时不按用户过滤，返回该会话下**所有用户**的混合记录
+    （群聊场景：整个群的历史）。返回的每条记录都带 ``user_id`` 字段，便于区分发言人。
+
+    返回：[{"role": "user"|"assistant", "content": str, "user_id": str, "created_at": str}, ...]
+    """
     if _db is None:
         return []
     return await _db.query_latest(umo, conversation_id, user_id, limit)
 
 
-async def query_latest(umo: str, conversation_id: str, user_id: str, limit: int = 10) -> list[dict]:
-    """查询最近 N 条记录。"""
+async def query_latest(
+    umo: str, conversation_id: str, user_id: Optional[str] = None, limit: int = 10
+) -> list[dict]:
+    """查询最近 N 条记录。``user_id`` 为空时返回该会话所有用户的混合记录。"""
     if _db is None:
         return []
     return await _db.query_latest(umo, conversation_id, user_id, limit)
 
 
-async def count_records(umo: str, conversation_id: str, user_id: str) -> int:
-    """统计记录数。"""
+async def count_records(
+    umo: str, conversation_id: str, user_id: Optional[str] = None
+) -> int:
+    """统计记录数。``user_id`` 为空时返回该会话所有用户的总数。"""
     if _db is None:
         return 0
     return await _db.count(umo, conversation_id, user_id)
@@ -194,13 +206,20 @@ class ChatMemoryPlugin(Star):
 
     # ── 公开实例方法（供 context.get_registered_star 调用）───
 
-    async def query_history(self, umo: str, conversation_id: str, user_id: str, limit: int = 20) -> list[dict]:
+    async def query_history(
+        self, umo: str, conversation_id: str, user_id: Optional[str] = None, limit: int = 20
+    ) -> list[dict]:
+        """查询会话历史。``user_id`` 为空时返回该会话所有用户的混合记录（群聊场景）。"""
         return await self.db.query_latest(umo, conversation_id, user_id, limit)
 
-    async def query_latest(self, umo: str, conversation_id: str, user_id: str, limit: int = 10) -> list[dict]:
+    async def query_latest(
+        self, umo: str, conversation_id: str, user_id: Optional[str] = None, limit: int = 10
+    ) -> list[dict]:
         return await self.db.query_latest(umo, conversation_id, user_id, limit)
 
-    async def count_records(self, umo: str, conversation_id: str, user_id: str) -> int:
+    async def count_records(
+        self, umo: str, conversation_id: str, user_id: Optional[str] = None
+    ) -> int:
         return await self.db.count(umo, conversation_id, user_id)
 
     # ── 内部工具 ──────────────────────────────────────

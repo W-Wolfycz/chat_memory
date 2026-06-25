@@ -64,21 +64,36 @@ class DBManager:
             await session.commit()
 
     async def query_latest(
-        self, umo: str, conversation_id: str, user_id: str, limit: int = 20
+        self, umo: str, conversation_id: str, user_id: Optional[str] = None, limit: int = 20
     ) -> list[dict]:
+        """查询最近 N 条记录。
+
+        ``user_id`` 为 None / 空字符串时不按用户过滤，返回该会话下**所有用户**的混合记录
+        （群聊场景：整个群的历史）。返回的每条记录都带 ``user_id`` 字段，便于区分发言人。
+        """
         await self.init_db()
         async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT role, content, created_at FROM chat_memory_records "
-                    "WHERE umo = :umo AND conversation_id = :cid AND user_id = :uid "
-                    "ORDER BY created_at DESC LIMIT :lim"
-                ),
-                {"umo": umo, "cid": conversation_id, "uid": user_id, "lim": limit},
-            )
+            if user_id:
+                result = await session.execute(
+                    text(
+                        "SELECT role, content, user_id, created_at FROM chat_memory_records "
+                        "WHERE umo = :umo AND conversation_id = :cid AND user_id = :uid "
+                        "ORDER BY created_at DESC LIMIT :lim"
+                    ),
+                    {"umo": umo, "cid": conversation_id, "uid": user_id, "lim": limit},
+                )
+            else:
+                result = await session.execute(
+                    text(
+                        "SELECT role, content, user_id, created_at FROM chat_memory_records "
+                        "WHERE umo = :umo AND conversation_id = :cid "
+                        "ORDER BY created_at DESC LIMIT :lim"
+                    ),
+                    {"umo": umo, "cid": conversation_id, "lim": limit},
+                )
             rows = result.fetchall()
             return [
-                {"role": r[0], "content": r[1], "created_at": str(r[2])}
+                {"role": r[0], "content": r[1], "user_id": r[2], "created_at": str(r[3])}
                 for r in reversed(rows)
             ]
 
@@ -86,15 +101,19 @@ class DBManager:
         self,
         umo: str,
         conversation_id: str,
-        user_id: str,
+        user_id: Optional[str] = None,
         limit: int = 20,
         role: Optional[str] = None,
         before: Optional[datetime] = None,
         after: Optional[datetime] = None,
     ) -> list[dict]:
+        """带可选过滤条件的查询。``user_id`` 为 None / 空字符串时不按用户过滤。"""
         await self.init_db()
-        conditions = ["umo = :umo", "conversation_id = :cid", "user_id = :uid"]
-        params: dict = {"umo": umo, "cid": conversation_id, "uid": user_id, "lim": limit}
+        conditions = ["umo = :umo", "conversation_id = :cid"]
+        params: dict = {"umo": umo, "cid": conversation_id, "lim": limit}
+        if user_id:
+            conditions.append("user_id = :uid")
+            params["uid"] = user_id
         if role:
             conditions.append("role = :role")
             params["role"] = role
@@ -108,14 +127,14 @@ class DBManager:
         async with self.async_session() as session:
             result = await session.execute(
                 text(
-                    f"SELECT role, content, created_at FROM chat_memory_records "
+                    f"SELECT role, content, user_id, created_at FROM chat_memory_records "
                     f"WHERE {where} ORDER BY created_at DESC LIMIT :lim"
                 ),
                 params,
             )
             rows = result.fetchall()
             return [
-                {"role": r[0], "content": r[1], "created_at": str(r[2])}
+                {"role": r[0], "content": r[1], "user_id": r[2], "created_at": str(r[3])}
                 for r in reversed(rows)
             ]
 
@@ -132,8 +151,11 @@ class DBManager:
             )
             return result.scalar() or 0
 
-    async def count(self, umo: str, conversation_id: str, user_id: str) -> int:
+    async def count(self, umo: str, conversation_id: str, user_id: Optional[str] = None) -> int:
+        """统计记录数。``user_id`` 为 None / 空字符串时返回该会话所有用户的总数。"""
         await self.init_db()
+        if not user_id:
+            return await self.count_conversation(umo, conversation_id)
         async with self.async_session() as session:
             result = await session.execute(
                 text(
