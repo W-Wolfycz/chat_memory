@@ -3,7 +3,7 @@
     "description": "单条记录最大字符数",
     "type": "int",
     "default": 500,
-    "hint": "超长文本会被截断存储。0 表示不限制（存储全文）。"
+    "hint": "超长文本会被截断存储。0 表示不限制。"
   },
   "auto_cleanup_days": {
     "description": "自动清理天数",
@@ -20,13 +20,64 @@
         "description": "日志区分机器人实例",
         "type": "bool",
         "default": false,
-        "hint": "启用后，日志前缀从 [ChatMemory] 变为 [ChatMemory:机器人ID]，便于多 Bot 实例环境下定位问题。"
+        "hint": "启用后日志前缀附加机器人 ID，多 Bot 实例环境下便于定位。"
       },
       "debug_to_info": {
         "description": "调试日志提级",
         "type": "bool",
         "default": false,
-        "hint": "启用后，所有 debug 级别日志以 info 级别输出，无需调整后端日志级别即可查看详细运行信息。"
+        "hint": "启用后 debug 日志以 info 级别输出。"
+      }
+    }
+  },
+  "context_takeover": {
+    "description": "上下文接管",
+    "type": "object",
+    "hint": "让 CM 接管对话上下文，跨重启 / 跨会话 / 跨用户保留完整记忆。",
+    "items": {
+      "enable": {
+        "description": "启用接管",
+        "type": "bool",
+        "default": false,
+        "hint": "总开关。关闭后仅存档，不干预 LLM 请求。"
+      },
+      "cross_session": {
+        "description": "跨群会话",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，本 bot 在其他群 / 私聊的同用户对话也会进入上下文（按 UMO + user 聚合，/new 后仍记得旧话题）。"
+      },
+      "full_group": {
+        "description": "整群消息",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，群内其他人的发言也会进入上下文（仅对群聊生效，私聊自动忽略）。昵称会作为前缀注入。"
+      },
+      "limit_rounds": {
+        "description": "注入轮数",
+        "type": "int",
+        "default": 30,
+        "hint": "注入最近多少轮对话给 LLM。"
+      },
+      "llm_status_filter": {
+        "description": "状态过滤",
+        "type": "list",
+        "options": ["llm_success", "llm_pending", "no_llm", "proactive", "orphan"],
+        "default": ["llm_success"],
+        "hint": "选哪些状态的消息进入上下文。详见 README 状态过滤章节。"
+      },
+      "prefix_enhance": {
+        "description": "前缀增强",
+        "type": "string",
+        "default": "time_sender",
+        "options": ["off", "time", "sender", "time_sender"],
+        "hint": "给每条 user 消息加前缀。off=不加；time=[HH:MM]；sender=昵称:；time_sender=两者都加（默认）。合并连发时各条原始消息仍保留各自前缀。"
+      },
+      "clear_native_history": {
+        "description": "清理原生历史",
+        "type": "bool",
+        "default": true,
+        "hint": "每轮清空系统自带的对话历史，避免重复。建议保持开启。"
       }
     }
   }

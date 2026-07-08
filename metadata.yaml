@@ -1,5 +1,5 @@
 name: chat_memory
-description: 独立对话记录存档，以 UMO + conversation_id + 用户ID 为维度存储全量对话文本，按 tag 标识消息成因/形态（含 LLM 状态、纯媒体、平台缺 mid、主动消息、漏存等），暴露查询接口供其他插件调用。
-version: 2.0.0
+description: 独立对话记录存档，以 UMO + conversation_id + 用户ID 为维度存储全量对话文本，双列状态（llm_status 描述 LLM 路径，content_kind JSON 数组描述内容形态），暴露查询接口供其他插件调用。
+version: 2.3.1
 author: Wolfycz
 repo: "https://github.com/W-Wolfycz/chat_memory"

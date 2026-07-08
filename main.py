@@ -1,15 +1,21 @@
-"""ChatMemory — 独立对话记录存档，以 UMO + conversation_id + 用户ID 为维度存储对话文本。
+"""ChatMemory — 独立对话记录存档。
 
-存储设计：每条记录带 ``message_id``（平台消息 id），assistant 记录额外带 ``pair_id``
-（= 对应 user 的 message_id），``tag`` 字段标识消息的成因/形态：
+每条记录带两个独立维度的状态字段：
 
-- ``non_llm``       非 LLM 路径（命令、插件直发、未回复等）
-- ``llm_pending``   LLM 触发但 assistant 未成功（孤儿，仅 user 侧出现）
-- ``llm_success``   LLM 路径且 assistant 成功回复（user 与 assistant 双侧同步）
-- ``media_only``    纯媒体消息（终态，走 LLM 后保持，不参与 llm_pending/llm_success 流转）
-- ``no_message_id`` 平台未给 message_id（user 与 assistant 都标此值，无法 pair_id 配对）
-- ``proactive``     主动消息（无前置 user 事件）
-- ``orphan``        user 漏存（DB 写入失败）但 assistant 来了
+- ``llm_status``：LLM 配对状态（单值，``''`` = 默认/未走 LLM）
+  - ``''``            默认（命令、插件 ``set_result``、纯媒体等）
+  - ``'llm_pending'`` LLM 触发但 assistant 未成功（孤儿 user）
+  - ``'llm_success'`` LLM 路径且 assistant 成功回复（user 与 assistant 双侧同步）
+  - ``'proactive'``   主动消息（assistant 单边，含 cron）
+  - ``'orphan'``      user 漏存（DB 写入失败）但 assistant 来了
+
+- ``content_kind``：消息内容形态（JSON 数组，可多值）
+  - ``'text'`` / ``'image'`` / ``'video'`` / ``'voice'`` / ``'file'``
+    / ``'face'`` / ``'forward'`` / ``'system_event'``
+  - ``[]`` 空数组 = empty（如纯 @ 无文字、纯 Reply 无文字）
+  - ``'at'`` / ``'reply'`` 不入 content_kind，用独立字段 ``at_id`` / ``reply_id`` 表达
+
+assistant 配对：``pair_id`` = 对应 user 的 ``message_id``；平台无 mid 时 NULL，无法配对。
 """
 
 import asyncio
@@ -22,17 +28,31 @@ from astrbot.api.star import Star, Context
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import (
+    Plain, Image, Video, Record, File, Face, At, AtAll, Reply, Forward,
+)
 
 from .storage import DBManager
 
-_TAG_NON_LLM = "non_llm"
-_TAG_LLM_PENDING = "llm_pending"
-_TAG_LLM_SUCCESS = "llm_success"
-_TAG_MEDIA_ONLY = "media_only"
-_TAG_NO_MID = "no_message_id"
-_TAG_PROACTIVE = "proactive"
-_TAG_ORPHAN = "orphan"
+# ── llm_status 取值 ─────────────────────────────────
+_LLM_DEFAULT = ""              # 默认（未走 LLM）
+_LLM_PENDING = "llm_pending"   # LLM 触发但 assistant 未成功
+_LLM_SUCCESS = "llm_success"   # LLM 路径且成功
+_LLM_PROACTIVE = "proactive"   # 主动消息（assistant 单边）
+_LLM_ORPHAN = "orphan"         # user 漏存
+
+# ── content_kind 取值 ───────────────────────────────
+_K_TEXT = "text"
+_K_IMAGE = "image"
+_K_VIDEO = "video"
+_K_VOICE = "voice"
+_K_FILE = "file"
+_K_FACE = "face"
+_K_FORWARD = "forward"
+_K_SYSTEM = "system_event"
+
+# 接管时需过滤的媒体 kind 集合（不含 system_event / 空数组）
+_MEDIA_KINDS = {_K_IMAGE, _K_VIDEO, _K_VOICE, _K_FILE, _K_FACE, _K_FORWARD}
 
 
 class ChatMemoryPlugin(Star):
@@ -46,6 +66,21 @@ class ChatMemoryPlugin(Star):
         self.log_with_bot_id = log_conf.get("log_with_bot_id", False)
         self.debug_to_info = log_conf.get("debug_to_info", False)
 
+        ct_conf = config.get("context_takeover", {}) or {}
+        self.ct_enable = bool(ct_conf.get("enable", False))
+        self.ct_cross_session = bool(ct_conf.get("cross_session", False))
+        self.ct_full_group = bool(ct_conf.get("full_group", False))
+        self.ct_limit_rounds = int(ct_conf.get("limit_rounds", 30))
+        self.ct_clear_native_history = bool(ct_conf.get("clear_native_history", True))
+        ct_status = ct_conf.get("llm_status_filter", ["llm_success"])
+        # "no_llm" 是 UI 占位符，DB 实际值是空串 ""
+        ct_status_list = list(ct_status) if ct_status else ["llm_success"]
+        self.ct_llm_status_filter = ["" if s == "no_llm" else s for s in ct_status_list]
+        self.ct_prefix_enhance = str(ct_conf.get("prefix_enhance", "time_sender"))
+        # 硬编码常开：drop_media 与 merge_consecutive 不暴露配置
+        self.ct_drop_media = True
+        self.ct_merge_consecutive = True
+
         data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
         self.db = DBManager(data_dir)
 
@@ -58,6 +93,19 @@ class ChatMemoryPlugin(Star):
             else "自动清理关闭"
         )
         logger.info(f"[ChatMemory] 对话记录存档已启用（{cleanup_desc}）")
+
+        if self.ct_enable:
+            modes = []
+            if self.ct_cross_session:
+                modes.append("cross_session")
+            if self.ct_full_group:
+                modes.append("full_group")
+            mode_repr = "+".join(modes) if modes else "standard"
+            logger.info(
+                f"[ChatMemory] 上下文接管已启用 "
+                f"(mode={mode_repr}, limit={self.ct_limit_rounds}, "
+                f"clear_native={self.ct_clear_native_history})"
+            )
 
     # ── 自动清理 ─────────────────────────────────────
 
@@ -124,23 +172,80 @@ class ChatMemoryPlugin(Star):
         return getattr(event, "message_str", "") or ""
 
     @staticmethod
-    def _is_media_only(event: AstrMessageEvent) -> bool:
-        """检测纯媒体消息：有非 Plain 组件，且 Plain 文本拼起来为空。"""
+    def _classify_content(event: AstrMessageEvent) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
+        """从 message_chain 提取内容形态分类 + 上下文引用字段。
+
+        返回 ``(content_kind, at_id, reply_id, forward_id)``：
+        - ``content_kind``：去重后的 kind 列表（保持首次出现顺序）
+        - ``at_id`` / ``reply_id`` / ``forward_id``：对应组件的 ID（无则 None）
+
+        组件白名单：Plain/Image/Video/Record/File/Face/Forward 入 content_kind；
+        At/Reply 不入 kind，单独提取 ID；其他组件（AtAll/Poke/Json/Unknown 等）忽略。
+
+        OTHER_MESSAGE 类型（poke / 请求 / 通知）：强制 content_kind=['system_event']，覆盖其他形态。
+        """
         chain = getattr(event, "message_chain", None) or []
-        if not chain:
-            return False
-        has_text = any(isinstance(c, Plain) and (c.text or "").strip() for c in chain)
-        has_media = any(not isinstance(c, Plain) for c in chain)
-        return has_media and not has_text
+        kind: list[str] = []
+        at_id: Optional[str] = None
+        reply_id: Optional[str] = None
+        forward_id: Optional[str] = None
+
+        def _push(k: str):
+            if k not in kind:
+                kind.append(k)
+
+        for comp in chain:
+            if isinstance(comp, Plain):
+                if (comp.text or "").strip():
+                    _push(_K_TEXT)
+            elif isinstance(comp, Image):
+                _push(_K_IMAGE)
+            elif isinstance(comp, Video):
+                _push(_K_VIDEO)
+            elif isinstance(comp, Record):
+                _push(_K_VOICE)
+            elif isinstance(comp, File):
+                _push(_K_FILE)
+            elif isinstance(comp, Face):
+                _push(_K_FACE)
+            elif isinstance(comp, Forward):
+                _push(_K_FORWARD)
+                if forward_id is None:
+                    fid = getattr(comp, "id", None)
+                    if fid:
+                        forward_id = str(fid)
+            elif isinstance(comp, AtAll):
+                # @全体成员：不入 at_id（避免 caller 误以为是 at 某个 ID）
+                pass
+            elif isinstance(comp, At):
+                if at_id is None:
+                    qq = getattr(comp, "qq", None)
+                    if qq:
+                        at_id = str(qq)
+            elif isinstance(comp, Reply):
+                if reply_id is None:
+                    rid = getattr(comp, "id", None)
+                    if rid:
+                        reply_id = str(rid)
+            # 其他组件（AtAll / Poke / Json / Unknown 等）忽略
+
+        # OTHER_MESSAGE（poke / 加好友请求 / 通知等）：强制 system_event
+        try:
+            mt = event.get_message_type()
+            mt_value = getattr(mt, "value", str(mt))
+            if mt_value == "OtherMessage":
+                kind = [_K_SYSTEM]
+        except Exception:
+            pass
+
+        return kind, at_id, reply_id, forward_id
 
     @staticmethod
-    def _media_placeholder(event: AstrMessageEvent) -> str:
-        """纯媒体消息的占位 content，取第一个非 Plain 组件的类型名。"""
-        chain = getattr(event, "message_chain", None) or []
-        for c in chain:
-            if not isinstance(c, Plain):
-                return f"[{type(c).__name__}]"
-        return "[media]"
+    def _content_placeholder(kind: list[str]) -> str:
+        """非文本内容的占位字符串（取第一个 kind）。"""
+        if not kind:
+            return ""
+        return f"[{kind[0]}]"
 
     async def _get_curr_cid(self, umo: str) -> str:
         try:
@@ -155,6 +260,69 @@ class ChatMemoryPlugin(Star):
         if msg_obj is None:
             return ""
         return getattr(msg_obj, "message_id", "") or ""
+
+    @staticmethod
+    def _parse_umo(umo: str) -> tuple[str, str, str]:
+        """拆 ``platform_id:MessageType:session_id`` 三段。"""
+        if not umo:
+            return "", "", ""
+        parts = umo.split(":", 2)
+        if len(parts) != 3:
+            return "", "", ""
+        return parts[0], parts[1], parts[2]
+
+    @staticmethod
+    def _get_group_id(event: AstrMessageEvent) -> str:
+        try:
+            return event.get_group_id() or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _get_sender_nickname(event: AstrMessageEvent) -> str:
+        try:
+            return event.get_sender_name() or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _get_self_id(event: AstrMessageEvent) -> str:
+        msg_obj = getattr(event, "message_obj", None)
+        if msg_obj is None:
+            return ""
+        return getattr(msg_obj, "self_id", "") or ""
+
+    @staticmethod
+    def _get_platform_name(event: AstrMessageEvent) -> str:
+        try:
+            return event.get_platform_name() or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _get_raw_timestamp(event: AstrMessageEvent) -> Optional[int]:
+        msg_obj = getattr(event, "message_obj", None)
+        if msg_obj is None:
+            return None
+        ts = getattr(msg_obj, "timestamp", None)
+        if isinstance(ts, (int, float)) and ts > 0:
+            return int(ts)
+        return None
+
+    def _collect_audit_fields(self, event: AstrMessageEvent) -> dict:
+        """从 event 提取审计/上下文字段，供 INSERT 使用。"""
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        platform_id, message_type, session_id = self._parse_umo(umo)
+        return {
+            "platform_id": platform_id,
+            "platform_name": self._get_platform_name(event),
+            "message_type": message_type,
+            "session_id": session_id,
+            "self_id": self._get_self_id(event),
+            "group_id": self._get_group_id(event),
+            "sender_nickname": self._get_sender_nickname(event),
+            "raw_timestamp": self._get_raw_timestamp(event),
+        }
 
     # ── 用户消息捕获（核心逻辑，可被多个钩子复用）──────
 
@@ -185,41 +353,55 @@ class ChatMemoryPlugin(Star):
         except Exception:
             pass
 
+        # cron 平台：跳过 user capture，让 assistant 走 proactive 分支
+        if self._get_platform_name(event) == "cron":
+            self._log(f"{self._log_prefix(event)} cron 平台，跳过 user 捕获（assistant 将标 proactive）")
+            return False
+
         cid = await self._get_curr_cid(umo)
         if not cid:
             self._log(f"{self._log_prefix(event)} 跳过 user 捕获：cid 暂未创建（首条消息可能漏存）")
             return False
 
+        kind, at_id, reply_id, forward_id = self._classify_content(event)
         user_text = self._extract_text(event)
-        is_media_only = not user_text and self._is_media_only(event)
-        if not user_text and not is_media_only:
-            self._log(f"{self._log_prefix(event)} 跳过 user 捕获：消息为空（无文本/无媒体）")
+
+        # content 决定：有文本用文本；否则用占位；empty（[] + 无引用字段）用空串
+        if user_text:
+            content = user_text
+        elif kind:
+            content = self._content_placeholder(kind)
+        else:
+            content = ""
+
+        # empty 且无任何引用字段：什么都没存，跳过
+        if not content and at_id is None and reply_id is None and forward_id is None:
+            self._log(f"{self._log_prefix(event)} 跳过 user 捕获：消息完全为空")
             return False
 
         msg_id = self._get_message_id(event)
         no_mid = not msg_id
 
-        # 决定终态 tag（这些 tag 不参与后续 llm_pending/llm_success 流转）
-        if no_mid:
-            user_tag = _TAG_NO_MID
-        elif is_media_only:
-            user_tag = _TAG_MEDIA_ONLY
-        else:
-            user_tag = _TAG_NON_LLM
-
-        content = user_text if user_text else self._media_placeholder(event)
-
-        # 用 await 拿到 bool，失败时不写 captured extras，让 capture_bot 走 orphan
+        audit = self._collect_audit_fields(event)
         ok = await self._safe_insert(
             umo, cid, user_id, "user", self._truncate(content),
-            message_id=msg_id or None, pair_id=None, tag=user_tag,
+            message_id=msg_id or None, pair_id=None,
+            llm_status=_LLM_DEFAULT, content_kind=kind,
+            at_id=at_id, reply_id=reply_id, forward_id=forward_id,
+            **audit,
         )
         if not ok:
             logger.warning(f"{self._log_prefix(event)} user 写入失败，extras 未标记，assistant 将标 orphan")
             return False
 
+        kind_repr = "/".join(kind) if kind else "empty"
+        ref_repr = []
+        if at_id: ref_repr.append(f"at={at_id[:8]}")
+        if reply_id: ref_repr.append(f"reply={reply_id[:8]}")
+        if forward_id: ref_repr.append(f"fwd={forward_id[:8]}")
+        ref_str = f"[{','.join(ref_repr)}]" if ref_repr else ""
         self._log(
-            f"{self._log_prefix(event)} user[{msg_id[:8] or '-'}][{user_tag}] -> "
+            f"{self._log_prefix(event)} user[{msg_id[:8] or '-'}][{kind_repr}]{ref_str} -> "
             f"{user_id}@{cid[:8]}: {content[:60]}"
         )
 
@@ -228,12 +410,11 @@ class ChatMemoryPlugin(Star):
         event.set_extra("chat_memory_user_msg_id", msg_id)
         event.set_extra("chat_memory_llm_triggered", False)
         event.set_extra("chat_memory_no_mid", no_mid)
-        event.set_extra("chat_memory_is_media", is_media_only)
         return True
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1000)
     async def capture_user(self, event: AstrMessageEvent):
-        """所有进入 ProcessStage 的 user 消息立即落库（默认 tag=non_llm）。"""
+        """所有进入 ProcessStage 的 user 消息立即落库（默认 llm_status=''）。"""
         await self._ensure_cleanup_started()
         await self._capture_user_internal(event)
 
@@ -241,15 +422,15 @@ class ChatMemoryPlugin(Star):
 
     @filter.on_llm_request()
     async def mark_llm_triggered(self, event: AstrMessageEvent, req: ProviderRequest):
-        """LLM 调用时：兜底重试 user 捕获 + 把 tag 从 non_llm 改成 llm_pending。
+        """LLM 调用时：兜底重试 user 捕获 + 把 user.llm_status 从 '' 改成 'llm_pending'。
 
-        终态 tag（media_only / no_message_id）保持不变，仅设 llm_triggered extra。
+        平台无 mid 时跳过升级（无法用 message_id 定位行）。
         """
         if not event.get_extra("chat_memory_captured"):
             self._log(f"{self._log_prefix(event)} LLM 触发，补捕获 user（首条消息兜底）")
             ok = await self._capture_user_internal(event)
             if not ok:
-                logger.warning(f"{self._log_prefix(event)} LLM 触发但 user 捕获失败，放弃 tag 更新")
+                logger.warning(f"{self._log_prefix(event)} LLM 触发但 user 捕获失败，放弃 llm_status 更新")
                 return
 
         umo = getattr(event, "unified_msg_origin", "")
@@ -259,26 +440,257 @@ class ChatMemoryPlugin(Star):
 
         event.set_extra("chat_memory_llm_triggered", True)
 
-        # 终态 tag：仅 LLM 触发标记，不改 tag
+        # 平台无 mid 时跳过升级（无法用 message_id 定位）
         if event.get_extra("chat_memory_no_mid"):
-            self._log(f"{self._log_prefix(event)} user 保持 no_message_id（平台无 mid）")
-            return
-        if event.get_extra("chat_memory_is_media"):
-            self._log(f"{self._log_prefix(event)} user 保持 media_only（纯媒体，走 LLM）")
+            self._log(f"{self._log_prefix(event)} user 保持 ''（平台无 mid，跳过 llm_pending 升级）")
             return
 
         msg_id = event.get_extra("chat_memory_user_msg_id")
         if not msg_id:
             return
 
-        await self._safe_update_tag(umo, cid, msg_id, _TAG_LLM_PENDING)
-        self._log(f"{self._log_prefix(event)} user[{msg_id[:8]}] tag -> llm_pending")
+        await self._safe_update_llm_status(umo, cid, msg_id, _LLM_PENDING)
+        self._log(f"{self._log_prefix(event)} user[{msg_id[:8]}] llm_status -> llm_pending")
+
+    # ── 上下文接管 ───────────────────────────────────
+
+    @filter.on_llm_request(priority=-100)
+    async def take_over_context(self, event: AstrMessageEvent, req: ProviderRequest):
+        """接管 req.contexts，注入 CM 数据 + 清空 native history。
+
+        priority=-100 确保最后执行（AstrBot 高值先执行），覆盖其他插件对 contexts 的修改。
+        与 mark_llm_triggered(默认 0) 顺序：先标记 llm_pending，后接管（CM 已落库再读取）。
+        """
+        if not self.ct_enable:
+            return
+
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if not umo:
+            return
+
+        cid = await self._get_curr_cid(umo)
+        if not cid:
+            self._log(f"{self._log_prefix(event)} 接管跳过：cid 未就绪（首条消息）")
+            return
+
+        user_id = event.get_sender_id() or ""
+        records = await self._takeover_query(umo, cid, user_id)
+        if not records:
+            self._log(f"{self._log_prefix(event)} 接管跳过：CM 无数据")
+            return
+
+        contexts = self._takeover_normalize(records, umo)
+        if not contexts:
+            self._log(f"{self._log_prefix(event)} 接管跳过：规整后为空")
+            return
+
+        req.contexts = contexts
+
+        if self.ct_clear_native_history:
+            asyncio.create_task(self._safe_reset_history(umo, cid))
+
+        self._log(
+            f"{self._log_prefix(event)} 接管 contexts={len(contexts)} "
+            f"(cross_session={self.ct_cross_session}, full_group={self.ct_full_group}, "
+            f"cid={cid[:8]})"
+        )
+
+    async def _takeover_query(self, umo: str, cid: str, user_id: str) -> list[dict]:
+        """按 cross_session / full_group 组合查询 CM 数据，返回扁平化 records 列表。
+
+        矩阵：
+        - cross=F, full=F → standard: query_rounds(umo, cid, user_id)
+        - cross=T, full=F → query_rounds_umo(umo, user_id)（跨 CID，本用户）
+        - cross=F, full=T → query_rounds(umo, cid, None)（本 CID，整群）
+        - cross=T, full=T → query_rounds_umo(umo, None)（跨 CID + 整群）
+
+        full_group 仅群聊生效；私聊自动降级为本用户。
+
+        若 ``llm_status_filter`` 含 proactive/orphan，额外查单边 assistant（``pair_id IS NULL``）
+        合并进结果，按 ``created_at`` 全局排序。``query_rounds`` 用 EXISTS 过滤单边，
+        不补查的话这两类永远进不了上下文。
+        """
+        limit = self.ct_limit_rounds
+        status = self.ct_llm_status_filter
+
+        # full_group 仅群聊生效
+        effective_full_group = self.ct_full_group and self._is_group_umo(umo)
+        target_user: Optional[str] = None if effective_full_group else user_id
+
+        try:
+            if self.ct_cross_session:
+                rounds = await self.query_rounds_umo(umo, target_user, limit, llm_status=status)
+            else:
+                rounds = await self.query_rounds(umo, cid, target_user, limit, llm_status=status)
+            records: list[dict] = [msg for rnd in rounds for msg in rnd]
+
+            # 补查单边 assistant（proactive/orphan 是 assistant 单边状态）
+            solo_statuses = [s for s in status if s in (_LLM_PROACTIVE, _LLM_ORPHAN)]
+            if solo_statuses:
+                solo_cid = None if self.ct_cross_session else cid
+                solo = await self.db.query_solo_assistants(
+                    umo, solo_cid, limit, llm_status=solo_statuses,
+                )
+                if solo:
+                    records.extend(solo)
+                    records.sort(key=lambda r: r.get("created_at") or "")
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
+            return []
+
+        return records
+
+    def _takeover_normalize(self, records: list[dict], umo: str) -> list[dict]:
+        """规整流水线：
+
+        过滤纯媒体 → user/solo-asst 加前缀 → 合并同 role（solo 自成一条）→
+        丢头部非 user → 丢尾部 solo assistant → 标 _no_save。
+
+        - **纯媒体过滤**：``content_kind`` 全是媒体 kind 的丢；图文混合（['text','image']）保留文本部分。
+        - **user 前缀**：``[MM/DD HH:MM:SS] Sender:``（按 prefix_enhance 配置）。
+        - **solo assistant 前缀**：proactive/orphan 这类单边 assistant 加 ``[主动]``/``[未配对]`` 标识，
+          可选带时间戳；让 LLM 知道"这是 bot 单方面说的，没有前置 user"。
+        - **合并**：连续同 role + 同 solo 标记的合并；solo 与非 solo 不合并（语义不同）。
+        - **丢尾部 solo assistant**：OpenAI 格式要求 messages 末尾不能是 assistant 单边（无对应 user），
+          否则 LLM 困惑"我刚主动说完话怎么又来 user"。末尾若是有配对的 llm_success assistant 保留（agent runner 追加 user_now 后合法）。
+        """
+        # 过滤纯媒体（图文混合保留）
+        records = [r for r in records if not self._is_pure_media(r)]
+
+        formatted: list[dict] = []
+        for r in records:
+            content = r.get("content", "") or ""
+            role = r.get("role", "user")
+            llm_status = r.get("llm_status", "")
+            is_solo = role == "assistant" and llm_status in (_LLM_PROACTIVE, _LLM_ORPHAN)
+
+            if role == "user":
+                content = self._apply_prefix(r, content)
+            elif is_solo:
+                tag = "主动" if llm_status == _LLM_PROACTIVE else "未配对"
+                content = self._apply_solo_prefix(r, content, tag)
+
+            formatted.append({"role": role, "content": content, "_solo": is_solo})
+
+        formatted = self._merge_with_solo(formatted)
+
+        # 丢头部非 user
+        while formatted and formatted[0]["role"] != "user":
+            formatted.pop(0)
+
+        # 丢尾部 solo assistant（proactive/orphan 这种单边不能结尾）
+        while formatted and formatted[-1]["role"] == "assistant" and formatted[-1].get("_solo"):
+            formatted.pop()
+
+        # 清理临时字段 + 标 _no_save
+        for c in formatted:
+            c.pop("_solo", None)
+            c["_no_save"] = True
+
+        return formatted
+
+    def _apply_prefix(self, record: dict, content: str) -> str:
+        """按 prefix_enhance 模式给 user content 加前缀。"""
+        mode = self.ct_prefix_enhance
+        if mode == "off" or not content:
+            return content
+
+        parts: list[str] = []
+        if mode in ("time", "time_sender"):
+            time_str = self._extract_time_str(record.get("created_at"))
+            if time_str:
+                parts.append(f"[{time_str}]")
+        if mode in ("sender", "time_sender"):
+            sender = record.get("sender_nickname") or record.get("user_id") or "?"
+            parts.append(f"{sender}:")
+
+        if parts:
+            return f"{' '.join(parts)} {content}"
+        return content
+
+    def _apply_solo_prefix(self, record: dict, content: str, tag: str) -> str:
+        """给单边 assistant（proactive/orphan）加前缀：可选时间戳 + [tag] 标识。
+
+        与 user 前缀风格一致但用方括号 tag 而非 sender（bot 自身昵称冗余）。
+        """
+        mode = self.ct_prefix_enhance
+        parts: list[str] = []
+        if mode in ("time", "time_sender"):
+            time_str = self._extract_time_str(record.get("created_at"))
+            if time_str:
+                parts.append(f"[{time_str}]")
+        parts.append(f"[{tag}]")
+        prefix = " ".join(parts)
+        return f"{prefix} {content}" if content else prefix
+
+    @staticmethod
+    def _extract_time_str(created_at) -> str:
+        """从 created_at 字符串提取 ``MM/DD HH:MM:SS``。
+
+        支持 SQLite CURRENT_TIMESTAMP 格式 ``2026-07-08 14:30:25``、
+        ISO ``2026-07-08T14:30:25``。其他格式回退到原值字符串。
+        跨天对话（cross_session 拉跨天数据）时日期才有意义；同一天内秒位冗余但保留便于精确定位。
+        """
+        if not created_at:
+            return ""
+        s = str(created_at)
+        if len(s) >= 19 and s[10] in (" ", "T"):
+            # s[5:19] = "MM-DD HH:MM:SS"
+            return s[5:19].replace("-", "/")
+        return s
+
+    @staticmethod
+    def _is_pure_media(r: dict) -> bool:
+        """判定是否纯媒体：content_kind 非空且全部属于媒体 kind。
+
+        图文混合（如 ['text','image']）保留文本部分，不丢。
+        """
+        kind = r.get("content_kind") or []
+        if not kind:
+            return False
+        return all(k in _MEDIA_KINDS for k in kind)
+
+    @staticmethod
+    def _merge_with_solo(contexts: list[dict]) -> list[dict]:
+        """合并连续同 role + 同 solo 标记的消息。
+
+        - 连续 user 合并（每条独立前缀已应用，合并后空行分隔）
+        - 连续非 solo assistant 合并（如多轮 llm_success 紧邻）
+        - 连续 solo assistant 合并（如多条 proactive 推送）
+        - solo 与非 solo assistant 不合并（语义不同，分开保留可读性）
+        """
+        merged: list[dict] = []
+        for c in contexts:
+            last = merged[-1] if merged else None
+            if (last and last["role"] == c["role"]
+                    and last.get("_solo") == c.get("_solo")):
+                last["content"] += "\n\n" + c["content"]
+            else:
+                merged.append(dict(c))
+        return merged
+
+    @staticmethod
+    def _is_group_umo(umo: str) -> bool:
+        if not umo:
+            return False
+        parts = umo.split(":", 2)
+        if len(parts) != 3:
+            return False
+        return parts[1] == "GroupMessage"
+
+    async def _safe_reset_history(self, umo: str, cid: str):
+        try:
+            await self.context.conversation_manager.update_conversation(
+                umo, conversation_id=cid, history=[]
+            )
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} 清理 native history 失败: {e}")
 
     # ── 捕获 BOT 回复 + 检测 reset/new ──────────────────
 
     @filter.on_decorating_result(priority=10)
     async def capture_bot(self, event: AstrMessageEvent):
-        """BOT 回复捕获：插入 assistant 记录，按 extras 判定 tag 与 pair_id。"""
+        """BOT 回复捕获：插入 assistant 记录，按 extras 判定 llm_status 与 pair_id。"""
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
@@ -310,43 +722,44 @@ class ChatMemoryPlugin(Star):
         capture_attempted = bool(event.get_extra("chat_memory_capture_attempted"))
         captured = bool(event.get_extra("chat_memory_captured"))
 
-        # 判定 assistant.tag（按"成因"细分，保证语义一致）
+        # 判定 assistant.llm_status + pair_id
         if not capture_attempted:
-            # 没经过 capture_user → 主动消息（无前置 user 事件）
-            asst_tag = _TAG_PROACTIVE
+            # 没经过 capture_user → 主动消息（含 cron）
+            asst_status = _LLM_PROACTIVE
             pair_id: Optional[str] = None
             logger.info(f"{self._log_prefix(event)} assistant 标 proactive（主动消息）")
         elif not captured:
             # 经过 capture_user 但落库失败 → 漏存
-            asst_tag = _TAG_ORPHAN
+            asst_status = _LLM_ORPHAN
             pair_id = None
             logger.warning(
                 f"{self._log_prefix(event)} assistant 标 orphan（user 漏存：DB 写入失败）"
             )
-        elif no_mid:
-            # user 在库但平台无 mid → 无法 pair_id 配对，独立 tag
-            asst_tag = _TAG_NO_MID
-            pair_id = None
-            self._log(f"{self._log_prefix(event)} assistant 标 no_message_id（平台无 mid）")
         elif llm_triggered and result.is_llm_result():
-            asst_tag = _TAG_LLM_SUCCESS
-            pair_id = user_msg_id
-            # 仅普通文本 user 升级 llm_success；media_only 是终态 tag，保持不变
-            if not event.get_extra("chat_memory_is_media"):
-                asyncio.create_task(self._safe_update_tag(
-                    umo, cid, user_msg_id, _TAG_LLM_SUCCESS,
+            asst_status = _LLM_SUCCESS
+            pair_id = user_msg_id if not no_mid else None
+            # user 从 llm_pending 升级到 llm_success（无 mid 时跳过：无法定位）
+            if not no_mid and user_msg_id:
+                asyncio.create_task(self._safe_update_llm_status(
+                    umo, cid, user_msg_id, _LLM_SUCCESS,
                 ))
         else:
-            asst_tag = _TAG_NON_LLM
-            pair_id = user_msg_id
+            # 走 capture_user 但没走 LLM（命令回复、set_result 等）
+            asst_status = _LLM_DEFAULT
+            pair_id = user_msg_id if not no_mid else None
+            if no_mid:
+                self._log(f"{self._log_prefix(event)} assistant 平台无 mid，pair_id 留空")
 
         content = self._truncate(bot_text)
+        audit = self._collect_audit_fields(event)
         asyncio.create_task(self._safe_insert(
             umo, cid, user_id, "assistant", content,
-            message_id=None, pair_id=pair_id, tag=asst_tag,
+            message_id=None, pair_id=pair_id,
+            llm_status=asst_status, content_kind=[_K_TEXT],
+            **audit,
         ))
         self._log(
-            f"{self._log_prefix(event)} bot[{asst_tag}] -> "
+            f"{self._log_prefix(event)} bot[{asst_status or 'default'}] -> "
             f"{user_id}@{cid[:8]}: {content[:60]}..."
         )
 
@@ -386,18 +799,19 @@ class ChatMemoryPlugin(Star):
         conversation_id: str,
         user_id: Optional[str] = None,
         limit: int = 20,
-        tag_filter: Optional[Union[str, list[str]]] = None,
+        llm_status: Optional[Union[str, list[str]]] = None,
+        content_kind: Optional[Union[str, list[str]]] = None,
         role_filter: Optional[str] = None,
     ) -> list[dict]:
         """查询会话历史。``user_id`` 为空时返回该会话所有用户的混合记录（群聊场景）。
 
-        ``tag_filter`` 支持 str 或 list[str]：仅返回 tag 匹配的记录（list 用 IN）。
+        ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
+        ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录（``'user'`` / ``'assistant'``）。
-
-        向后兼容：返回的 dict 在原 role/content/user_id/created_at 基础上**新增**
-        message_id / pair_id / tag 三字段。老调用方读旧字段不受影响。
         """
-        return await self.db.query_latest(umo, conversation_id, user_id, limit, tag_filter, role_filter)
+        return await self.db.query_latest(
+            umo, conversation_id, user_id, limit, llm_status, content_kind, role_filter,
+        )
 
     async def query_rounds(
         self,
@@ -405,30 +819,50 @@ class ChatMemoryPlugin(Star):
         conversation_id: str,
         user_id: Optional[str] = None,
         limit_rounds: int = 10,
-        tag_filter: Optional[Union[str, list[str]]] = None,
+        llm_status: Optional[Union[str, list[str]]] = None,
+        content_kind: Optional[Union[str, list[str]]] = None,
     ) -> list[list[dict]]:
         """按轮次返回 user-assistant 配对。每轮 ``[user_dict, assistant_dict]`` 两条。
 
-        ``tag_filter`` 支持 str 或 list[str]：仅过滤 user 侧的 tag。
+        ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
         """
-        return await self.db.query_rounds(umo, conversation_id, user_id, limit_rounds, tag_filter)
+        return await self.db.query_rounds(
+            umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
+        )
 
     # ── 内部工具 ──────────────────────────────────────
 
     async def _safe_insert(
         self, umo: str, cid: str, user_id: str, role: str, content: str,
-        message_id: Optional[str] = None, pair_id: Optional[str] = None, tag: str = _TAG_NON_LLM,
+        message_id: Optional[str] = None, pair_id: Optional[str] = None,
+        llm_status: str = _LLM_DEFAULT, content_kind: Optional[list[str]] = None,
+        platform_id: Optional[str] = None, platform_name: Optional[str] = None,
+        message_type: Optional[str] = None, session_id: Optional[str] = None,
+        self_id: Optional[str] = None, group_id: Optional[str] = None,
+        sender_nickname: Optional[str] = None, raw_timestamp: Optional[int] = None,
+        at_id: Optional[str] = None, reply_id: Optional[str] = None,
+        forward_id: Optional[str] = None,
     ) -> bool:
         try:
-            await self.db.insert(umo, cid, user_id, role, content, message_id, pair_id, tag)
+            await self.db.insert(
+                umo, cid, user_id, role, content, message_id, pair_id,
+                llm_status=llm_status, content_kind=content_kind,
+                platform_id=platform_id, platform_name=platform_name,
+                message_type=message_type, session_id=session_id,
+                self_id=self_id, group_id=group_id, sender_nickname=sender_nickname,
+                raw_timestamp=raw_timestamp,
+                at_id=at_id, reply_id=reply_id, forward_id=forward_id,
+            )
             return True
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 写入失败: {e}")
             return False
 
-    async def _safe_update_tag(self, umo: str, cid: str, message_id: str, new_tag: str) -> int:
+    async def _safe_update_llm_status(
+        self, umo: str, cid: str, message_id: str, new_status: str,
+    ) -> int:
         try:
-            return await self.db.update_tag(umo, cid, message_id, new_tag)
+            return await self.db.update_llm_status(umo, cid, message_id, new_status)
         except Exception as e:
-            logger.warning(f"{self._log_prefix()} 更新 tag 失败: {e}")
+            logger.warning(f"{self._log_prefix()} 更新 llm_status 失败: {e}")
             return 0
