@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 
@@ -69,6 +69,21 @@ class DBManager:
         )
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._register_pragmas()
+
+    def _register_pragmas(self):
+        """开 WAL + synchronous=NORMAL：群聊高频写入下避免 database is locked。
+
+        WAL 允许读写并发，NORMAL 同步级别配合 WAL 在性能与耐久性间取平衡
+        （崩溃时仅丢最后一轮事务，对聊天存档可接受）。
+        """
+
+        @event.listens_for(self.engine.sync_engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, conn_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
 
     async def init_db(self):
         if self._initialized:
@@ -224,7 +239,7 @@ class DBManager:
             params["lim"] = limit
 
             sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC LIMIT :lim")
+                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
             for name in expanding_binds:
                 sql_text = sql_text.bindparams(bindparam(name, expanding=True))
 
@@ -291,7 +306,7 @@ class DBManager:
             user_params["lim"] = limit_rounds
 
             sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC LIMIT :lim")
+                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
             for name in expanding_binds:
                 sql_text = sql_text.bindparams(bindparam(name, expanding=True))
 
@@ -307,7 +322,7 @@ class DBManager:
                 asst_sql = (
                     _SELECT_COLS + " FROM chat_memory_records "
                     "WHERE umo = :umo AND conversation_id = :cid AND role = 'assistant' "
-                    "AND pair_id IN :pids ORDER BY created_at ASC"
+                    "AND pair_id IN :pids ORDER BY created_at ASC, id ASC"
                 )
                 asst_result = await session.execute(
                     text(asst_sql).bindparams(bindparam("pids", expanding=True)),
@@ -381,7 +396,7 @@ class DBManager:
             user_params["lim"] = limit_rounds
 
             sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC LIMIT :lim")
+                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
             for name in expanding_binds:
                 sql_text = sql_text.bindparams(bindparam(name, expanding=True))
 
@@ -397,7 +412,7 @@ class DBManager:
                 asst_sql = (
                     _SELECT_COLS + " FROM chat_memory_records "
                     "WHERE umo = :umo AND role = 'assistant' "
-                    "AND pair_id IN :pids ORDER BY created_at ASC"
+                    "AND pair_id IN :pids ORDER BY created_at ASC, id ASC"
                 )
                 asst_result = await session.execute(
                     text(asst_sql).bindparams(bindparam("pids", expanding=True)),
@@ -419,6 +434,7 @@ class DBManager:
         conversation_id: Optional[str] = None,
         limit: int = 10,
         llm_status: Optional[Union[str, list[str]]] = None,
+        user_id: Optional[str] = None,
     ) -> list[dict]:
         """查询单边 assistant（``pair_id IS NULL``，即 proactive / orphan）。
 
@@ -426,6 +442,8 @@ class DBManager:
         不会返回这类记录——必须单独查。
 
         ``conversation_id`` 为空时跨 CID 查询（配合 cross_session）。
+        ``user_id`` 给定时按触发用户过滤（standard 模式避免跨用户泄漏）；
+        为空时返回该范围下所有用户的 solo assistant（full_group 模式）。
         按 ``created_at DESC LIMIT :lim`` 取，返回时升序（与 query_rounds 一致）。
         """
         await self.init_db()
@@ -440,6 +458,9 @@ class DBManager:
             if conversation_id:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
+            if user_id:
+                conditions.append("user_id = :uid")
+                params["uid"] = user_id
             if llm_status:
                 if isinstance(llm_status, str):
                     status_list = [llm_status]
@@ -453,7 +474,7 @@ class DBManager:
             params["lim"] = limit
 
             sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC LIMIT :lim")
+                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
             for name in expanding_binds:
                 sql_text = sql_text.bindparams(bindparam(name, expanding=True))
 

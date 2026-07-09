@@ -70,7 +70,8 @@ class ChatMemoryPlugin(Star):
         self.ct_enable = bool(ct_conf.get("enable", False))
         self.ct_cross_session = bool(ct_conf.get("cross_session", False))
         self.ct_full_group = bool(ct_conf.get("full_group", False))
-        self.ct_limit_rounds = int(ct_conf.get("limit_rounds", 30))
+        # limit_rounds 钳到 [1, 100]：负数会让 SQLite LIMIT -1 等价无限制
+        self.ct_limit_rounds = max(1, min(100, int(ct_conf.get("limit_rounds", 30))))
         self.ct_clear_native_history = bool(ct_conf.get("clear_native_history", True))
         ct_status = ct_conf.get("llm_status_filter", ["llm_success"])
         # "no_llm" 是 UI 占位符，DB 实际值是空串 ""
@@ -86,6 +87,8 @@ class ChatMemoryPlugin(Star):
 
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_started = False
+        # fire-and-forget 任务的引用保活：CPython 不保证无引用 task 不被 GC
+        self._pending_tasks: set[asyncio.Task] = set()
 
         cleanup_desc = (
             f"自动清理 {self.auto_cleanup_days} 天前的记录"
@@ -106,6 +109,20 @@ class ChatMemoryPlugin(Star):
                 f"(mode={mode_repr}, limit={self.ct_limit_rounds}, "
                 f"clear_native={self.ct_clear_native_history})"
             )
+
+    # ── fire-and-forget 任务管理 ─────────────────────
+
+    def _spawn_tasks(self, *coros) -> None:
+        """并发调度多个协程并保活引用。
+
+        asyncio.create_task 创建的任务若无人持有引用，可能在完成前被 GC
+        （CPython 实现细节，3.11+ 相对稳定但仍不保证）。这里维护一个 set，
+        done callback 中自动清理，避免静默丢失。
+        """
+        for coro in coros:
+            task = asyncio.create_task(coro)
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
 
     # ── 自动清理 ─────────────────────────────────────
 
@@ -330,13 +347,10 @@ class ChatMemoryPlugin(Star):
         """捕获 user 消息立即落库。返回 True 表示成功（或已捕获过）。
 
         幂等：通过 ``chat_memory_captured`` extra 防重复。
-        ``chat_memory_capture_attempted`` 在入口处先设，让 capture_bot 区分
-        "主动消息（attempted 未设）" vs "漏存（attempted 设但 captured 未设）"。
+        ``chat_memory_capture_attempted`` 仅在"真正尝试过写库"的路径才设：
+        - cron / bot 自身 / umo 空：跳过且**不**标 attempted → capture_bot 走 proactive
+        - cid 暂未就绪 / 内容空 / 写库失败：标 attempted + 未标 captured → orphan
         """
-        # 入口先标记 attempted，capture_bot 据此区分 orphan vs proactive
-        if not event.get_extra("chat_memory_capture_attempted"):
-            event.set_extra("chat_memory_capture_attempted", True)
-
         if event.get_extra("chat_memory_captured"):
             return True
 
@@ -353,10 +367,14 @@ class ChatMemoryPlugin(Star):
         except Exception:
             pass
 
-        # cron 平台：跳过 user capture，让 assistant 走 proactive 分支
+        # cron 平台：跳过 user capture 且不标 attempted → capture_bot 走 proactive 分支
         if self._get_platform_name(event) == "cron":
             self._log(f"{self._log_prefix(event)} cron 平台，跳过 user 捕获（assistant 将标 proactive）")
             return False
+
+        # 以下路径都是"真正尝试过 capture"：cid 未就绪、内容空、写库失败都属 orphan
+        if not event.get_extra("chat_memory_capture_attempted"):
+            event.set_extra("chat_memory_capture_attempted", True)
 
         cid = await self._get_curr_cid(umo)
         if not cid:
@@ -487,7 +505,7 @@ class ChatMemoryPlugin(Star):
         req.contexts = contexts
 
         if self.ct_clear_native_history:
-            asyncio.create_task(self._safe_reset_history(umo, cid))
+            self._spawn_tasks(self._safe_reset_history(umo, cid))
 
         self._log(
             f"{self._log_prefix(event)} 接管 contexts={len(contexts)} "
@@ -525,15 +543,19 @@ class ChatMemoryPlugin(Star):
             records: list[dict] = [msg for rnd in rounds for msg in rnd]
 
             # 补查单边 assistant（proactive/orphan 是 assistant 单边状态）
+            # full_group 时 target_user 为 None（取整群 solo）；否则按当前用户过滤
             solo_statuses = [s for s in status if s in (_LLM_PROACTIVE, _LLM_ORPHAN)]
             if solo_statuses:
                 solo_cid = None if self.ct_cross_session else cid
                 solo = await self.db.query_solo_assistants(
-                    umo, solo_cid, limit, llm_status=solo_statuses,
+                    umo, solo_cid, limit, llm_status=solo_statuses, user_id=target_user,
                 )
-                if solo:
-                    records.extend(solo)
-                    records.sort(key=lambda r: r.get("created_at") or "")
+                records.extend(solo)
+
+            # 防御性全局排序：query_rounds 扁平化后 assistant 可能跨越下一条 user 的
+            # 时间戳（一对多场景），solo 也可能插到任意位置。n 通常 <60，sort 开销可忽略
+            if records:
+                records.sort(key=lambda r: r.get("created_at") or "")
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
             return []
@@ -635,8 +657,8 @@ class ChatMemoryPlugin(Star):
             return ""
         s = str(created_at)
         if len(s) >= 19 and s[10] in (" ", "T"):
-            # s[5:19] = "MM-DD HH:MM:SS"
-            return s[5:19].replace("-", "/")
+            # s[5:19] = "MM-DD HH:MM:SS"（空格）或 "MM-DDTHH:MM:SS"（ISO）
+            return s[5:19].replace("-", "/").replace("T", " ")
         return s
 
     @staticmethod
@@ -740,7 +762,7 @@ class ChatMemoryPlugin(Star):
             pair_id = user_msg_id if not no_mid else None
             # user 从 llm_pending 升级到 llm_success（无 mid 时跳过：无法定位）
             if not no_mid and user_msg_id:
-                asyncio.create_task(self._safe_update_llm_status(
+                self._spawn_tasks(self._safe_update_llm_status(
                     umo, cid, user_msg_id, _LLM_SUCCESS,
                 ))
         else:
@@ -752,7 +774,7 @@ class ChatMemoryPlugin(Star):
 
         content = self._truncate(bot_text)
         audit = self._collect_audit_fields(event)
-        asyncio.create_task(self._safe_insert(
+        self._spawn_tasks(self._safe_insert(
             umo, cid, user_id, "assistant", content,
             message_id=None, pair_id=pair_id,
             llm_status=asst_status, content_kind=[_K_TEXT],
@@ -770,6 +792,11 @@ class ChatMemoryPlugin(Star):
 
         /reset: CID 不变，清空历史 → 清除该 CID 下所有存档记录。
         /new:   产生新 CID → 旧 CID 记录保留。
+
+        ⚠️ 已知脆弱点：AstrBot 仅提供 ``_clean_group_context_session`` extra 标识
+        "属于 reset/new 类"，不区分具体哪个。这里靠 result 文本含 "reset" 区分——
+        若 bot 回复内容里碰巧含 "reset" 字样（如"已重置"翻译为英文回复），会误判为 /reset
+        并清库。AstrBot 当前无官方区分 API，这是无奈之举。
         """
         cid = await self._get_curr_cid(umo)
         if not cid:
@@ -866,3 +893,38 @@ class ChatMemoryPlugin(Star):
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 更新 llm_status 失败: {e}")
             return 0
+
+    # ── 生命周期终止 ─────────────────────────────────
+
+    async def terminate(self):
+        """AstrBot 卸载/重载时调用：取消未完成任务 + 释放 DB 连接池。
+
+        热重载场景下若不显式 dispose，aiosqlite 连接与 SQLAlchemy 引擎会泄漏，
+        多次重载后可能耗尽文件描述符。
+        """
+        # 1. 取消周期清理 task
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"{self._log_prefix()} 清理 task 停止异常: {e}")
+            self._cleanup_task = None
+
+        # 2. 取消所有 fire-and-forget task
+        pending = [t for t in self._pending_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._pending_tasks.clear()
+
+        # 3. 释放 DB 连接池
+        try:
+            await self.db.engine.dispose()
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} engine.dispose 异常: {e}")
+
+        logger.info(f"{self._log_prefix()} 已终止")
