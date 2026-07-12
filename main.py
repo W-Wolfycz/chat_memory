@@ -78,6 +78,10 @@ class ChatMemoryPlugin(Star):
         ct_status_list = list(ct_status) if ct_status else ["llm_success"]
         self.ct_llm_status_filter = ["" if s == "no_llm" else s for s in ct_status_list]
         self.ct_prefix_enhance = str(ct_conf.get("prefix_enhance", "time_sender"))
+        # Kind 白名单：选中=需要；默认 ["text"]；空集合 = 不过滤（全部进入）
+        self.ct_include_kinds: set[str] = set(ct_conf.get("include_content_kinds", ["text"]) or [])
+        # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
+        self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
         # 硬编码常开：drop_media 与 merge_consecutive 不暴露配置
         self.ct_drop_media = True
         self.ct_merge_consecutive = True
@@ -514,46 +518,45 @@ class ChatMemoryPlugin(Star):
         )
 
     async def _takeover_query(self, umo: str, cid: str, user_id: str) -> list[dict]:
-        """按 cross_session / full_group 组合查询 CM 数据，返回扁平化 records 列表。
+        """按 cross_session / full_group / 配对模式 查询 CM 数据，返回扁平化 records 列表。
 
-        矩阵：
-        - cross=F, full=F → standard: query_rounds(umo, cid, user_id)
-        - cross=T, full=F → query_rounds_umo(umo, user_id)（跨 CID，本用户）
-        - cross=F, full=T → query_rounds(umo, cid, None)（本 CID，整群）
-        - cross=T, full=T → query_rounds_umo(umo, None)（跨 CID + 整群）
+        两种查询模式：
+        - **配对模式**（仅 llm_success）：用 ``query_rounds_raw`` 查配对轮次，按轮数切片
+        - **混合模式**（含其他状态）：用 ``query_messages_raw`` 查全量，按条数切片
 
-        full_group 仅群聊生效；私聊自动降级为本用户。
-
-        若 ``llm_status_filter`` 含 proactive/orphan，额外查单边 assistant（``pair_id IS NULL``）
-        合并进结果，按 ``created_at`` 全局排序。``query_rounds`` 用 EXISTS 过滤单边，
-        不补查的话这两类永远进不了上下文。
+        ``limit_rounds`` 含义随模式变化：
+        - 配对模式 → 轮数（user-assistant 一对为一轮）
+        - 混合模式 → 消息数（单条记录）
         """
         limit = self.ct_limit_rounds
-        status = self.ct_llm_status_filter
+        status_set: set[str] = set(self.ct_llm_status_filter)
+        include_kinds = self.ct_include_kinds  # set[str]
+        all_match = self.ct_include_all_match
+
+        # 判断配对模式：仅 llm_success
+        is_pair_only = (status_set == {"llm_success"})
 
         # full_group 仅群聊生效
         effective_full_group = self.ct_full_group and self._is_group_umo(umo)
         target_user: Optional[str] = None if effective_full_group else user_id
 
+        # cross_session：conversation_id 传 None 跨 CID
+        target_cid: Optional[str] = None if self.ct_cross_session else cid
+
         try:
-            if self.ct_cross_session:
-                rounds = await self.query_rounds_umo(umo, target_user, limit, llm_status=status)
-            else:
-                rounds = await self.query_rounds(umo, cid, target_user, limit, llm_status=status)
-            records: list[dict] = [msg for rnd in rounds for msg in rnd]
-
-            # 补查单边 assistant（proactive/orphan 是 assistant 单边状态）
-            # full_group 时 target_user 为 None（取整群 solo）；否则按当前用户过滤
-            solo_statuses = [s for s in status if s in (_LLM_PROACTIVE, _LLM_ORPHAN)]
-            if solo_statuses:
-                solo_cid = None if self.ct_cross_session else cid
-                solo = await self.db.query_solo_assistants(
-                    umo, solo_cid, limit, llm_status=solo_statuses, user_id=target_user,
+            if is_pair_only:
+                # 配对模式：按轮数
+                rounds = await self.db.query_rounds_raw(
+                    umo, target_cid, target_user, limit, include_kinds, all_match,
                 )
-                records.extend(solo)
+                records: list[dict] = [msg for rnd in rounds for msg in rnd]
+            else:
+                # 混合模式：按消息数
+                records = await self.db.query_messages_raw(
+                    umo, target_cid, target_user, limit, status_set, include_kinds, all_match,
+                )
 
-            # 防御性全局排序：query_rounds 扁平化后 assistant 可能跨越下一条 user 的
-            # 时间戳（一对多场景），solo 也可能插到任意位置。n 通常 <60，sort 开销可忽略
+            # 防御性全局排序（混合模式下 messages_raw 已排序，但保持一致）
             if records:
                 records.sort(key=lambda r: r.get("created_at") or "")
         except Exception as e:

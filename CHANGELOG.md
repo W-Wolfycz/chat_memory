@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.3.2 — 2026-07-12
+
+### 轮数精确 + 内容白名单下沉 SQL
+
+> ⚠️ **行为变化**：v2.3.1 升级到 v2.3.2 后，开启 takeover 时默认只让含 `text` 的消息进入 LLM 上下文（纯图 / poke / 加好友通知等被滤掉）。capture 仍照常全量入库。如需恢复 v2.3.1 行为（不过滤），清空 `include_content_kinds` 即可。
+
+**limit_rounds 含义动态化**（依赖 `llm_status_filter`）：
+- 仅 `llm_success` → **轮数**（user-assistant 配对，一轮 = 一对）
+- 含其他状态 → **消息数**（单条记录）
+
+**include_content_kinds 下沉 SQL 层**：之前在应用层过滤导致轮数不精确（查 N 轮 → 过滤后剩 M 轮）。现在 SQL 直接判定白名单，limit 名额只算有效记录。
+
+**白名单 ANY / ALL 双语义**（`include_all_match` 开关）：
+- ANY（默认）：消息的 `content_kind` 与白名单**任一交集**即进入上下文
+- ALL：消息的所有 kind 都须在白名单内（且非空）才进入
+
+默认 `["text"]` + ANY：只让含文本的消息进入上下文。清空白名单 = 不过滤（全量进入）。
+
+**新增 takeover 专用内部方法**（storage 层，不影响对外 API）：
+- `query_rounds_raw(umo, cid, user_id, limit, include_kinds, all_match)` — 配对模式
+- `query_messages_raw(umo, cid, user_id, limit, statuses, include_kinds, all_match)` — 混合模式
+
+对外 API（`query_rounds` / `query_latest`）语义不变。
+
 ## 2.3.1 — 2026-07-09
 
 ### 上下文接管（context_takeover）

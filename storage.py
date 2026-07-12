@@ -507,6 +507,176 @@ class DBManager:
             await session.commit()
             return result.rowcount
 
+    async def query_rounds_raw(
+        self,
+        umo: str,
+        conversation_id: Optional[str],
+        user_id: Optional[str],
+        limit_rounds: int,
+        include_kinds: Optional[set[str]] = None,
+        all_match: bool = False,
+    ) -> list[list[dict]]:
+        """内部方法：配对模式查询（takeover 专用）。
+
+        类似 ``query_rounds`` 但支持 ``include_kinds`` 白名单过滤。
+        仅返回**有 assistant 配对**的 user，每轮 ``[user_dict, assistant_dict]`` 两条。
+
+        ``conversation_id`` 为 None 时跨 CID（``query_rounds_mo`` 等价）。
+        ``user_id`` 为 None 时不按用户过滤（``full_group`` 场景）。
+
+        ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
+        - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
+        - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
+        仅在 user 查询时过滤（assistant 不过滤，与配对语义一致）。
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            conditions = [
+                "umo = :umo",
+                "role = 'user'",
+                (
+                    "EXISTS (SELECT 1 FROM chat_memory_records a "
+                    "WHERE a.umo = chat_memory_records.umo "
+                    "AND a.role = 'assistant' "
+                    "AND a.pair_id = chat_memory_records.message_id)"
+                ),
+            ]
+            params: dict = {"umo": umo, "lim": limit_rounds}
+            expanding_binds: list[str] = []
+
+            if conversation_id:
+                conditions.append("conversation_id = :cid")
+                params["cid"] = conversation_id
+
+            if user_id:
+                conditions.append("user_id = :uid")
+                params["uid"] = user_id
+
+            # include_kinds：白名单
+            if include_kinds:
+                if all_match:
+                    # ALL：非空且全部 kind ∈ 白名单
+                    conditions.append(
+                        "EXISTS (SELECT 1 FROM json_each(content_kind)) "
+                        "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
+                        "WHERE value NOT IN :include_kinds)"
+                    )
+                else:
+                    # ANY：任一 kind ∈ 白名单
+                    conditions.append(
+                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
+                        "WHERE value IN :include_kinds)"
+                    )
+                params["include_kinds"] = list(include_kinds)
+                expanding_binds.append("include_kinds")
+
+            where = " AND ".join(conditions)
+            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
+                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
+            for name in expanding_binds:
+                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
+
+            result = await session.execute(sql_text, params)
+            user_rows = list(reversed(result.fetchall()))  # 升序
+
+            if not user_rows:
+                return []
+
+            user_msg_ids = [r[3] for r in user_rows]  # message_id 在第 4 列
+            assistant_map: dict[str, list[dict]] = {}
+            if user_msg_ids:
+                # assistant 查询同样需要处理 conversation_id
+                asst_conditions = ["umo = :umo", "role = 'assistant'", "pair_id IN :pids"]
+                asst_params = {"umo": umo, "pids": user_msg_ids}
+                if conversation_id:
+                    asst_conditions.append("conversation_id = :cid")
+                    asst_params["cid"] = conversation_id
+                asst_sql = (
+                    _SELECT_COLS + " FROM chat_memory_records WHERE "
+                    + " AND ".join(asst_conditions) +
+                    " ORDER BY created_at ASC, id ASC"
+                )
+                asst_result = await session.execute(
+                    text(asst_sql).bindparams(bindparam("pids", expanding=True)),
+                    asst_params,
+                )
+                for r in asst_result.fetchall():
+                    assistant_map.setdefault(r[3], []).append(_row_to_dict(r))
+
+            rounds: list[list[dict]] = []
+            for r in user_rows:
+                entry = [_row_to_dict(r)]
+                entry.extend(assistant_map.get(r[3], []))
+                rounds.append(entry)
+            return rounds
+
+    async def query_messages_raw(
+        self,
+        umo: str,
+        conversation_id: Optional[str],
+        user_id: Optional[str],
+        limit_messages: int,
+        statuses: set[str],
+        include_kinds: Optional[set[str]] = None,
+        all_match: bool = False,
+    ) -> list[dict]:
+        """内部方法：混合模式查询（takeover 专用）。
+
+        查询全量消息（user + assistant），按 ``limit_messages`` 条数切片。
+        ``conversation_id`` 为 None 时跨 CID，``user_id`` 为 None 时不按用户过滤。
+        ``statuses`` 过滤 llm_status（IN 语义）。
+
+        ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
+        - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
+        - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            conditions = [
+                "umo = :umo",
+                "role IN ('user', 'assistant')",
+            ]
+            params: dict = {"umo": umo, "lim": limit_messages}
+            expanding_binds: list[str] = []
+
+            if conversation_id:
+                conditions.append("conversation_id = :cid")
+                params["cid"] = conversation_id
+
+            if user_id:
+                conditions.append("user_id = :uid")
+                params["uid"] = user_id
+
+            if statuses:
+                conditions.append("llm_status IN :statuses")
+                params["statuses"] = list(statuses)
+                expanding_binds.append("statuses")
+
+            if include_kinds:
+                if all_match:
+                    conditions.append(
+                        "EXISTS (SELECT 1 FROM json_each(content_kind)) "
+                        "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
+                        "WHERE value NOT IN :include_kinds)"
+                    )
+                else:
+                    conditions.append(
+                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
+                        "WHERE value IN :include_kinds)"
+                    )
+                params["include_kinds"] = list(include_kinds)
+                expanding_binds.append("include_kinds")
+
+            where = " AND ".join(conditions)
+            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
+                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
+            for name in expanding_binds:
+                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
+
+            result = await session.execute(sql_text, params)
+            rows = result.fetchall()
+            return [_row_to_dict(r) for r in reversed(rows)]  # 升序
+
 
 # SELECT 列顺序固定，_row_to_dict 按位置映射
 _SELECT_COLS = (

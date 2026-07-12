@@ -159,6 +159,21 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 
 开启 `proactive`/`orphan` 后，单边 assistant 会带 `[主动]`/`[未配对]` 前缀注入，让 LLM 知道这是 bot 单方面说的。
 
+### 轮数 vs 消息数（limit_rounds 含义）
+
+`limit_rounds` 的语义随 `llm_status_filter` 选择动态变化：
+
+| `llm_status_filter` | limit_rounds 含义 | SQL 策略 |
+|---|---|---|
+| 仅 `llm_success` | **轮数**（user-assistant 一对为一轮） | 配对查询，按配对切 N 轮 |
+| 含其他状态（`proactive`/`no_llm`/...） | **消息数**（单条记录） | 全量查询，按条数切 N 条 |
+
+**例**：`limit_rounds=30`
+- 只选 `llm_success` → 30 轮配对（≈60 条记录）
+- 选了 `llm_success + proactive` → 30 条消息（可能是 14 user + 14 assistant + 2 proactive）
+
+**轮数精确**：内容白名单下沉到 SQL 层，被过滤的记录不占用 limit 名额。配 30 轮就是 30 轮，不会因为过滤变少。
+
 ### 前缀增强
 
 每条消息按 `prefix_enhance` 配置加前缀：
@@ -190,10 +205,30 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 | `enable` | bool | false | 总开关 |
 | `cross_session` | bool | false | 跨 CID |
 | `full_group` | bool | false | 整群消息（仅群聊） |
-| `limit_rounds` | int | 30 | 注入最近 N 轮（钳到 `[1, 100]`） |
+| `limit_rounds` | int | 30 | 注入轮数或消息数（含义随状态过滤变化，见下） |
 | `llm_status_filter` | chip | `["llm_success"]` | 状态多选 |
+| `include_content_kinds` | chip | `["text"]` | 内容白名单（清空=不过滤） |
+| `include_all_match` | bool | false | ALL 模式开关（默认 ANY） |
 | `prefix_enhance` | select | `"time_sender"` | off / time / sender / time_sender |
 | `clear_native_history` | bool | true | 每轮清空 native history |
+
+### 内容白名单（include_content_kinds）
+
+**只影响 takeover**，capture 照常入库。
+
+`include_content_kinds` 是白名单：选中=需要进入上下文的 kind。空集合 = 不过滤（全部进入）。
+配合 `include_all_match` 切换 ANY / ALL 两种语义：
+
+| `include_all_match` | 语义 | 保留条件 | 例子（白名单 `["text"]`） |
+|---|---|---|---|
+| false（默认） | ANY | content_kind 与白名单**任一交集** | `["text"]` ✓ / `["text","image"]` ✓ / `["image"]` ✗ / `[]` ✗ |
+| true | ALL | content_kind **全部**属于白名单（且非空） | `["text"]` ✓ / `["text","image"]` ✗ / `["image"]` ✗ / `[]` ✗ |
+
+场景：
+- **默认 ANY + `["text"]`**：含文本即进（纯文 ✓ / 文+图 ✓ / 纯图 ✗ / poke 通知 ✗）
+- **启用 ALL + `["text"]`**：仅纯文本进（文+图也滤掉，因为 image 不在白名单）
+- **ALL + 多选 `["text","image"]`**：精确限定为这两种 kind（纯文 ✓ / 纯图 ✓ / 文+图 ✓ / 文+语音 ✗）
+- **清空**：不过滤，全量进入
 
 ## 已知限制
 
