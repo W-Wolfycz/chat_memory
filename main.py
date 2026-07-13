@@ -176,6 +176,46 @@ class ChatMemoryPlugin(Star):
             return text
         return text[:self.max_len]
 
+    @staticmethod
+    def _strip_reasoning_prefix(text: str) -> str:
+        """剥离 AstrBot 错误序列化的 reasoning parts 前缀。
+
+        AstrBot 部分 Provider（reasoning 模型如 GLM/DeepSeek/o1）会把 content parts 列表
+        ``[{'type': 'think', 'content': '...', 'encrypted': None}]`` 整体 str() 后塞到 Plain
+        组件，紧跟实际回复文本。这里字符级跟踪括号平衡（处理字符串/转义）找到列表结束位置，
+        返回剩余部分。
+
+        非该前缀格式直接返回原文；解析失败也返回原文（保守）。
+        """
+        if not text.startswith("[{'type': 'think'"):
+            return text
+        depth = 0
+        i = 0
+        n = len(text)
+        in_str = False
+        quote = ""
+        while i < n:
+            c = text[i]
+            if in_str:
+                if c == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if c == quote:
+                    in_str = False
+                i += 1
+                continue
+            if c in ("'", '"'):
+                in_str = True
+                quote = c
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[i + 1:].lstrip()
+            i += 1
+        return text
+
     def _log(self, msg: str):
         if self.debug_to_info:
             logger.info(msg)
@@ -184,7 +224,10 @@ class ChatMemoryPlugin(Star):
 
     @staticmethod
     def _extract_text(event: AstrMessageEvent) -> str:
-        chain = getattr(event, "message_chain", None)
+        try:
+            chain = event.get_messages() or []
+        except Exception:
+            chain = []
         if chain:
             parts = [comp.text for comp in chain if isinstance(comp, Plain)]
             text = "".join(parts).strip()
@@ -194,7 +237,7 @@ class ChatMemoryPlugin(Star):
 
     @staticmethod
     def _classify_content(event: AstrMessageEvent) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
-        """从 message_chain 提取内容形态分类 + 上下文引用字段。
+        """从消息组件链提取内容形态分类 + 上下文引用字段。
 
         返回 ``(content_kind, at_id, reply_id, forward_id)``：
         - ``content_kind``：去重后的 kind 列表（保持首次出现顺序）
@@ -205,7 +248,10 @@ class ChatMemoryPlugin(Star):
 
         OTHER_MESSAGE 类型（poke / 请求 / 通知）：强制 content_kind=['system_event']，覆盖其他形态。
         """
-        chain = getattr(event, "message_chain", None) or []
+        try:
+            chain = event.get_messages() or []
+        except Exception:
+            chain = []
         kind: list[str] = []
         at_id: Optional[str] = None
         reply_id: Optional[str] = None
@@ -249,6 +295,14 @@ class ChatMemoryPlugin(Star):
                     if rid:
                         reply_id = str(rid)
             # 其他组件（AtAll / Poke / Json / Unknown 等）忽略
+
+        # 回退：AstrBot 部分 Provider/适配器把 user 文本放在 event.message_str，
+        # message 组件链里没有非空 Plain（或 chain 为空）。此时若已无任何 kind，
+        # 但 message_str 非空，则补 text（与 _extract_text 的回退逻辑对齐）。
+        if not kind:
+            msg_str = (getattr(event, "message_str", "") or "").strip()
+            if msg_str:
+                kind.append(_K_TEXT)
 
         # OTHER_MESSAGE（poke / 加好友请求 / 通知等）：强制 system_event
         try:
@@ -584,7 +638,7 @@ class ChatMemoryPlugin(Star):
 
         formatted: list[dict] = []
         for r in records:
-            content = r.get("content", "") or ""
+            content = self._strip_reasoning_prefix(r.get("content", "") or "")
             role = r.get("role", "user")
             llm_status = r.get("llm_status", "")
             is_solo = role == "assistant" and llm_status in (_LLM_PROACTIVE, _LLM_ORPHAN)
@@ -730,6 +784,7 @@ class ChatMemoryPlugin(Star):
             return
 
         bot_text = "".join(comp.text for comp in result.chain if isinstance(comp, Plain)).strip()
+        bot_text = self._strip_reasoning_prefix(bot_text)
         if not bot_text:
             return
 

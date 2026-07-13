@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.3.4 — 2026-07-14
+
+### 修复 user content_kind 错标导致 takeover 完全失效
+
+**Bug**：`_classify_content` 只从 `event.message_chain` 提取 Plain 组件判 text kind。但 AstrBot 部分 Provider/适配器把 user 文本放在 `event.message_str`，message_chain 为空 → kind 错标为 `[]`。生产环境实测 100% user 消息都被错标。
+
+**连锁反应**：
+1. user 入库 content_kind=[]
+2. takeover 配置 `include_content_kinds=["text"]` 把所有 user 在 SQL 层滤光
+3. 只剩 assistant 进 `_takeover_normalize` → 头部 pop（非 user）→ 全 pop → 空 → "规整后为空"
+4. takeover 跳过注入，AstrBot 用 native history 兜底（含 `<interaction>` / `<system_reminder>` 等各插件 prefix 累积）
+
+**修复**：`_classify_content` 加 message_str 回退 — chain 中无非空 Plain 但 message_str 有文本时，补 `_K_TEXT`（与 `_extract_text` 回退逻辑对齐）。
+
+### 修复组件链读取源错误（图片 / @ / 回复 / 转发全不入库）
+
+**真正根因**：`AstrMessageEvent` 上**没有** `message_chain` 属性，官方 API 是 `event.get_messages()`（或 `event.message_obj.message`）。`_extract_text` / `_classify_content` 用 `getattr(event, "message_chain", None)` 永远拿到 `None`，组件链恒为空 → 所有非文本组件（`Image` / `Video` / `Record` / `File` / `Face` / `Forward` / `At` / `Reply`）全部漏抽。
+
+**影响**（v2.3.0 起一直坏）：
+- 纯图片 / 纯视频 / 纯语音消息：kind=[] + message_str="" → 触发"消息完全为空"跳过，**根本不入库**
+- 纯 @BOT：kind=[] + at_id=None → 跳过不入库
+- 文本 + @/回复/转发：文本能入库（靠 message_str 回退），但 `at_id` / `reply_id` / `forward_id` 全丢
+- 合并转发：kind 不含 forward，forward_id 不提取
+
+**修复**：把 `_extract_text` 和 `_classify_content` 的 chain 读取源从 `getattr(event, "message_chain", None)` 改为 `event.get_messages()`。
+
+**v2.3.4 加的 message_str 回退保留**：AstrBot 部分 Provider 确实只填 `event.message_str`、组件链为空，回退仍是必要兜底。
+
+> ⚠️ **老库不可回填**：被错跳过的图片 / @ / 回复 / 转发消息**根本没入库**，信息从一开始就丢了。本修复只覆盖未来消息。已入库的纯文本消息 `content_kind` 错标问题仍可用 `scripts/fix_content_kind_v2.3.4.py` 修。
+
+## 2.3.3 — 2026-07-14
+
+### 修复 reasoning parts 污染上下文
+
+**Bug**：AstrBot 部分 Provider（GLM / DeepSeek / o1 等 reasoning 模型）把 content parts 列表 `[{'type': 'think', 'content': '...', 'encrypted': None}]` 整体 `str()` 后塞进 Plain 组件，紧跟实际回复。`capture_bot` 入库时把这个序列化字符串当回复文本一起存了，takeover 注入时 think 推理内容污染了 LLM 上下文。
+
+**修复**（双保险）：
+- `capture_bot` 入库前用 `_strip_reasoning_prefix` 剥离前缀
+- `_takeover_normalize` 注入前同样剥离，处理老库已有数据（无需迁移）
+
+剥离逻辑：字符级跟踪 `[` / `]` 平衡 + 字符串/转义识别，找到列表结束位置返回剩余部分。非该前缀格式 / 解析失败均保守返回原文。
+
 ## 2.3.2 — 2026-07-12
 
 ### 轮数精确 + 内容白名单下沉 SQL
