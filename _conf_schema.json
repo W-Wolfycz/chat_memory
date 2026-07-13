@@ -42,10 +42,10 @@
         "hint": "总开关。关闭后仅存档，不干预 LLM 请求。"
       },
       "cross_session": {
-        "description": "跨群会话",
+        "description": "跨会话目标（群私聊互通）",
         "type": "bool",
         "default": false,
-        "hint": "开启后，本 bot 在其他群 / 私聊的同用户对话也会进入上下文（按 UMO + user 聚合，/new 后仍记得旧话题）。"
+        "hint": "开启后，同一用户在不同会话目标（CID / 群 / 私聊）的消息都进入上下文，按 platform_id + user_id 聚合。典型用途：群私聊记忆互通、/new 后仍记得旧话题。注意：与 full_group 同时开启会聚合整个 platform 所有用户所有会话，慎用。"
       },
       "full_group": {
         "description": "整群消息",

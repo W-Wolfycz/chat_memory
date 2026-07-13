@@ -137,13 +137,14 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 | `cross_session` | `full_group` | 数据范围 | 适用场景 |
 |---|---|---|---|
 | F | F | 同 CID 同用户 | 默认，与 native 等价但走 CM 数据源 |
-| T | F | 跨 CID 同用户 | `/new` 或 `/reset` 后仍记得上一个会话 |
-| F | T | 同 CID 全群 | 群聊让 LLM 看到所有发言者 |
-| T | T | 跨 CID 全群 | 跨会话 + 整群聚合 |
+| T | F | 跨 CID 跨 umo 同用户 | **群私聊互通**：同用户在所有群 + 私聊的对话都进入上下文；`/new` 后仍记得旧话题 |
+| F | T | 同 CID 同群全员 | 群聊让 LLM 看到所有发言者 |
+| T | T | 跨 CID 跨 umo 全 platform | 所有用户所有会话混合，**慎用** |
 
 > **full_group 仅群聊生效**：私聊自动降级为本用户。
 > **隐私**：full_group 开启后，群内其他人发言（含昵称）会注入 LLM。可用 `prefix_enhance=off/time` 关闭昵称前缀。
-> **cross_session 限制**：跨 CID 配对依赖平台 `message_id` 全局唯一，多数平台天然满足。
+> **cross_session 实现**：开启后查询条件从 `umo = :umo` 改为 `platform_id = :pid`，按 `platform_id + user_id` 聚合（user_id 为空时降级为整 platform）。
+> **配对正确性**：跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 是行内自连接，每条 user 仍能在自己 umo 内找到 pair_id 匹配的 assistant；依赖平台 `message_id` 全局唯一，多数平台天然满足。
 
 ### 状态过滤
 
@@ -203,7 +204,7 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `enable` | bool | false | 总开关 |
-| `cross_session` | bool | false | 跨 CID |
+| `cross_session` | bool | false | 跨 CID 跨 umo（群私聊互通） |
 | `full_group` | bool | false | 整群消息（仅群聊） |
 | `limit_rounds` | int | 30 | 注入轮数或消息数（含义随状态过滤变化，见下） |
 | `llm_status_filter` | chip | `["llm_success"]` | 状态多选 |

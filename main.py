@@ -594,20 +594,24 @@ class ChatMemoryPlugin(Star):
         effective_full_group = self.ct_full_group and self._is_group_umo(umo)
         target_user: Optional[str] = None if effective_full_group else user_id
 
-        # cross_session：conversation_id 传 None 跨 CID
+        # cross_session：跨 CID（cid=None）+ 跨 umo（cross_umo=True）
+        # 跨 umo 按 platform_id + user_id 聚合，实现群私聊互通
         target_cid: Optional[str] = None if self.ct_cross_session else cid
+        cross_umo = self.ct_cross_session
 
         try:
             if is_pair_only:
                 # 配对模式：按轮数
                 rounds = await self.db.query_rounds_raw(
                     umo, target_cid, target_user, limit, include_kinds, all_match,
+                    cross_umo=cross_umo,
                 )
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
                 # 混合模式：按消息数
                 records = await self.db.query_messages_raw(
                     umo, target_cid, target_user, limit, status_set, include_kinds, all_match,
+                    cross_umo=cross_umo,
                 )
 
             # 防御性全局排序（混合模式下 messages_raw 已排序，但保持一致）

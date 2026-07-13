@@ -2,6 +2,30 @@
 
 ## 2.3.4 — 2026-07-14
 
+### cross_session 升级为真正"群私聊互通"
+
+**旧行为**：`cross_session` 仅跨 CID 同 umo（极少用），schema description 写"跨群会话"但实际做不到跨群。
+
+**新行为**：开启后查询条件从 `umo = :umo` 改为 `platform_id = :pid`（从 umo 提取首段），按 `platform_id + user_id` 聚合 → 同一用户在所有群 + 私聊的消息都进入上下文。
+
+**接管范围矩阵**：
+
+| `cross_session` | `full_group` | 数据范围 |
+|---|---|---|
+| F | F | 同 CID 同用户 |
+| T | F | **跨 CID 跨 umo 同用户**（群私聊互通） |
+| F | T | 同 CID 同群全员 |
+| T | T | 跨 CID 跨 umo 全 platform（慎用） |
+
+**实现**：
+- `storage.py` 加 `_umo_filter(umo, cross_umo)` 辅助函数 + `query_rounds_raw` / `query_messages_raw` 加 `cross_umo: bool=False` 参数
+- `main.py` `_takeover_query` 在 `ct_cross_session=True` 时传 `cross_umo=True`
+- EXISTS 子查的 `a.umo = chat_memory_records.umo` 行内自连接保留，跨 umo 后每条 user 仍能在自己 umo 内找配对 assistant（依赖 `message_id` 全平台唯一，aiocqhttp 满足）
+
+**副作用**：旧行为依赖者（极少）从"跨 CID 同 umo"变"跨 CID 跨 umo"，对单群单私聊用户无变化。
+
+**文档同步**：`_conf_schema.json` description 改"跨会话目标（群私聊互通）"，hint 重写；`README.md` 表格 + 接管范围说明对齐。
+
 ### 修复 user content_kind 错标导致 takeover 完全失效
 
 **Bug**：`_classify_content` 只从 `event.message_chain` 提取 Plain 组件判 text kind。但 AstrBot 部分 Provider/适配器把 user 文本放在 `event.message_str`，message_chain 为空 → kind 错标为 `[]`。生产环境实测 100% user 消息都被错标。

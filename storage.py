@@ -515,6 +515,7 @@ class DBManager:
         limit_rounds: int,
         include_kinds: Optional[set[str]] = None,
         all_match: bool = False,
+        cross_umo: bool = False,
     ) -> list[list[dict]]:
         """内部方法：配对模式查询（takeover 专用）。
 
@@ -523,6 +524,9 @@ class DBManager:
 
         ``conversation_id`` 为 None 时跨 CID（``query_rounds_mo`` 等价）。
         ``user_id`` 为 None 时不按用户过滤（``full_group`` 场景）。
+        ``cross_umo=True`` 时按 ``platform_id``（从 umo 提取）跨 umo 同 platform 聚合，
+        实现群私聊互通；EXISTS 子查的 ``a.umo = chat_memory_records.umo`` 是行内
+        自连接，跨 umo 仍保证 user/assistant 在同一 umo 内配对。
 
         ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
         - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
@@ -531,8 +535,9 @@ class DBManager:
         """
         await self.init_db()
         async with self.async_session() as session:
+            umo_cond, umo_param = _umo_filter(umo, cross_umo)
             conditions = [
-                "umo = :umo",
+                umo_cond,
                 "role = 'user'",
                 (
                     "EXISTS (SELECT 1 FROM chat_memory_records a "
@@ -541,7 +546,7 @@ class DBManager:
                     "AND a.pair_id = chat_memory_records.message_id)"
                 ),
             ]
-            params: dict = {"umo": umo, "lim": limit_rounds}
+            params: dict = {**umo_param, "lim": limit_rounds}
             expanding_binds: list[str] = []
 
             if conversation_id:
@@ -585,9 +590,9 @@ class DBManager:
             user_msg_ids = [r[3] for r in user_rows]  # message_id 在第 4 列
             assistant_map: dict[str, list[dict]] = {}
             if user_msg_ids:
-                # assistant 查询同样需要处理 conversation_id
-                asst_conditions = ["umo = :umo", "role = 'assistant'", "pair_id IN :pids"]
-                asst_params = {"umo": umo, "pids": user_msg_ids}
+                # assistant 查询：与 user 同维度（umo 或 platform_id），按 pair_id 配对
+                asst_conditions = [umo_cond, "role = 'assistant'", "pair_id IN :pids"]
+                asst_params = {**umo_param, "pids": user_msg_ids}
                 if conversation_id:
                     asst_conditions.append("conversation_id = :cid")
                     asst_params["cid"] = conversation_id
@@ -619,11 +624,13 @@ class DBManager:
         statuses: set[str],
         include_kinds: Optional[set[str]] = None,
         all_match: bool = False,
+        cross_umo: bool = False,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
         查询全量消息（user + assistant），按 ``limit_messages`` 条数切片。
         ``conversation_id`` 为 None 时跨 CID，``user_id`` 为 None 时不按用户过滤。
+        ``cross_umo=True`` 时按 ``platform_id``（从 umo 提取）跨 umo 同 platform 聚合。
         ``statuses`` 过滤 llm_status（IN 语义）。
 
         ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
@@ -632,11 +639,12 @@ class DBManager:
         """
         await self.init_db()
         async with self.async_session() as session:
+            umo_cond, umo_param = _umo_filter(umo, cross_umo)
             conditions = [
-                "umo = :umo",
+                umo_cond,
                 "role IN ('user', 'assistant')",
             ]
-            params: dict = {"umo": umo, "lim": limit_messages}
+            params: dict = {**umo_param, "lim": limit_messages}
             expanding_binds: list[str] = []
 
             if conversation_id:
@@ -679,6 +687,19 @@ class DBManager:
 
 
 # SELECT 列顺序固定，_row_to_dict 按位置映射
+def _umo_filter(umo: str, cross_umo: bool) -> tuple[str, dict]:
+    """构造 umo 维度的 WHERE 条件。
+
+    - ``cross_umo=False``：精确匹配 ``umo = :umo``
+    - ``cross_umo=True``：按 ``platform_id``（从 umo 提取首段）跨 umo 聚合，
+      实现群私聊互通。要求 umo 非空且含 ``:`` 分隔。
+    """
+    if cross_umo:
+        pid = umo.split(":", 1)[0] if umo else ""
+        return "platform_id = :pid", {"pid": pid}
+    return "umo = :umo", {"umo": umo}
+
+
 _SELECT_COLS = (
     "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
     "platform_id, platform_name, message_type, session_id, self_id, "
