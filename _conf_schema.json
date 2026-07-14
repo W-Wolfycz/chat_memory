@@ -91,6 +91,12 @@
         "type": "bool",
         "default": true,
         "hint": "每轮清空系统自带的对话历史，避免重复。建议保持开启。"
+      },
+      "filter_by_persona": {
+        "description": "按 persona 隔离",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后查询严格按当前 persona 过滤——切换 persona 时旧 persona 时期的对话自动隔离，切回后自然回归。persona_id 为空（如老库 ALTER 补列后的旧行）会跳过过滤避免老数据全被滤光。与 cross_session=T 协同可获得完整体验：切 persona + /new + 切回旧 persona 仍能拉到旧 cid 的旧数据。cross_session=F 时 /new 后切回旧 persona 拿不到旧 cid 数据（cid 维度卡死，非 persona 问题）。"
       }
     }
   }

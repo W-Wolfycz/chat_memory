@@ -85,6 +85,9 @@ class ChatMemoryPlugin(Star):
         self.ct_include_kinds: set[str] = set(ct_conf.get("include_content_kinds", ["text"]) or [])
         # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
         self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
+        # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时跳过（兜底）
+        # 与 cross_session=T 协同可获完整 persona 隔离体验（切 persona + /new + 切回仍可见旧数据）
+        self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
 
         data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
         self.db = DBManager(data_dir)
@@ -369,6 +372,20 @@ class ChatMemoryPlugin(Star):
         except Exception:
             return ""
 
+    async def _get_curr_persona(self, umo: str, cid: Optional[str] = None) -> str:
+        """取当前 conversation 的 persona_id。cid 未提供则先查 curr cid。
+        失败或无 persona 返回空串（filter_by_persona 兜底：空串不过滤）。"""
+        try:
+            conv_mgr = self.context.conversation_manager
+            if not cid:
+                cid = await conv_mgr.get_curr_conversation_id(umo)
+            if not cid:
+                return ""
+            conv = await conv_mgr.get_conversation(umo, cid)
+            return getattr(conv, "persona_id", "") or ""
+        except Exception:
+            return ""
+
     @staticmethod
     def _get_message_id(event: AstrMessageEvent) -> str:
         msg_obj = getattr(event, "message_obj", None)
@@ -498,12 +515,17 @@ class ChatMemoryPlugin(Star):
         msg_id = self._get_message_id(event)
         no_mid = not msg_id
 
+        # 取当前 persona_id 缓存到 extras，capture_bot 复用避免二次查询
+        persona_id = await self._get_curr_persona(umo, cid)
+        event.set_extra("chat_memory_persona_id", persona_id)
+
         audit = self._collect_audit_fields(event)
         ok = await self._safe_insert(
             umo, cid, user_id, "user", self._truncate(content),
             message_id=msg_id or None, pair_id=None,
             llm_status=_LLM_DEFAULT, content_kind=kind,
             at_id=at_id, reply_id=reply_id, forward_id=forward_id,
+            persona_id=persona_id or None,
             **audit,
         )
         if not ok:
@@ -590,7 +612,12 @@ class ChatMemoryPlugin(Star):
             return
 
         user_id = event.get_sender_id() or ""
-        records = await self._takeover_query(umo, cid, user_id)
+        # persona_id：on_llm_request 时 req.conversation 已就绪，直接读避免二次查 conv_mgr
+        persona_id = ""
+        if self.ct_filter_by_persona:
+            conv = getattr(req, "conversation", None)
+            persona_id = getattr(conv, "persona_id", "") or ""
+        records = await self._takeover_query(umo, cid, user_id, persona_id)
         if not records:
             self._log(f"{self._log_prefix(event)} 接管跳过：CM 无数据")
             return
@@ -611,7 +638,9 @@ class ChatMemoryPlugin(Star):
             f"cid={cid[:8]})"
         )
 
-    async def _takeover_query(self, umo: str, cid: str, user_id: str) -> list[dict]:
+    async def _takeover_query(
+        self, umo: str, cid: str, user_id: str, persona_id: str = "",
+    ) -> list[dict]:
         """按 cross_session / full_group / 配对模式 查询 CM 数据，返回扁平化 records 列表。
 
         两种查询模式：
@@ -621,11 +650,15 @@ class ChatMemoryPlugin(Star):
         ``limit_rounds`` 含义随模式变化：
         - 配对模式 → 轮数（user-assistant 一对为一轮）
         - 混合模式 → 消息数（单条记录）
+
+        ``persona_id``：仅当 ``ct_filter_by_persona=True`` 时由调用方填入（取自
+        ``req.conversation.persona_id``）；为空时 storage 层跳过 persona 过滤。
         """
         limit = self.ct_limit_rounds
         status_set: set[str] = set(self.ct_llm_status_filter)
         include_kinds = self.ct_include_kinds  # set[str]
         all_match = self.ct_include_all_match
+        filter_by_persona = self.ct_filter_by_persona
 
         # 判断配对模式：仅 llm_success
         is_pair_only = (status_set == {"llm_success"})
@@ -644,6 +677,7 @@ class ChatMemoryPlugin(Star):
                 rounds = await self.db.query_rounds_raw(
                     umo, target_cid, user_id, limit, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
+                    persona_id=persona_id, filter_by_persona=filter_by_persona,
                 )
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
@@ -652,6 +686,7 @@ class ChatMemoryPlugin(Star):
                 records = await self.db.query_messages_raw(
                     umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
+                    persona_id=persona_id, filter_by_persona=filter_by_persona,
                 )
 
             # 防御性全局排序（混合模式下 messages_raw 已排序，但保持一致）
@@ -876,11 +911,16 @@ class ChatMemoryPlugin(Star):
                 self._log(f"{self._log_prefix(event)} assistant 平台无 mid，pair_id 留空")
 
         content = self._truncate(bot_text) if bot_text else self._content_placeholder(asst_kind)
+        # persona_id：优先从 extras（capture_user 已缓存）；兜底重查
+        persona_id = event.get_extra("chat_memory_persona_id")
+        if persona_id is None:
+            persona_id = await self._get_curr_persona(umo, cid)
         audit = self._collect_audit_fields(event)
         self._spawn_tasks(self._safe_insert(
             umo, cid, user_id, "assistant", content,
             message_id=None, pair_id=pair_id,
             llm_status=asst_status, content_kind=asst_kind,
+            persona_id=persona_id or None,
             **audit,
         ))
         self._log(
@@ -937,15 +977,21 @@ class ChatMemoryPlugin(Star):
         llm_status: Optional[Union[str, list[str]]] = None,
         content_kind: Optional[Union[str, list[str]]] = None,
         role_filter: Optional[str] = None,
+        persona_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> list[dict]:
         """查询会话历史。``user_id`` 为空时返回该会话所有用户的混合记录（群聊场景）。
 
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
         ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录（``'user'`` / ``'assistant'``）。
+        ``persona_id`` 给定时按 persona 严格过滤（None / 空串跳过）。
+        ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点，tz-aware 自动转 UTC）。
         """
         return await self.db.query_latest(
             umo, conversation_id, user_id, limit, llm_status, content_kind, role_filter,
+            persona_id=persona_id, since=since, until=until,
         )
 
     async def query_rounds(
@@ -956,13 +1002,20 @@ class ChatMemoryPlugin(Star):
         limit_rounds: int = 10,
         llm_status: Optional[Union[str, list[str]]] = None,
         content_kind: Optional[Union[str, list[str]]] = None,
+        persona_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> list[list[dict]]:
         """按轮次返回 user-assistant 配对。每轮 ``[user_dict, assistant_dict]`` 两条。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
+        ``persona_id`` 给定时按 persona 过滤（user + assistant 都加，保证配对同 persona）。
+        ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加，保证配对
+        在时间窗口内；EXISTS 子查不限时间，保持"有配对"语义）。
         """
         return await self.db.query_rounds(
             umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
+            persona_id=persona_id, since=since, until=until,
         )
 
     # ── 内部工具 ──────────────────────────────────────
@@ -976,7 +1029,7 @@ class ChatMemoryPlugin(Star):
         self_id: Optional[str] = None, group_id: Optional[str] = None,
         sender_nickname: Optional[str] = None, raw_timestamp: Optional[int] = None,
         at_id: Optional[str] = None, reply_id: Optional[str] = None,
-        forward_id: Optional[str] = None,
+        forward_id: Optional[str] = None, persona_id: Optional[str] = None,
     ) -> bool:
         try:
             await self.db.insert(
@@ -987,6 +1040,7 @@ class ChatMemoryPlugin(Star):
                 self_id=self_id, group_id=group_id, sender_nickname=sender_nickname,
                 raw_timestamp=raw_timestamp,
                 at_id=at_id, reply_id=reply_id, forward_id=forward_id,
+                persona_id=persona_id,
             )
             return True
         except Exception as e:

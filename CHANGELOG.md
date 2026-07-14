@@ -1,5 +1,52 @@
 # Changelog
 
+## 2.3.4 — 2026-07-15
+
+### persona 隔离（filter_by_persona）
+
+新增 `persona_id` 列 + `filter_by_persona` 配置，让 CM 查询按当前 persona 严格过滤。切换 persona 时旧 persona 时期的对话自动隔离，切回后自然回归。
+
+**改动**：
+
+| 层 | 改动 |
+|---|---|
+| **schema** | 加 `persona_id TEXT` 列 + `ix_cm_persona` 索引；v2.3.3 老库（有 `llm_status` 缺 `persona_id`）自动 `ALTER TABLE ADD COLUMN` 补列（纯增列，不 RENAME 备份） |
+| **入库** | `capture_user` / `capture_bot` 从 `conversation.persona_id` 取值填入；user 端缓存到 extras 供 bot 复用避免二次查 conv_mgr |
+| **查询** | `query_rounds_raw` / `query_messages_raw` 加 `persona_id` + `filter_by_persona` 参数；user + EXISTS + assistant 三处一致加 `persona_id = :persona_id` 条件（配对模式） |
+| **takeover** | `_takeover_query` 从 `req.conversation.persona_id` 取当前 persona 透传；`filter_by_persona=False` 时 persona_id 不参与过滤 |
+| **配置** | `_conf_schema.json` 加 `filter_by_persona` 布尔项，默认 `false`（现行行为不变） |
+
+**与 cross_session 的协同**：
+
+| `filter_by_persona` | `cross_session` | 切 persona + /new + 切回旧行为 |
+|---|---|---|
+| F | F | 现行行为 |
+| T | F | persona 隔离，但 /new 后切不回旧 persona 数据（cid 卡死） |
+| F | T | 跨 cid 聚合，persona 不卡 |
+| **T** | **T** | **完整隔离体验**——切 persona + /new + 切回仍能拉到旧 cid 的旧数据 |
+
+**兜底**：`persona_id` 为空（老库 ALTER 补列后的 NULL 旧行 / 边缘平台取不到 persona）时即使 `filter_by_persona=True` 也跳过过滤，避免老数据全被滤光。
+
+**未覆盖**：cid 不会自动随 persona 切换——同一 cid 下可能累积多个 persona 的数据。如需"切 persona 自动开新 cid"见 TODO。
+
+新增 T38 测试覆盖 schema 静态 + 透传 + 真实 sqlite 行为 + 跨 cid persona 过滤。
+
+### 对外 API 查询参数扩展
+
+`query_history` / `query_rounds` 新增三个可选参数（纯增量，默认 None 时行为与 v2.3.3 一致）：
+
+| 参数 | 类型 | 作用 |
+|---|---|---|
+| `persona_id` | `Optional[str]` | 按 persona 严格过滤（None / 空串跳过）；`query_rounds` 的 user + assistant 都加条件，保证配对同 persona |
+| `since` | `Optional[datetime]` | `created_at >= since`（含端点）；tz-aware 自动转 UTC naive |
+| `until` | `Optional[datetime]` | `created_at <= until`（含端点）；同上 |
+
+**EXISTS 子查语义**：`query_rounds` 的 EXISTS 子查**不**加 persona / 时间条件，保持"有配对"语义。若配对 assistant 落在过滤范围外（如 persona 不一致或时间窗口外），该 user 仍被选中但 assistant 查询返回空，结果是 `[user_dict]` 一条。
+
+**时区归一化**：新增 `_normalize_dt` 辅助函数——None 透传、tz-aware 转 UTC naive、naive 假定已 UTC（与 `insert` 的 `datetime.now(timezone.utc).replace(tzinfo=None)` 对齐）。
+
+新增 T39 测试覆盖静态签名 + 真实 sqlite 行为 + EXISTS 语义。
+
 ## 2.3.3 — 2026-07-14
 
 整合配对正确性修复、cross_session 升级、消息捕获分类、reasoning 污染防护、CODE_REVIEW 加固批次。

@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS chat_memory_records (
     at_id           TEXT,
     reply_id        TEXT,
     forward_id      TEXT,
+    persona_id      TEXT,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )"""
 
@@ -54,6 +55,7 @@ _CREATE_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS ix_cm_platform_group_time ON chat_memory_records (platform_id, group_id, created_at)",
     "CREATE INDEX IF NOT EXISTS ix_cm_llm_status ON chat_memory_records (llm_status)",
     "CREATE INDEX IF NOT EXISTS ix_cm_umo_role_time ON chat_memory_records (umo, role, created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_cm_persona ON chat_memory_records (persona_id)",
 )
 
 
@@ -105,6 +107,12 @@ class DBManager:
                         f"ALTER TABLE chat_memory_records RENAME TO {backup_name}"
                     ))
                     # 备份表的旧索引会跟着改名或保留（SQLite 行为），这里不主动清理
+                    existing_cols = set()  # 触发下面 CREATE 新表
+                elif existing_cols and "persona_id" not in existing_cols:
+                    # v2.3.3 老库：已有 llm_status 但缺 persona_id，纯增列补上
+                    await conn.execute(text(
+                        "ALTER TABLE chat_memory_records ADD COLUMN persona_id TEXT"
+                    ))
                 await conn.execute(text(_CREATE_TABLE_SQL))
                 for idx_sql in _CREATE_INDEX_SQL:
                     await conn.execute(text(idx_sql))
@@ -132,6 +140,7 @@ class DBManager:
         at_id: Optional[str] = None,
         reply_id: Optional[str] = None,
         forward_id: Optional[str] = None,
+        persona_id: Optional[str] = None,
     ) -> None:
         await self.init_db()
         kind_json = json.dumps(content_kind or [], ensure_ascii=False)
@@ -143,11 +152,11 @@ class DBManager:
                     "llm_status, content_kind, "
                     "platform_id, platform_name, message_type, session_id, self_id, "
                     "group_id, sender_nickname, raw_timestamp, "
-                    "at_id, reply_id, forward_id, created_at) "
+                    "at_id, reply_id, forward_id, persona_id, created_at) "
                     "VALUES (:umo, :cid, :uid, :role, :content, :mid, :pid, "
                     ":lstatus, :ckind, "
                     ":pid_plat, :pname, :mtype, :sid, :self_id, "
-                    ":gid, :nick, :rts, :at_id, :reply_id, :fwd_id, :now)"
+                    ":gid, :nick, :rts, :at_id, :reply_id, :fwd_id, :per_id, :now)"
                 ),
                 {
                     "umo": umo,
@@ -170,6 +179,7 @@ class DBManager:
                     "at_id": at_id,
                     "reply_id": reply_id,
                     "fwd_id": forward_id,
+                    "per_id": persona_id,
                     "now": datetime.now(timezone.utc).replace(tzinfo=None),
                 },
             )
@@ -201,6 +211,9 @@ class DBManager:
         llm_status: Optional[Union[str, list[str]]] = None,
         content_kind: Optional[Union[str, list[str]]] = None,
         role_filter: Optional[str] = None,
+        persona_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> list[dict]:
         """查询最近 N 条记录（按时间升序返回）。
 
@@ -208,6 +221,9 @@ class DBManager:
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
         ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录。
+        ``persona_id`` 给定时按 persona 严格过滤（None / 空串跳过，与 takeover 的 filter_by_persona 对齐）。
+        ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点）；
+        ``datetime`` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 ``CURRENT_TIMESTAMP`` 对齐）。
 
         ``limit`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）导致全库返回。
         """
@@ -246,6 +262,18 @@ class DBManager:
                     params["kinds"] = kind_list
                     expanding_binds.append("kinds")
 
+            since_norm = _normalize_dt(since)
+            until_norm = _normalize_dt(until)
+            if since_norm:
+                conditions.append("created_at >= :since")
+                params["since"] = since_norm
+            if until_norm:
+                conditions.append("created_at <= :until")
+                params["until"] = until_norm
+            if persona_id:
+                conditions.append("persona_id = :persona_id")
+                params["persona_id"] = persona_id
+
             where = " AND ".join(conditions)
             params["lim"] = limit
 
@@ -266,6 +294,9 @@ class DBManager:
         limit_rounds: int = 10,
         llm_status: Optional[Union[str, list[str]]] = None,
         content_kind: Optional[Union[str, list[str]]] = None,
+        persona_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
     ) -> list[list[dict]]:
         """按配对返回对话轮次。每轮保证 ``[user_dict, assistant_dict]`` 两条。
 
@@ -273,6 +304,12 @@ class DBManager:
         因此 ``limit_rounds`` 轮对应 ``2 * limit_rounds`` 条记录。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
+        ``persona_id`` 给定时按 persona 过滤（user + assistant 都加条件，保证配对同 persona；
+        None / 空串跳过）。EXISTS 子查不加 persona 条件，保持"有配对"语义——若配对
+        assistant 的 persona 与 ``persona_id`` 不一致，该 user 仍会被选中但 assistant 查询
+        返回空，结果是 ``[user_dict]`` 一条。
+        ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加，保证返回
+        记录都在时间窗口内；EXISTS 子查不限时间）；``datetime`` tz-aware 自动转 UTC naive。
 
         ``limit_rounds`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）。
         """
@@ -316,6 +353,19 @@ class DBManager:
                     )
                     user_params["kinds"] = kind_list
                     expanding_binds.append("kinds")
+
+            since_norm = _normalize_dt(since)
+            until_norm = _normalize_dt(until)
+            if since_norm:
+                conditions.append("created_at >= :since")
+                user_params["since"] = since_norm
+            if until_norm:
+                conditions.append("created_at <= :until")
+                user_params["until"] = until_norm
+            if persona_id:
+                conditions.append("persona_id = :persona_id")
+                user_params["persona_id"] = persona_id
+
             where = " AND ".join(conditions)
             user_params["lim"] = limit_rounds
 
@@ -333,14 +383,32 @@ class DBManager:
             user_msg_ids = [r[3] for r in user_rows]
             assistant_map: dict[str, list[dict]] = {}
             if user_msg_ids:
+                asst_conditions = [
+                    "umo = :umo",
+                    "conversation_id = :cid",
+                    "role = 'assistant'",
+                    "pair_id IN :pids",
+                ]
+                asst_params: dict = {
+                    "umo": umo, "cid": conversation_id, "pids": user_msg_ids,
+                }
+                if since_norm:
+                    asst_conditions.append("created_at >= :since")
+                    asst_params["since"] = since_norm
+                if until_norm:
+                    asst_conditions.append("created_at <= :until")
+                    asst_params["until"] = until_norm
+                if persona_id:
+                    asst_conditions.append("persona_id = :persona_id")
+                    asst_params["persona_id"] = persona_id
                 asst_sql = (
-                    _SELECT_COLS + " FROM chat_memory_records "
-                    "WHERE umo = :umo AND conversation_id = :cid AND role = 'assistant' "
-                    "AND pair_id IN :pids ORDER BY created_at ASC, id ASC"
+                    _SELECT_COLS + " FROM chat_memory_records WHERE "
+                    + " AND ".join(asst_conditions) +
+                    " ORDER BY created_at ASC, id ASC"
                 )
                 asst_result = await session.execute(
                     text(asst_sql).bindparams(bindparam("pids", expanding=True)),
-                    {"umo": umo, "cid": conversation_id, "pids": user_msg_ids},
+                    asst_params,
                 )
                 for r in asst_result.fetchall():
                     # key 用 pair_id（r[4]），而非 message_id（r[3]，assistant 恒为 None）
@@ -401,6 +469,8 @@ class DBManager:
         all_match: bool = False,
         cross_umo: bool = False,
         full_group: bool = False,
+        persona_id: Optional[str] = None,
+        filter_by_persona: bool = False,
     ) -> list[list[dict]]:
         """内部方法：配对模式查询（takeover 专用）。
 
@@ -421,6 +491,10 @@ class DBManager:
         - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
         - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
         仅在 user 查询时过滤（assistant 不过滤，与配对语义一致）。
+
+        ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤（user + EXISTS + assistant
+        三处都加条件，保证配对同 persona）；``persona_id`` 为空时跳过过滤（兜底老库 ALTER
+        补列后的 NULL 旧行，避免老数据全被滤光）。
         """
         await self.init_db()
         async with self.async_session() as session:
@@ -441,6 +515,13 @@ class DBManager:
             if conversation_id:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
+
+            # persona 过滤：user + EXISTS + assistant 三处一致，保证配对同 persona
+            persona_cond = None
+            if filter_by_persona and persona_id:
+                persona_cond = "persona_id = :persona_id"
+                conditions.append(persona_cond)
+                params["persona_id"] = persona_id
 
             # include_kinds：白名单
             if include_kinds:
@@ -481,6 +562,9 @@ class DBManager:
                 if conversation_id:
                     asst_conditions.append("conversation_id = :cid")
                     asst_params["cid"] = conversation_id
+                if persona_cond:
+                    asst_conditions.append(persona_cond)
+                    asst_params["persona_id"] = persona_id
                 asst_sql = (
                     _SELECT_COLS + " FROM chat_memory_records WHERE "
                     + " AND ".join(asst_conditions) +
@@ -512,6 +596,8 @@ class DBManager:
         all_match: bool = False,
         cross_umo: bool = False,
         full_group: bool = False,
+        persona_id: Optional[str] = None,
+        filter_by_persona: bool = False,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
@@ -527,6 +613,9 @@ class DBManager:
         ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
         - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
         - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
+
+        ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤；``persona_id`` 为空时
+        跳过（兜底老库 ALTER 补列后的 NULL 旧行）。
         """
         await self.init_db()
         async with self.async_session() as session:
@@ -541,6 +630,10 @@ class DBManager:
             if conversation_id:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
+
+            if filter_by_persona and persona_id:
+                conditions.append("persona_id = :persona_id")
+                params["persona_id"] = persona_id
 
             if statuses:
                 conditions.append("llm_status IN :statuses")
@@ -574,6 +667,22 @@ class DBManager:
 
 
 # SELECT 列顺序固定，_row_to_dict 按位置映射
+def _normalize_dt(dt: Optional[datetime]) -> Optional[datetime]:
+    """归一化 datetime 为 UTC naive（与 schema default ``CURRENT_TIMESTAMP`` 对齐）。
+
+    - None 透传
+    - tz-aware 转 UTC naive
+    - naive 假定已经是 UTC（与 ``insert`` 里 ``datetime.now(timezone.utc).replace(tzinfo=None)`` 一致）
+
+    供对外 API ``query_latest`` / ``query_rounds`` 的 ``since`` / ``until`` 参数使用。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def _scope_filter(
     umo: str,
     user_id: Optional[str],
@@ -631,14 +740,15 @@ def _scope_filter(
 _SELECT_COLS = (
     "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
     "platform_id, platform_name, message_type, session_id, self_id, "
-    "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, created_at"
+    "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, "
+    "persona_id, created_at"
 )
 
 # 列位置索引（与 _SELECT_COLS 一一对应）
 # 0 role | 1 content | 2 user_id | 3 message_id | 4 pair_id
 # 5 llm_status | 6 content_kind | 7 platform_id | 8 platform_name | 9 message_type
 # 10 session_id | 11 self_id | 12 group_id | 13 sender_nickname | 14 raw_timestamp
-# 15 at_id | 16 reply_id | 17 forward_id | 18 created_at
+# 15 at_id | 16 reply_id | 17 forward_id | 18 persona_id | 19 created_at
 
 
 def _row_to_dict(r) -> dict:
@@ -666,5 +776,6 @@ def _row_to_dict(r) -> dict:
         "at_id": r[15],
         "reply_id": r[16],
         "forward_id": r[17],
-        "created_at": str(r[18]),
+        "persona_id": r[18],
+        "created_at": str(r[19]),
     }
