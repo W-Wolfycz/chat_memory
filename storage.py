@@ -141,6 +141,7 @@ class DBManager:
         reply_id: Optional[str] = None,
         forward_id: Optional[str] = None,
         persona_id: Optional[str] = None,
+        created_at: Optional[datetime] = None,
     ) -> None:
         await self.init_db()
         kind_json = json.dumps(content_kind or [], ensure_ascii=False)
@@ -180,7 +181,7 @@ class DBManager:
                     "reply_id": reply_id,
                     "fwd_id": forward_id,
                     "per_id": persona_id,
-                    "now": datetime.now(timezone.utc).replace(tzinfo=None),
+                    "now": created_at if created_at is not None else datetime.now(timezone.utc).replace(tzinfo=None),
                 },
             )
             await session.commit()
@@ -492,9 +493,9 @@ class DBManager:
         - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
         仅在 user 查询时过滤（assistant 不过滤，与配对语义一致）。
 
-        ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤（user + EXISTS + assistant
-        三处都加条件，保证配对同 persona）；``persona_id`` 为空时跳过过滤（兜底老库 ALTER
-        补列后的 NULL 旧行，避免老数据全被滤光）。
+        ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤（user + assistant
+        两处都加条件，保证配对同 persona；EXISTS 子查不加，保持"有配对"语义）；
+        ``persona_id`` 为空时过滤 ``IS NULL OR ''`` 的记录（匹配老库补列后的旧行）。
         """
         await self.init_db()
         async with self.async_session() as session:
@@ -516,12 +517,16 @@ class DBManager:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
 
-            # persona 过滤：user + EXISTS + assistant 三处一致，保证配对同 persona
+            # persona 过滤：user + assistant 两处一致（EXISTS 不加，保持"有配对"语义）
             persona_cond = None
-            if filter_by_persona and persona_id:
-                persona_cond = "persona_id = :persona_id"
-                conditions.append(persona_cond)
-                params["persona_id"] = persona_id
+            if filter_by_persona:
+                if persona_id:
+                    persona_cond = "persona_id = :persona_id"
+                    conditions.append(persona_cond)
+                    params["persona_id"] = persona_id
+                else:
+                    persona_cond = "(persona_id IS NULL OR persona_id = '')"
+                    conditions.append(persona_cond)
 
             # include_kinds：白名单
             if include_kinds:
@@ -615,7 +620,7 @@ class DBManager:
         - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
 
         ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤；``persona_id`` 为空时
-        跳过（兜底老库 ALTER 补列后的 NULL 旧行）。
+        过滤 ``IS NULL OR ''`` 的记录（匹配老库补列后的旧行）。
         """
         await self.init_db()
         async with self.async_session() as session:
@@ -631,9 +636,12 @@ class DBManager:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
 
-            if filter_by_persona and persona_id:
-                conditions.append("persona_id = :persona_id")
-                params["persona_id"] = persona_id
+            if filter_by_persona:
+                if persona_id:
+                    conditions.append("persona_id = :persona_id")
+                    params["persona_id"] = persona_id
+                else:
+                    conditions.append("(persona_id IS NULL OR persona_id = '')")
 
             if statuses:
                 conditions.append("llm_status IN :statuses")

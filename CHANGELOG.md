@@ -11,9 +11,9 @@
 | 层 | 改动 |
 |---|---|
 | **schema** | 加 `persona_id TEXT` 列 + `ix_cm_persona` 索引；v2.3.3 老库（有 `llm_status` 缺 `persona_id`）自动 `ALTER TABLE ADD COLUMN` 补列（纯增列，不 RENAME 备份） |
-| **入库** | `capture_user` / `capture_bot` 从 `conversation.persona_id` 取值填入；user 端缓存到 extras 供 bot 复用避免二次查 conv_mgr |
-| **查询** | `query_rounds_raw` / `query_messages_raw` 加 `persona_id` + `filter_by_persona` 参数；user + EXISTS + assistant 三处一致加 `persona_id = :persona_id` 条件（配对模式） |
-| **takeover** | `_takeover_query` 从 `req.conversation.persona_id` 取当前 persona 透传；`filter_by_persona=False` 时 persona_id 不参与过滤 |
+| **入库** | `capture_user` / `capture_bot` 调用 `_get_effective_persona` 取值，内部走 `persona_manager.resolve_selected_persona`（session 规则 > conversation > config 默认），与 `_ensure_persona_and_skills` 同源；user 端缓存到 extras 供 bot 复用 |
+| **查询** | `query_rounds_raw` / `query_messages_raw` 加 `persona_id` + `filter_by_persona` 参数；user + assistant 两处加条件（EXISTS 子查不加，保持"有配对"语义）。**严格过滤**：`persona_id` 非空 → `= :persona_id`；为空 → `IS NULL OR ''`（老数据不再泄漏） |
+| **takeover** | `_takeover_query` 通过 `_get_effective_persona` 取当前生效 persona 透传（与 capture 路径一致）；`filter_by_persona=False` 时 persona_id 不参与过滤；`filter_by_persona=True` 但 persona_id 为空时打 warn 日志 |
 | **配置** | `_conf_schema.json` 加 `filter_by_persona` 布尔项，默认 `false`（现行行为不变） |
 
 **与 cross_session 的协同**：
@@ -25,11 +25,13 @@
 | F | T | 跨 cid 聚合，persona 不卡 |
 | **T** | **T** | **完整隔离体验**——切 persona + /new + 切回仍能拉到旧 cid 的旧数据 |
 
-**兜底**：`persona_id` 为空（老库 ALTER 补列后的 NULL 旧行 / 边缘平台取不到 persona）时即使 `filter_by_persona=True` 也跳过过滤，避免老数据全被滤光。
+**兜底**：`persona_id` 为空时 `filter_by_persona=True` 严格过滤 `persona_id IS NULL OR ''`（匹配老库补列后的 NULL 旧行），不再全量跳过。空 persona 时打 warn 日志提醒用户。
 
 **未覆盖**：cid 不会自动随 persona 切换——同一 cid 下可能累积多个 persona 的数据。如需"切 persona 自动开新 cid"见 TODO。
 
-新增 T38 测试覆盖 schema 静态 + 透传 + 真实 sqlite 行为 + 跨 cid persona 过滤。
+**时区感知**：`created_at` 改为读取 AstrBot 全局 `timezone` 配置（IANA 名称如 `Asia/Shanghai`），落库时间戳按配置时区生成而非硬编码 UTC。`storage.insert` 新增可选 `created_at` 参数（None 时回退 UTC）。`main.py` 加 `_now()` helper。
+
+新增 T38 测试覆盖 schema 静态 + 透传 + 真实 sqlite 行为 + 跨 cid persona 过滤 + 严格过滤 + warn 日志。
 
 ### 对外 API 查询参数扩展
 

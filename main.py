@@ -19,9 +19,10 @@ assistant 配对：``pair_id`` = 对应 user 的 ``message_id``；平台无 mid 
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from typing import Optional, Union
+from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api.star import Star, Context
@@ -88,6 +89,13 @@ class ChatMemoryPlugin(Star):
         # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时跳过（兜底）
         # 与 cross_session=T 协同可获完整 persona 隔离体验（切 persona + /new + 切回仍可见旧数据）
         self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
+
+        # 读取 AstrBot 全局时区配置（IANA 名称如 "Asia/Shanghai"），用于 created_at 生成
+        try:
+            tz_name = context.get_config().get("timezone", "Asia/Shanghai")
+            self._tz = ZoneInfo(tz_name)
+        except Exception:
+            self._tz = ZoneInfo("Asia/Shanghai")
 
         data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
         self.db = DBManager(data_dir)
@@ -178,6 +186,10 @@ class ChatMemoryPlugin(Star):
         if self.max_len <= 0:
             return text
         return text[:self.max_len]
+
+    def _now(self) -> datetime:
+        """返回当前时刻的 naive datetime（按 AstrBot 配置时区）。"""
+        return datetime.now(self._tz).replace(tzinfo=None)
 
     @staticmethod
     def _strip_reasoning_prefix(text: str) -> str:
@@ -386,6 +398,29 @@ class ChatMemoryPlugin(Star):
         except Exception:
             return ""
 
+    async def _get_effective_persona(self, umo: str, event: AstrMessageEvent,
+                                     cid: Optional[str] = None) -> str:
+        """通过 resolve_selected_persona 获取当前实际生效的 persona_id。
+
+        与 _ensure_persona_and_skills 同源，保证 CM 记录/过滤的 persona 与 LLM
+        实际使用的 persona 一致。优先级：session 规则 > conversation.persona_id > config 默认。
+        None / '[%None]' / 异常一律返回空串（兜底跳过过滤）。
+        """
+        try:
+            conv_persona_id = await self._get_curr_persona(umo, cid) or None
+            cfg = self.context.get_config(umo=umo).get("provider_settings", {})
+            resolved, _, _, _ = await self.context.persona_manager.resolve_selected_persona(
+                umo=umo,
+                conversation_persona_id=conv_persona_id,
+                platform_name=event.get_platform_name(),
+                provider_settings=cfg,
+            )
+            if resolved and resolved != "[%None]":
+                return resolved
+            return ""
+        except Exception:
+            return ""
+
     @staticmethod
     def _get_message_id(event: AstrMessageEvent) -> str:
         msg_obj = getattr(event, "message_obj", None)
@@ -515,8 +550,8 @@ class ChatMemoryPlugin(Star):
         msg_id = self._get_message_id(event)
         no_mid = not msg_id
 
-        # 取当前 persona_id 缓存到 extras，capture_bot 复用避免二次查询
-        persona_id = await self._get_curr_persona(umo, cid)
+        # 取当前生效 persona_id 缓存到 extras，capture_bot 复用避免二次查询
+        persona_id = await self._get_effective_persona(umo, event, cid)
         event.set_extra("chat_memory_persona_id", persona_id)
 
         audit = self._collect_audit_fields(event)
@@ -526,6 +561,7 @@ class ChatMemoryPlugin(Star):
             llm_status=_LLM_DEFAULT, content_kind=kind,
             at_id=at_id, reply_id=reply_id, forward_id=forward_id,
             persona_id=persona_id or None,
+            created_at=self._now(),
             **audit,
         )
         if not ok:
@@ -612,11 +648,14 @@ class ChatMemoryPlugin(Star):
             return
 
         user_id = event.get_sender_id() or ""
-        # persona_id：on_llm_request 时 req.conversation 已就绪，直接读避免二次查 conv_mgr
         persona_id = ""
         if self.ct_filter_by_persona:
-            conv = getattr(req, "conversation", None)
-            persona_id = getattr(conv, "persona_id", "") or ""
+            persona_id = await self._get_effective_persona(umo, event, cid)
+            if not persona_id:
+                logger.warning(
+                    f"{self._log_prefix(event)} filter_by_persona=True 但当前生效 persona_id 为空，"
+                    f"将仅匹配 persona_id IS NULL OR '' 的记录（老数据/未分配 persona 的消息）"
+                )
         records = await self._takeover_query(umo, cid, user_id, persona_id)
         if not records:
             self._log(f"{self._log_prefix(event)} 接管跳过：CM 无数据")
@@ -914,13 +953,14 @@ class ChatMemoryPlugin(Star):
         # persona_id：优先从 extras（capture_user 已缓存）；兜底重查
         persona_id = event.get_extra("chat_memory_persona_id")
         if persona_id is None:
-            persona_id = await self._get_curr_persona(umo, cid)
+            persona_id = await self._get_effective_persona(umo, event, cid)
         audit = self._collect_audit_fields(event)
         self._spawn_tasks(self._safe_insert(
             umo, cid, user_id, "assistant", content,
             message_id=None, pair_id=pair_id,
             llm_status=asst_status, content_kind=asst_kind,
             persona_id=persona_id or None,
+            created_at=self._now(),
             **audit,
         ))
         self._log(
@@ -1030,6 +1070,7 @@ class ChatMemoryPlugin(Star):
         sender_nickname: Optional[str] = None, raw_timestamp: Optional[int] = None,
         at_id: Optional[str] = None, reply_id: Optional[str] = None,
         forward_id: Optional[str] = None, persona_id: Optional[str] = None,
+        created_at: Optional[datetime] = None,
     ) -> bool:
         try:
             await self.db.insert(
@@ -1040,7 +1081,7 @@ class ChatMemoryPlugin(Star):
                 self_id=self_id, group_id=group_id, sender_nickname=sender_nickname,
                 raw_timestamp=raw_timestamp,
                 at_id=at_id, reply_id=reply_id, forward_id=forward_id,
-                persona_id=persona_id,
+                persona_id=persona_id, created_at=created_at,
             )
             return True
         except Exception as e:
