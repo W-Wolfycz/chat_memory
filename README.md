@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **全量捕获**：所有进入 ProcessStage 的 user 消息立即落库（命令、闲聊、纯媒体、空消息都存）
+- **全量捕获**：所有进入 ProcessStage 的 user 消息 + BOT 回复立即落库（命令、闲聊、纯媒体、混合消息都存）
 - **配对存储**：assistant 带 `pair_id`（= 对应 user 的 `message_id`），便于重组成轮
 - **双列状态**：`llm_status` 描述 LLM 路径，`content_kind` 描述内容形态，正交独立
 - **可选接管上下文**：开启 `context_takeover` 后接管 LLM 的 contexts 注入
@@ -49,7 +49,7 @@ CREATE TABLE chat_memory_records (
     user_id         TEXT NOT NULL,
     role            TEXT NOT NULL,                  -- 'user' 或 'assistant'
     content         TEXT NOT NULL DEFAULT '',
-    message_id      TEXT,                           -- 平台消息 id（NULL 表示平台未给）
+    message_id      TEXT,                           -- 平台消息 id（NULL 表示平台未给；assistant 恒为 NULL）
     pair_id         TEXT,                           -- 仅 assistant：绑定的 user.message_id
     llm_status      TEXT NOT NULL DEFAULT '',
     content_kind    TEXT NOT NULL DEFAULT '[]',     -- JSON 数组：内容形态
@@ -70,9 +70,9 @@ CREATE TABLE chat_memory_records (
 
 > **platform_id vs platform_name**：自 AstrBot v4.0 起 umo 第一段是实例 ID（多 aiocqhttp 实例时每个不同），`platform_name` 才是类型。
 >
-> **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间，`created_at` 是落库时间。
-
-**老库处理**：v2.3 不做兼容迁移。启动时检测到老 schema 直接 DROP 重建，老数据丢失。
+> **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（UTC naive，与 schema default `CURRENT_TIMESTAMP` 对齐）。
+>
+> **老库处理**：v2.3 不做兼容迁移。启动时检测到老 schema（缺 `llm_status` 列）会把旧表 RENAME 为 `chat_memory_records_backup_<ts>` 备份，再重建新表。老数据保留在同 .db 文件中可手动恢复，但不会自动迁移到新表。
 
 ## 供其他插件调用
 
@@ -128,7 +128,7 @@ group_all = await cm.query_history(umo, cid, limit=50)
 
 让 ChatMemory 成为唯一上下文源：每轮 LLM 请求时用 CM 数据覆盖 `req.contexts`，并清空 native `conversation.history` 防累积。
 
-CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 contexts 的修改）；注入内容标 `_no_save`，不回写 native。
+CM 在所有 `on_llm_request` 钩子中最后执行（priority=-100）；注入内容标 `_no_save`，不回写 native。
 
 ### 接管范围
 
@@ -136,15 +136,14 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 
 | `cross_session` | `full_group` | 数据范围 | 适用场景 |
 |---|---|---|---|
-| F | F | 同 CID 同用户 | 默认，与 native 等价但走 CM 数据源 |
-| T | F | 跨 CID 跨 umo 同用户 | **群私聊互通**：同用户在所有群 + 私聊的对话都进入上下文；`/new` 后仍记得旧话题 |
-| F | T | 同 CID 同群全员 | 群聊让 LLM 看到所有发言者 |
-| T | T | 跨 CID 跨 umo 全 platform | 所有用户所有会话混合，**慎用** |
+| F | F | 当前 umo 当前 user | 默认，与 native 等价但走 CM 数据源 |
+| T | F | 跨 umo 当前 user | **群私聊互通**：同一用户在所有群 + 私聊的对话都进入上下文 |
+| F | T | 当前 umo 整群全员 | 群聊让 LLM 看到所有发言者 |
+| T | T | 当前 umo 整群 + 其他 umo 当前 user | 群私聊互通 + 整群 |
 
 > **full_group 仅群聊生效**：私聊自动降级为本用户。
 > **隐私**：full_group 开启后，群内其他人发言（含昵称）会注入 LLM。可用 `prefix_enhance=off/time` 关闭昵称前缀。
-> **cross_session 实现**：开启后查询条件从 `umo = :umo` 改为 `platform_id = :pid`，按 `platform_id + user_id` 聚合（user_id 为空时降级为整 platform）。
-> **配对正确性**：跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 是行内自连接，每条 user 仍能在自己 umo 内找到 pair_id 匹配的 assistant；依赖平台 `message_id` 全局唯一，多数平台天然满足。
+> **scope 实现**：storage 层 `_scope_filter(umo, user_id, cross_umo, full_group)` 按 4 种组合构造 WHERE — F/F=`umo+user_id`、T/F=`platform_id+user_id`、F/T=`umo`、T/T=前两者 OR。跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 保证 user/assistant 在同一 umo 内配对。
 
 ### 状态过滤
 
@@ -173,7 +172,7 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 - 只选 `llm_success` → 30 轮配对（≈60 条记录）
 - 选了 `llm_success + proactive` → 30 条消息（可能是 14 user + 14 assistant + 2 proactive）
 
-**轮数精确**：内容白名单下沉到 SQL 层，被过滤的记录不占用 limit 名额。配 30 轮就是 30 轮，不会因为过滤变少。
+**轮数精确**：内容白名单下沉到 SQL 层，被过滤的记录不占用 limit 名额。
 
 ### 前缀增强
 
@@ -188,25 +187,14 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 
 配对 assistant 不加前缀（角色即 bot 自身）。
 
-**示例**（time_sender + full_group，注入的 contexts）：
-
-```
-[
-  {"role":"user","content":"[07/09 14:30:25] Alice: 大家晚上吃什么\n\n[07/09 14:31:00] Bob: 我吃了面条"},
-  {"role":"assistant","content":"你们聊"},
-  {"role":"assistant","content":"[07/09 14:31:30] [主动] 提醒：14:00 开会"},
-  {"role":"user","content":"[07/09 14:35:00] Alice: 那去吃火锅吧"}
-]
-```
-
 ### 配置项
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `enable` | bool | false | 总开关 |
-| `cross_session` | bool | false | 跨 CID 跨 umo（群私聊互通） |
+| `cross_session` | bool | false | 跨 umo（群私聊互通） |
 | `full_group` | bool | false | 整群消息（仅群聊） |
-| `limit_rounds` | int | 30 | 注入轮数或消息数（含义随状态过滤变化，见下） |
+| `limit_rounds` | int | 30 | 注入轮数或消息数（含义随状态过滤变化，见上） |
 | `llm_status_filter` | chip | `["llm_success"]` | 状态多选 |
 | `include_content_kinds` | chip | `["text"]` | 内容白名单（清空=不过滤） |
 | `include_all_match` | bool | false | ALL 模式开关（默认 ANY） |
@@ -217,25 +205,21 @@ CM 在所有 `on_llm_request` 钩子中最后执行（覆盖其他插件对 cont
 
 **只影响 takeover**，capture 照常入库。
 
-`include_content_kinds` 是白名单：选中=需要进入上下文的 kind。空集合 = 不过滤（全部进入）。
-配合 `include_all_match` 切换 ANY / ALL 两种语义：
+`include_content_kinds` 是白名单：选中=需要进入上下文的 kind。空集合 = 不过滤（全部进入）。配合 `include_all_match` 切换 ANY / ALL 两种语义：
 
 | `include_all_match` | 语义 | 保留条件 | 例子（白名单 `["text"]`） |
 |---|---|---|---|
 | false（默认） | ANY | content_kind 与白名单**任一交集** | `["text"]` ✓ / `["text","image"]` ✓ / `["image"]` ✗ / `[]` ✗ |
 | true | ALL | content_kind **全部**属于白名单（且非空） | `["text"]` ✓ / `["text","image"]` ✗ / `["image"]` ✗ / `[]` ✗ |
 
-场景：
+**典型场景**：
 - **默认 ANY + `["text"]`**：含文本即进（纯文 ✓ / 文+图 ✓ / 纯图 ✗ / poke 通知 ✗）
-- **启用 ALL + `["text"]`**：仅纯文本进（文+图也滤掉，因为 image 不在白名单）
-- **ALL + 多选 `["text","image"]`**：精确限定为这两种 kind（纯文 ✓ / 纯图 ✓ / 文+图 ✓ / 文+语音 ✗）
+- **ALL + `["text","image"]`**：精确限定为这两种 kind
 - **清空**：不过滤，全量进入
 
 ## 已知限制
 
 - **首条消息是非 LLM 命令时漏存**：cid 尚未创建，且无 LLM 钩子兜底
-- **配对依赖 `message_id`**：平台不返时无法用 `query_rounds` 配对，只能 `query_history`
-- **Forward 不拆开**：合并转发只存 1 条记录
 - **/reset 与 /new 区分靠文本匹配**：AstrBot 未提供官方区分 API；若 bot 回复碰巧含 "reset" 字样会误判清库
 - **与其他接管类插件冲突**：LivingMemory 等会互相覆盖，建议二选一
 

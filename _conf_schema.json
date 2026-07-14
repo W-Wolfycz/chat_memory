@@ -45,7 +45,7 @@
         "description": "跨会话目标（群私聊互通）",
         "type": "bool",
         "default": false,
-        "hint": "开启后，同一用户在不同会话目标（CID / 群 / 私聊）的消息都进入上下文，按 platform_id + user_id 聚合。典型用途：群私聊记忆互通、/new 后仍记得旧话题。注意：与 full_group 同时开启会聚合整个 platform 所有用户所有会话，慎用。"
+        "hint": "开启后，同一用户在其他群 / 私聊的对话也进入上下文。与 full_group 同时开启时：当前群整群 + 其他群/私聊仅当前 user（不会跨到别的用户在其他 umo 的对话）。"
       },
       "full_group": {
         "description": "整群消息",

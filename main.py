@@ -54,6 +54,9 @@ _K_SYSTEM = "system_event"
 # 接管时需过滤的媒体 kind 集合（不含 system_event / 空数组）
 _MEDIA_KINDS = {_K_IMAGE, _K_VIDEO, _K_VOICE, _K_FILE, _K_FACE, _K_FORWARD}
 
+# terminate 时给 fire-and-forget task 的 flush 窗口（秒）：保护在写的 assistant 记录
+_TERMINATE_FLUSH_TIMEOUT = 5.0
+
 
 class ChatMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -82,9 +85,6 @@ class ChatMemoryPlugin(Star):
         self.ct_include_kinds: set[str] = set(ct_conf.get("include_content_kinds", ["text"]) or [])
         # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
         self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
-        # 硬编码常开：drop_media 与 merge_consecutive 不暴露配置
-        self.ct_drop_media = True
-        self.ct_merge_consecutive = True
 
         data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
         self.db = DBManager(data_dir)
@@ -314,6 +314,46 @@ class ChatMemoryPlugin(Star):
             pass
 
         return kind, at_id, reply_id, forward_id
+
+    @staticmethod
+    def _classify_assistant_chain(chain) -> tuple[list[str], str]:
+        """从 BOT 回复组件链提取 ``(content_kind, text)``。
+
+        与 user 端 ``_classify_content`` 的差异：
+        - 不提取 ``at_id`` / ``reply_id`` / ``forward_id``（bot 主动回复一般不携带这些）
+        - 不做 ``message_str`` 回退（``result.chain`` 即为真相源）
+        - 不做 ``OtherMessage`` 强制覆盖（result 必然是 assistant 输出）
+
+        返回 ``(kind, text)``：
+        - ``kind``：去重后保留首次出现顺序；空列表表示完全空 chain
+        - ``text``：所有 Plain 组件拼接并 strip
+        """
+        kind: list[str] = []
+        parts: list[str] = []
+
+        def _push(k: str):
+            if k not in kind:
+                kind.append(k)
+
+        for comp in chain:
+            if isinstance(comp, Plain):
+                if (comp.text or "").strip():
+                    _push(_K_TEXT)
+                    parts.append(comp.text)
+            elif isinstance(comp, Image):
+                _push(_K_IMAGE)
+            elif isinstance(comp, Video):
+                _push(_K_VIDEO)
+            elif isinstance(comp, Record):
+                _push(_K_VOICE)
+            elif isinstance(comp, File):
+                _push(_K_FILE)
+            elif isinstance(comp, Face):
+                _push(_K_FACE)
+            elif isinstance(comp, Forward):
+                _push(_K_FORWARD)
+            # At / AtAll / Reply / Poke / Json / Unknown 等：assistant 端忽略
+        return kind, "".join(parts).strip()
 
     @staticmethod
     def _content_placeholder(kind: list[str]) -> str:
@@ -592,7 +632,6 @@ class ChatMemoryPlugin(Star):
 
         # full_group 仅群聊生效
         effective_full_group = self.ct_full_group and self._is_group_umo(umo)
-        target_user: Optional[str] = None if effective_full_group else user_id
 
         # cross_session：跨 CID（cid=None）+ 跨 umo（cross_umo=True）
         # 跨 umo 按 platform_id + user_id 聚合，实现群私聊互通
@@ -603,15 +642,16 @@ class ChatMemoryPlugin(Star):
             if is_pair_only:
                 # 配对模式：按轮数
                 rounds = await self.db.query_rounds_raw(
-                    umo, target_cid, target_user, limit, include_kinds, all_match,
-                    cross_umo=cross_umo,
+                    umo, target_cid, user_id, limit, include_kinds, all_match,
+                    cross_umo=cross_umo, full_group=effective_full_group,
                 )
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
-                # 混合模式：按消息数
+                # 混合模式：按消息数；overfetch 2x 给规整留余地（防先 LIMIT 后过滤导致空上下文）
+                # 规整阶段会丢头部 assistant / 尾部 solo / 纯媒体；overfetch 后再在 normalize 截到目标条数
                 records = await self.db.query_messages_raw(
-                    umo, target_cid, target_user, limit, status_set, include_kinds, all_match,
-                    cross_umo=cross_umo,
+                    umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
+                    cross_umo=cross_umo, full_group=effective_full_group,
                 )
 
             # 防御性全局排序（混合模式下 messages_raw 已排序，但保持一致）
@@ -787,9 +827,10 @@ class ChatMemoryPlugin(Star):
         if not result or not result.chain:
             return
 
-        bot_text = "".join(comp.text for comp in result.chain if isinstance(comp, Plain)).strip()
+        asst_kind, bot_text = self._classify_assistant_chain(result.chain)
         bot_text = self._strip_reasoning_prefix(bot_text)
-        if not bot_text:
+        if not asst_kind:
+            # 完全空 chain（无 Plain 也无任何媒体组件）才跳过；纯图 / 纯语音仍入库
             return
 
         user_id = event.get_sender_id() or ""
@@ -834,12 +875,12 @@ class ChatMemoryPlugin(Star):
             if no_mid:
                 self._log(f"{self._log_prefix(event)} assistant 平台无 mid，pair_id 留空")
 
-        content = self._truncate(bot_text)
+        content = self._truncate(bot_text) if bot_text else self._content_placeholder(asst_kind)
         audit = self._collect_audit_fields(event)
         self._spawn_tasks(self._safe_insert(
             umo, cid, user_id, "assistant", content,
             message_id=None, pair_id=pair_id,
-            llm_status=asst_status, content_kind=[_K_TEXT],
+            llm_status=asst_status, content_kind=asst_kind,
             **audit,
         ))
         self._log(
@@ -872,9 +913,14 @@ class ChatMemoryPlugin(Star):
             )
 
         if "reset" in result_text.lower():
-            deleted = await self.db.delete_by_conversation(umo, cid)
-            if deleted > 0:
-                logger.info(f"{self._log_prefix(event)} /reset（CID={cid[:8]}），清除 {deleted} 条存档记录")
+            # 删除前 SELECT count + warning（审计痕迹，CR1 P1-2）：误判时日志可追溯
+            count = await self.db.count_by_conversation(umo, cid)
+            if count > 0:
+                logger.warning(
+                    f"{self._log_prefix(event)} /reset 即将清除 CID={cid[:8]} 下 {count} 条存档（不可逆，result_text 命中 'reset'）"
+                )
+                deleted = await self.db.delete_by_conversation(umo, cid)
+                logger.info(f"{self._log_prefix(event)} /reset 完成：实际清除 {deleted} 条")
             else:
                 self._log(f"{self._log_prefix(event)} /reset（CID={cid[:8]}），无存档记录可清除")
         else:
@@ -975,12 +1021,18 @@ class ChatMemoryPlugin(Star):
                 logger.warning(f"{self._log_prefix()} 清理 task 停止异常: {e}")
             self._cleanup_task = None
 
-        # 2. 取消所有 fire-and-forget task
+        # 2. fire-and-forget task：先给 flush 窗口（保护在写的 assistant 记录），超时才 cancel
         pending = [t for t in self._pending_tasks if not t.done()]
-        for t in pending:
-            t.cancel()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=_TERMINATE_FLUSH_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         self._pending_tasks.clear()
 
         # 3. 释放 DB 连接池

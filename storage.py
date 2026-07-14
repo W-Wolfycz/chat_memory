@@ -8,12 +8,12 @@ Schema 说明：
   / 'system_event'。空数组 '[]' 表示 empty（如纯 @ 无文本）。
 - ``at_id`` / ``reply_id`` / ``forward_id``：上下文引用 ID，仅在对应组件出现时存。
 
-老库（v2.x）不兼容，启动时 PRAGMA 检测到缺 ``llm_status`` 列则 DROP 重建。
+老库（v2.x）不兼容，启动时 PRAGMA 检测到缺 ``llm_status`` 列则 RENAME 备份后重建（不直接 DROP）。
 """
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
@@ -83,6 +83,8 @@ class DBManager:
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout=5000ms：群聊高频写入时遇到锁等待，最多等 5s 而非立即报 locked
+            cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
 
     async def init_db(self):
@@ -92,11 +94,17 @@ class DBManager:
             if self._initialized:
                 return
             async with self.engine.begin() as conn:
-                # v2.3 不做迁移：检测到老 schema（缺 llm_status 列）直接 DROP 重建
+                # v2.3 不做迁移：检测到老 schema（缺 llm_status 列）→ RENAME 备份后重建
+                # 不直接 DROP，给用户事后手动恢复的机会（备份表保留在同一个 .db 文件里）
                 result = await conn.execute(text("PRAGMA table_info(chat_memory_records)"))
                 existing_cols = {row[1] for row in result.fetchall()}
                 if existing_cols and "llm_status" not in existing_cols:
-                    await conn.execute(text("DROP TABLE chat_memory_records"))
+                    import time as _time
+                    backup_name = f"chat_memory_records_backup_{int(_time.time())}"
+                    await conn.execute(text(
+                        f"ALTER TABLE chat_memory_records RENAME TO {backup_name}"
+                    ))
+                    # 备份表的旧索引会跟着改名或保留（SQLite 行为），这里不主动清理
                 await conn.execute(text(_CREATE_TABLE_SQL))
                 for idx_sql in _CREATE_INDEX_SQL:
                     await conn.execute(text(idx_sql))
@@ -162,7 +170,7 @@ class DBManager:
                     "at_id": at_id,
                     "reply_id": reply_id,
                     "fwd_id": forward_id,
-                    "now": datetime.now(),
+                    "now": datetime.now(timezone.utc).replace(tzinfo=None),
                 },
             )
             await session.commit()
@@ -200,8 +208,11 @@ class DBManager:
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
         ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录。
+
+        ``limit`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）导致全库返回。
         """
         await self.init_db()
+        limit = max(1, min(1000, int(limit)))
         async with self.async_session() as session:
             conditions = ["umo = :umo", "conversation_id = :cid"]
             params: dict = {"umo": umo, "cid": conversation_id}
@@ -262,8 +273,11 @@ class DBManager:
         因此 ``limit_rounds`` 轮对应 ``2 * limit_rounds`` 条记录。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
+
+        ``limit_rounds`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）。
         """
         await self.init_db()
+        limit_rounds = max(1, min(1000, int(limit_rounds)))
         async with self.async_session() as session:
             conditions = [
                 "umo = :umo",
@@ -329,7 +343,8 @@ class DBManager:
                     {"umo": umo, "cid": conversation_id, "pids": user_msg_ids},
                 )
                 for r in asst_result.fetchall():
-                    assistant_map.setdefault(r[3], []).append(_row_to_dict(r))
+                    # key 用 pair_id（r[4]），而非 message_id（r[3]，assistant 恒为 None）
+                    assistant_map.setdefault(r[4], []).append(_row_to_dict(r))
 
             rounds: list[list[dict]] = []
             for r in user_rows:
@@ -337,150 +352,6 @@ class DBManager:
                 entry.extend(assistant_map.get(r[3], []))
                 rounds.append(entry)
             return rounds
-
-    async def query_rounds_umo(
-        self,
-        umo: str,
-        user_id: Optional[str] = None,
-        limit_rounds: int = 10,
-        llm_status: Optional[Union[str, list[str]]] = None,
-        content_kind: Optional[Union[str, list[str]]] = None,
-    ) -> list[list[dict]]:
-        """跨 CID 按轮次返回对话（用于 cross_session 接管模式）。
-
-        与 ``query_rounds`` 结构一致，但**不限 conversation_id**：返回该 umo 下
-        所有 CID 的 user-assistant 配对，按 created_at 全局排序。配对仍按
-        ``message_id`` ↔ ``pair_id``，因此跨 CID 的 user 与 assistant 不会
-        错配（不同 CID 的 message_id 不重叠即可）。
-
-        ``user_id`` 给定时按用户过滤；为空时返回该 umo 下所有用户的混合记录。
-        """
-        await self.init_db()
-        async with self.async_session() as session:
-            conditions = [
-                "umo = :umo",
-                "role = 'user'",
-                (
-                    "EXISTS (SELECT 1 FROM chat_memory_records a "
-                    "WHERE a.umo = chat_memory_records.umo "
-                    "AND a.role = 'assistant' AND a.pair_id = chat_memory_records.message_id)"
-                ),
-            ]
-            user_params: dict = {"umo": umo}
-            expanding_binds: list[str] = []
-            if user_id:
-                conditions.append("user_id = :uid")
-                user_params["uid"] = user_id
-            if llm_status:
-                if isinstance(llm_status, str):
-                    status_list = [llm_status]
-                else:
-                    status_list = list(llm_status)
-                if status_list:
-                    conditions.append("llm_status IN :statuses")
-                    user_params["statuses"] = status_list
-                    expanding_binds.append("statuses")
-            if content_kind:
-                if isinstance(content_kind, str):
-                    kind_list = [content_kind]
-                else:
-                    kind_list = list(content_kind)
-                if kind_list:
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value IN :kinds)"
-                    )
-                    user_params["kinds"] = kind_list
-                    expanding_binds.append("kinds")
-            where = " AND ".join(conditions)
-            user_params["lim"] = limit_rounds
-
-            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
-            for name in expanding_binds:
-                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
-
-            result = await session.execute(sql_text, user_params)
-            user_rows = list(reversed(result.fetchall()))  # 升序
-
-            if not user_rows:
-                return []
-
-            user_msg_ids = [r[3] for r in user_rows]
-            assistant_map: dict[str, list[dict]] = {}
-            if user_msg_ids:
-                asst_sql = (
-                    _SELECT_COLS + " FROM chat_memory_records "
-                    "WHERE umo = :umo AND role = 'assistant' "
-                    "AND pair_id IN :pids ORDER BY created_at ASC, id ASC"
-                )
-                asst_result = await session.execute(
-                    text(asst_sql).bindparams(bindparam("pids", expanding=True)),
-                    {"umo": umo, "pids": user_msg_ids},
-                )
-                for r in asst_result.fetchall():
-                    assistant_map.setdefault(r[3], []).append(_row_to_dict(r))
-
-            rounds: list[list[dict]] = []
-            for r in user_rows:
-                entry = [_row_to_dict(r)]
-                entry.extend(assistant_map.get(r[3], []))
-                rounds.append(entry)
-            return rounds
-
-    async def query_solo_assistants(
-        self,
-        umo: str,
-        conversation_id: Optional[str] = None,
-        limit: int = 10,
-        llm_status: Optional[Union[str, list[str]]] = None,
-        user_id: Optional[str] = None,
-    ) -> list[dict]:
-        """查询单边 assistant（``pair_id IS NULL``，即 proactive / orphan）。
-
-        用于上下文接管时把这些 assistant 也注入。``query_rounds`` 用 EXISTS 过滤单边，
-        不会返回这类记录——必须单独查。
-
-        ``conversation_id`` 为空时跨 CID 查询（配合 cross_session）。
-        ``user_id`` 给定时按触发用户过滤（standard 模式避免跨用户泄漏）；
-        为空时返回该范围下所有用户的 solo assistant（full_group 模式）。
-        按 ``created_at DESC LIMIT :lim`` 取，返回时升序（与 query_rounds 一致）。
-        """
-        await self.init_db()
-        async with self.async_session() as session:
-            conditions = [
-                "umo = :umo",
-                "role = 'assistant'",
-                "pair_id IS NULL",
-            ]
-            params: dict = {"umo": umo}
-            expanding_binds: list[str] = []
-            if conversation_id:
-                conditions.append("conversation_id = :cid")
-                params["cid"] = conversation_id
-            if user_id:
-                conditions.append("user_id = :uid")
-                params["uid"] = user_id
-            if llm_status:
-                if isinstance(llm_status, str):
-                    status_list = [llm_status]
-                else:
-                    status_list = list(llm_status)
-                if status_list:
-                    conditions.append("llm_status IN :statuses")
-                    params["statuses"] = status_list
-                    expanding_binds.append("statuses")
-            where = " AND ".join(conditions)
-            params["lim"] = limit
-
-            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
-            for name in expanding_binds:
-                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
-
-            result = await session.execute(sql_text, params)
-            rows = result.fetchall()
-            return [_row_to_dict(r) for r in reversed(rows)]
 
     async def delete_by_conversation(self, umo: str, conversation_id: str) -> int:
         """清除某个 conversation_id 下的所有记录（用于 /reset）。"""
@@ -495,6 +366,19 @@ class DBManager:
             )
             await session.commit()
             return result.rowcount
+
+    async def count_by_conversation(self, umo: str, conversation_id: str) -> int:
+        """统计某 conversation_id 下的记录数（用于 /reset 删除前审计痕迹）。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT COUNT(*) FROM chat_memory_records "
+                    "WHERE umo = :umo AND conversation_id = :cid"
+                ),
+                {"umo": umo, "cid": conversation_id},
+            )
+            return result.scalar() or 0
 
     async def delete_old(self, before: datetime) -> int:
         """删除 created_at 早于 ``before`` 的所有记录（用于 auto_cleanup_days）。"""
@@ -516,17 +400,22 @@ class DBManager:
         include_kinds: Optional[set[str]] = None,
         all_match: bool = False,
         cross_umo: bool = False,
+        full_group: bool = False,
     ) -> list[list[dict]]:
         """内部方法：配对模式查询（takeover 专用）。
 
         类似 ``query_rounds`` 但支持 ``include_kinds`` 白名单过滤。
         仅返回**有 assistant 配对**的 user，每轮 ``[user_dict, assistant_dict]`` 两条。
 
-        ``conversation_id`` 为 None 时跨 CID（``query_rounds_mo`` 等价）。
-        ``user_id`` 为 None 时不按用户过滤（``full_group`` 场景）。
-        ``cross_umo=True`` 时按 ``platform_id``（从 umo 提取）跨 umo 同 platform 聚合，
-        实现群私聊互通；EXISTS 子查的 ``a.umo = chat_memory_records.umo`` 是行内
-        自连接，跨 umo 仍保证 user/assistant 在同一 umo 内配对。
+        scope 由 ``cross_umo`` × ``full_group`` 决定（见 ``_scope_filter``）：
+        - F/F：当前 umo 当前 user
+        - T/F：跨 umo 当前 user（群私聊互通）
+        - F/T：当前 umo 整群
+        - T/T：当前 umo 整群 + 其他 umo 当前 user（混合语义）
+
+        ``conversation_id`` 为 None 时跨 CID。EXISTS 子查的
+        ``a.umo = chat_memory_records.umo`` 是行内自连接，跨 umo 仍保证
+        user/assistant 在同一 umo 内配对（依赖 message_id 全平台唯一）。
 
         ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
         - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
@@ -535,9 +424,9 @@ class DBManager:
         """
         await self.init_db()
         async with self.async_session() as session:
-            umo_cond, umo_param = _umo_filter(umo, cross_umo)
+            scope_cond, scope_param = _scope_filter(umo, user_id, cross_umo, full_group)
             conditions = [
-                umo_cond,
+                scope_cond,
                 "role = 'user'",
                 (
                     "EXISTS (SELECT 1 FROM chat_memory_records a "
@@ -546,16 +435,12 @@ class DBManager:
                     "AND a.pair_id = chat_memory_records.message_id)"
                 ),
             ]
-            params: dict = {**umo_param, "lim": limit_rounds}
+            params: dict = {**scope_param, "lim": limit_rounds}
             expanding_binds: list[str] = []
 
             if conversation_id:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
-
-            if user_id:
-                conditions.append("user_id = :uid")
-                params["uid"] = user_id
 
             # include_kinds：白名单
             if include_kinds:
@@ -590,9 +475,9 @@ class DBManager:
             user_msg_ids = [r[3] for r in user_rows]  # message_id 在第 4 列
             assistant_map: dict[str, list[dict]] = {}
             if user_msg_ids:
-                # assistant 查询：与 user 同维度（umo 或 platform_id），按 pair_id 配对
-                asst_conditions = [umo_cond, "role = 'assistant'", "pair_id IN :pids"]
-                asst_params = {**umo_param, "pids": user_msg_ids}
+                # assistant 查询：与 user 同 scope（保证配对在范围内），按 pair_id 配对
+                asst_conditions = [scope_cond, "role = 'assistant'", "pair_id IN :pids"]
+                asst_params = {**scope_param, "pids": user_msg_ids}
                 if conversation_id:
                     asst_conditions.append("conversation_id = :cid")
                     asst_params["cid"] = conversation_id
@@ -606,7 +491,8 @@ class DBManager:
                     asst_params,
                 )
                 for r in asst_result.fetchall():
-                    assistant_map.setdefault(r[3], []).append(_row_to_dict(r))
+                    # key 用 pair_id（r[4]）：assistant.message_id 恒为 None，用 r[3] 会全部 miss
+                    assistant_map.setdefault(r[4], []).append(_row_to_dict(r))
 
             rounds: list[list[dict]] = []
             for r in user_rows:
@@ -625,12 +511,17 @@ class DBManager:
         include_kinds: Optional[set[str]] = None,
         all_match: bool = False,
         cross_umo: bool = False,
+        full_group: bool = False,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
         查询全量消息（user + assistant），按 ``limit_messages`` 条数切片。
-        ``conversation_id`` 为 None 时跨 CID，``user_id`` 为 None 时不按用户过滤。
-        ``cross_umo=True`` 时按 ``platform_id``（从 umo 提取）跨 umo 同 platform 聚合。
+        scope 由 ``cross_umo`` × ``full_group`` 决定（见 ``_scope_filter``）：
+        - F/F：当前 umo 当前 user
+        - T/F：跨 umo 当前 user（群私聊互通）
+        - F/T：当前 umo 整群
+        - T/T：当前 umo 整群 + 其他 umo 当前 user（混合语义）
+        ``conversation_id`` 为 None 时跨 CID。
         ``statuses`` 过滤 llm_status（IN 语义）。
 
         ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
@@ -639,21 +530,17 @@ class DBManager:
         """
         await self.init_db()
         async with self.async_session() as session:
-            umo_cond, umo_param = _umo_filter(umo, cross_umo)
+            scope_cond, scope_param = _scope_filter(umo, user_id, cross_umo, full_group)
             conditions = [
-                umo_cond,
+                scope_cond,
                 "role IN ('user', 'assistant')",
             ]
-            params: dict = {**umo_param, "lim": limit_messages}
+            params: dict = {**scope_param, "lim": limit_messages}
             expanding_binds: list[str] = []
 
             if conversation_id:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
-
-            if user_id:
-                conditions.append("user_id = :uid")
-                params["uid"] = user_id
 
             if statuses:
                 conditions.append("llm_status IN :statuses")
@@ -687,17 +574,58 @@ class DBManager:
 
 
 # SELECT 列顺序固定，_row_to_dict 按位置映射
-def _umo_filter(umo: str, cross_umo: bool) -> tuple[str, dict]:
-    """构造 umo 维度的 WHERE 条件。
+def _scope_filter(
+    umo: str,
+    user_id: Optional[str],
+    cross_umo: bool,
+    full_group: bool,
+) -> tuple[str, dict]:
+    """构造 takeover scope 的 WHERE 条件 + 绑定参数。
 
-    - ``cross_umo=False``：精确匹配 ``umo = :umo``
-    - ``cross_umo=True``：按 ``platform_id``（从 umo 提取首段）跨 umo 聚合，
-      实现群私聊互通。要求 umo 非空且含 ``:`` 分隔。
+    4 种组合（``cross_umo`` × ``full_group``）：
+
+    - F/F：当前 umo 当前 user（默认）
+      → ``umo = :scope_umo AND user_id = :scope_uid``
+    - T/F：跨 umo 当前 user（群私聊互通）
+      → ``platform_id = :scope_pid AND user_id = :scope_uid``
+    - F/T：当前 umo 整群（同群所有人）
+      → ``umo = :scope_umo``
+    - T/T：混合语义 — 当前 umo 整群 + 其他 umo 当前 user
+      → ``((umo = :scope_umo) OR (platform_id = :scope_pid AND umo != :scope_umo AND user_id = :scope_uid))``
+
+    ``user_id`` 为空时：所有 ``user_id`` 限制退化为不加（等价于整群/整 platform），
+    与 2.3.3 之前的行为一致（兜底处理无 sender_id 的边缘平台）。
     """
+    pid = umo.split(":", 1)[0] if umo else ""
+    has_uid = bool(user_id)
+
+    if cross_umo and full_group:
+        if has_uid:
+            cond = (
+                "((umo = :scope_umo) "
+                "OR (platform_id = :scope_pid AND umo != :scope_umo "
+                "AND user_id = :scope_uid))"
+            )
+            return cond, {"scope_umo": umo, "scope_pid": pid, "scope_uid": user_id}
+        return "platform_id = :scope_pid", {"scope_pid": pid}
+
     if cross_umo:
-        pid = umo.split(":", 1)[0] if umo else ""
-        return "platform_id = :pid", {"pid": pid}
-    return "umo = :umo", {"umo": umo}
+        if has_uid:
+            return (
+                "platform_id = :scope_pid AND user_id = :scope_uid",
+                {"scope_pid": pid, "scope_uid": user_id},
+            )
+        return "platform_id = :scope_pid", {"scope_pid": pid}
+
+    if full_group:
+        return "umo = :scope_umo", {"scope_umo": umo}
+
+    if has_uid:
+        return (
+            "umo = :scope_umo AND user_id = :scope_uid",
+            {"scope_umo": umo, "scope_uid": user_id},
+        )
+    return "umo = :scope_umo", {"scope_umo": umo}
 
 
 _SELECT_COLS = (
