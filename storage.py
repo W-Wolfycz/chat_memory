@@ -16,6 +16,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -60,7 +61,7 @@ _CREATE_INDEX_SQL = (
 
 
 class DBManager:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, tz: Optional[ZoneInfo] = None):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "chat_memory.db"
@@ -71,6 +72,8 @@ class DBManager:
         )
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        # 输出时区：created_at 存 UTC naive，查询返回时转此 tz naive；None 则原样输出 UTC
+        self._tz = tz
         self._register_pragmas()
 
     def _register_pragmas(self):
@@ -141,7 +144,6 @@ class DBManager:
         reply_id: Optional[str] = None,
         forward_id: Optional[str] = None,
         persona_id: Optional[str] = None,
-        created_at: Optional[datetime] = None,
     ) -> None:
         await self.init_db()
         kind_json = json.dumps(content_kind or [], ensure_ascii=False)
@@ -181,7 +183,7 @@ class DBManager:
                     "reply_id": reply_id,
                     "fwd_id": forward_id,
                     "per_id": persona_id,
-                    "now": created_at if created_at is not None else datetime.now(timezone.utc).replace(tzinfo=None),
+                    "now": datetime.now(timezone.utc).replace(tzinfo=None),
                 },
             )
             await session.commit()
@@ -222,7 +224,7 @@ class DBManager:
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
         ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录。
-        ``persona_id`` 给定时按 persona 严格过滤（None / 空串跳过，与 takeover 的 filter_by_persona 对齐）。
+        ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点）；
         ``datetime`` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 ``CURRENT_TIMESTAMP`` 对齐）。
 
@@ -271,9 +273,12 @@ class DBManager:
             if until_norm:
                 conditions.append("created_at <= :until")
                 params["until"] = until_norm
-            if persona_id:
-                conditions.append("persona_id = :persona_id")
-                params["persona_id"] = persona_id
+            if persona_id is not None:
+                if persona_id:
+                    conditions.append("persona_id = :persona_id")
+                    params["persona_id"] = persona_id
+                else:
+                    conditions.append("(persona_id IS NULL OR persona_id = '')")
 
             where = " AND ".join(conditions)
             params["lim"] = limit
@@ -285,7 +290,7 @@ class DBManager:
 
             result = await session.execute(sql_text, params)
             rows = result.fetchall()
-            return [_row_to_dict(r) for r in reversed(rows)]
+            return [_row_to_dict(r, self._tz) for r in reversed(rows)]
 
     async def query_rounds(
         self,
@@ -305,8 +310,8 @@ class DBManager:
         因此 ``limit_rounds`` 轮对应 ``2 * limit_rounds`` 条记录。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
-        ``persona_id`` 给定时按 persona 过滤（user + assistant 都加条件，保证配对同 persona；
-        None / 空串跳过）。EXISTS 子查不加 persona 条件，保持"有配对"语义——若配对
+        ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``。user + assistant
+        都加条件，保证配对同 persona。EXISTS 子查不加 persona 条件，保持"有配对"语义——若配对
         assistant 的 persona 与 ``persona_id`` 不一致，该 user 仍会被选中但 assistant 查询
         返回空，结果是 ``[user_dict]`` 一条。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加，保证返回
@@ -363,9 +368,12 @@ class DBManager:
             if until_norm:
                 conditions.append("created_at <= :until")
                 user_params["until"] = until_norm
-            if persona_id:
-                conditions.append("persona_id = :persona_id")
-                user_params["persona_id"] = persona_id
+            if persona_id is not None:
+                if persona_id:
+                    conditions.append("persona_id = :persona_id")
+                    user_params["persona_id"] = persona_id
+                else:
+                    conditions.append("(persona_id IS NULL OR persona_id = '')")
 
             where = " AND ".join(conditions)
             user_params["lim"] = limit_rounds
@@ -399,9 +407,12 @@ class DBManager:
                 if until_norm:
                     asst_conditions.append("created_at <= :until")
                     asst_params["until"] = until_norm
-                if persona_id:
-                    asst_conditions.append("persona_id = :persona_id")
-                    asst_params["persona_id"] = persona_id
+                if persona_id is not None:
+                    if persona_id:
+                        asst_conditions.append("persona_id = :persona_id")
+                        asst_params["persona_id"] = persona_id
+                    else:
+                        asst_conditions.append("(persona_id IS NULL OR persona_id = '')")
                 asst_sql = (
                     _SELECT_COLS + " FROM chat_memory_records WHERE "
                     + " AND ".join(asst_conditions) +
@@ -413,11 +424,11 @@ class DBManager:
                 )
                 for r in asst_result.fetchall():
                     # key 用 pair_id（r[4]），而非 message_id（r[3]，assistant 恒为 None）
-                    assistant_map.setdefault(r[4], []).append(_row_to_dict(r))
+                    assistant_map.setdefault(r[4], []).append(_row_to_dict(r, self._tz))
 
             rounds: list[list[dict]] = []
             for r in user_rows:
-                entry = [_row_to_dict(r)]
+                entry = [_row_to_dict(r, self._tz)]
                 entry.extend(assistant_map.get(r[3], []))
                 rounds.append(entry)
             return rounds
@@ -500,15 +511,24 @@ class DBManager:
         await self.init_db()
         async with self.async_session() as session:
             scope_cond, scope_param = _scope_filter(umo, user_id, cross_umo, full_group)
+            # EXISTS 子查：cid 非空时加 conversation_id 条件（防跨 cid 误配对）；
+            # cid=None（cross_session）时不加，允许跨 cid 配对
+            exists_parts = [
+                "EXISTS (SELECT 1 FROM chat_memory_records a",
+                "WHERE a.umo = chat_memory_records.umo",
+            ]
+            if conversation_id:
+                exists_parts.append(
+                    "AND a.conversation_id = chat_memory_records.conversation_id"
+                )
+            exists_parts.extend([
+                "AND a.role = 'assistant'",
+                "AND a.pair_id = chat_memory_records.message_id)",
+            ])
             conditions = [
                 scope_cond,
                 "role = 'user'",
-                (
-                    "EXISTS (SELECT 1 FROM chat_memory_records a "
-                    "WHERE a.umo = chat_memory_records.umo "
-                    "AND a.role = 'assistant' "
-                    "AND a.pair_id = chat_memory_records.message_id)"
-                ),
+                " ".join(exists_parts),
             ]
             params: dict = {**scope_param, "lim": limit_rounds}
             expanding_binds: list[str] = []
@@ -581,11 +601,11 @@ class DBManager:
                 )
                 for r in asst_result.fetchall():
                     # key 用 pair_id（r[4]）：assistant.message_id 恒为 None，用 r[3] 会全部 miss
-                    assistant_map.setdefault(r[4], []).append(_row_to_dict(r))
+                    assistant_map.setdefault(r[4], []).append(_row_to_dict(r, self._tz))
 
             rounds: list[list[dict]] = []
             for r in user_rows:
-                entry = [_row_to_dict(r)]
+                entry = [_row_to_dict(r, self._tz)]
                 entry.extend(assistant_map.get(r[3], []))
                 rounds.append(entry)
             return rounds
@@ -671,7 +691,7 @@ class DBManager:
 
             result = await session.execute(sql_text, params)
             rows = result.fetchall()
-            return [_row_to_dict(r) for r in reversed(rows)]  # 升序
+            return [_row_to_dict(r, self._tz) for r in reversed(rows)]  # 升序
 
 
 # SELECT 列顺序固定，_row_to_dict 按位置映射
@@ -759,12 +779,29 @@ _SELECT_COLS = (
 # 15 at_id | 16 reply_id | 17 forward_id | 18 persona_id | 19 created_at
 
 
-def _row_to_dict(r) -> dict:
-    """把 SELECT 出来的行映射为 dict，content_kind 解析回 list。"""
+def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
+    """把 SELECT 出来的行映射为 dict，content_kind 解析回 list。
+
+    ``tz`` 给定时把 ``created_at`` 从 UTC naive 转为配置时区 naive 输出；
+    None 则原样返回 UTC naive 字符串（与落库 ``CURRENT_TIMESTAMP`` 一致）。
+    """
     try:
         kind_list = json.loads(r[6]) if r[6] else []
     except (json.JSONDecodeError, TypeError):
         kind_list = []
+    created_at_raw = r[19]
+    if tz is not None and created_at_raw:
+        try:
+            dt = datetime.fromisoformat(str(created_at_raw).replace("T", " "))
+            created_at_str = (
+                dt.replace(tzinfo=timezone.utc)
+                .astimezone(tz)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+        except (ValueError, TypeError):
+            created_at_str = str(created_at_raw)
+    else:
+        created_at_str = str(created_at_raw)
     return {
         "role": r[0],
         "content": r[1],
@@ -785,5 +822,5 @@ def _row_to_dict(r) -> dict:
         "reply_id": r[16],
         "forward_id": r[17],
         "persona_id": r[18],
-        "created_at": str(r[19]),
+        "created_at": created_at_str,
     }

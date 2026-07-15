@@ -90,7 +90,8 @@ class ChatMemoryPlugin(Star):
         # 与 cross_session=T 协同可获完整 persona 隔离体验（切 persona + /new + 切回仍可见旧数据）
         self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
 
-        # 读取 AstrBot 全局时区配置（IANA 名称如 "Asia/Shanghai"），用于 created_at 生成
+        # 读取 AstrBot 全局时区配置（IANA 名称如 "Asia/Shanghai"），传给 DBManager
+        # 做查询输出转换：存储统一 UTC naive，返回时转此 tz naive
         try:
             tz_name = context.get_config().get("timezone", "Asia/Shanghai")
             self._tz = ZoneInfo(tz_name)
@@ -98,7 +99,7 @@ class ChatMemoryPlugin(Star):
             self._tz = ZoneInfo("Asia/Shanghai")
 
         data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
-        self.db = DBManager(data_dir)
+        self.db = DBManager(data_dir, tz=self._tz)
 
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_started = False
@@ -155,7 +156,7 @@ class ChatMemoryPlugin(Star):
         try:
             while True:
                 await asyncio.sleep(86400)
-                cutoff = datetime.now() - timedelta(days=self.auto_cleanup_days)
+                cutoff = datetime.now(dt_timezone.utc).replace(tzinfo=None) - timedelta(days=self.auto_cleanup_days)
                 try:
                     deleted = await self.db.delete_old(cutoff)
                     if deleted > 0:
@@ -186,10 +187,6 @@ class ChatMemoryPlugin(Star):
         if self.max_len <= 0:
             return text
         return text[:self.max_len]
-
-    def _now(self) -> datetime:
-        """返回当前时刻的 naive datetime（按 AstrBot 配置时区）。"""
-        return datetime.now(self._tz).replace(tzinfo=None)
 
     @staticmethod
     def _strip_reasoning_prefix(text: str) -> str:
@@ -561,7 +558,6 @@ class ChatMemoryPlugin(Star):
             llm_status=_LLM_DEFAULT, content_kind=kind,
             at_id=at_id, reply_id=reply_id, forward_id=forward_id,
             persona_id=persona_id or None,
-            created_at=self._now(),
             **audit,
         )
         if not ok:
@@ -669,7 +665,7 @@ class ChatMemoryPlugin(Star):
         req.contexts = contexts
 
         if self.ct_clear_native_history:
-            self._spawn_tasks(self._safe_reset_history(umo, cid))
+            await self._safe_reset_history(umo, cid)
 
         self._log(
             f"{self._log_prefix(event)} 接管 contexts={len(contexts)} "
@@ -960,7 +956,6 @@ class ChatMemoryPlugin(Star):
             message_id=None, pair_id=pair_id,
             llm_status=asst_status, content_kind=asst_kind,
             persona_id=persona_id or None,
-            created_at=self._now(),
             **audit,
         ))
         self._log(
@@ -1026,7 +1021,7 @@ class ChatMemoryPlugin(Star):
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
         ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录（``'user'`` / ``'assistant'``）。
-        ``persona_id`` 给定时按 persona 严格过滤（None / 空串跳过）。
+        ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点，tz-aware 自动转 UTC）。
         """
         return await self.db.query_latest(
@@ -1049,7 +1044,7 @@ class ChatMemoryPlugin(Star):
         """按轮次返回 user-assistant 配对。每轮 ``[user_dict, assistant_dict]`` 两条。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
-        ``persona_id`` 给定时按 persona 过滤（user + assistant 都加，保证配对同 persona）。
+        ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``。user + assistant 都加。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加，保证配对
         在时间窗口内；EXISTS 子查不限时间，保持"有配对"语义）。
         """
@@ -1070,7 +1065,6 @@ class ChatMemoryPlugin(Star):
         sender_nickname: Optional[str] = None, raw_timestamp: Optional[int] = None,
         at_id: Optional[str] = None, reply_id: Optional[str] = None,
         forward_id: Optional[str] = None, persona_id: Optional[str] = None,
-        created_at: Optional[datetime] = None,
     ) -> bool:
         try:
             await self.db.insert(
@@ -1081,7 +1075,7 @@ class ChatMemoryPlugin(Star):
                 self_id=self_id, group_id=group_id, sender_nickname=sender_nickname,
                 raw_timestamp=raw_timestamp,
                 at_id=at_id, reply_id=reply_id, forward_id=forward_id,
-                persona_id=persona_id, created_at=created_at,
+                persona_id=persona_id,
             )
             return True
         except Exception as e:
