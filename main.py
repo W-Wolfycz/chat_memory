@@ -22,12 +22,11 @@ assistant 配对：新记录优先用内部 ``turn_id``；旧记录用 ``pair_id
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
-from pathlib import Path
 from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
-from astrbot.api.star import Star, Context
+from astrbot.api.star import Star, Context, StarTools
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
@@ -102,7 +101,7 @@ class ChatMemoryPlugin(Star):
         except Exception:
             self._tz = ZoneInfo("Asia/Shanghai")
 
-        data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "chat_memory"
+        data_dir = StarTools.get_data_dir("chat_memory")
         self.db = DBManager(data_dir, tz=self._tz)
 
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -127,6 +126,25 @@ class ChatMemoryPlugin(Star):
                 f"(mode={mode_repr}, limit={self.ct_limit_rounds}, "
                 f"clear_native={self.ct_clear_native_history})"
             )
+
+    async def initialize(self) -> None:
+        """在插件加载阶段完成数据库迁移并启动后台服务。
+
+        初始化失败必须继续向外抛出，让 AstrBot 将插件标记为加载失败；否则插件可能
+        表面可用、实际从第一条消息开始持续漏存。失败前释放已创建的数据库连接。
+        """
+        try:
+            await self.db.init_db()
+            await self._ensure_cleanup_started()
+        except BaseException:
+            try:
+                await self.db.engine.dispose()
+            except Exception as dispose_error:
+                logger.warning(
+                    f"{self._log_prefix()} 初始化失败后的 engine.dispose 异常: "
+                    f"{dispose_error}"
+                )
+            raise
 
     # ── 自动清理 ─────────────────────────────────────
 
@@ -476,7 +494,14 @@ class ChatMemoryPlugin(Star):
                     f"{self._log_prefix(event)} filter_by_persona=True 但当前生效 persona_id 为空，"
                     f"将仅匹配 persona_id IS NULL OR '' 的记录（老数据/未分配 persona 的消息）"
                 )
-        records = await self._takeover_query(umo, cid, user_id, persona_id)
+        current_turn_id = event.get_extra("chat_memory_turn_id") or ""
+        records = await self._takeover_query(
+            umo,
+            cid,
+            user_id,
+            persona_id,
+            exclude_turn_id=current_turn_id,
+        )
         if not records:
             await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
             return
@@ -526,7 +551,12 @@ class ChatMemoryPlugin(Star):
         self._log(f"{self._log_prefix(event)} 严格接管 contexts=0：{reason}")
 
     async def _takeover_query(
-        self, umo: str, cid: str, user_id: str, persona_id: str = "",
+        self,
+        umo: str,
+        cid: str,
+        user_id: str,
+        persona_id: str = "",
+        exclude_turn_id: str = "",
     ) -> list[dict]:
         """按 cross_session / full_group / 配对模式 查询 CM 数据，返回扁平化 records 列表。
 
@@ -538,8 +568,9 @@ class ChatMemoryPlugin(Star):
         - 配对模式 → 轮数（user-assistant 一对为一轮）
         - 混合模式 → 消息数（单条记录）
 
-        ``persona_id``：仅当 ``ct_filter_by_persona=True`` 时由调用方填入（取自
-        ``req.conversation.persona_id``）；为空时 storage 层跳过 persona 过滤。
+        ``persona_id``：仅当 ``ct_filter_by_persona=True`` 时由调用方填入。
+        ``exclude_turn_id``：混合模式排除本轮刚写入的 user，避免它同时出现在
+        ``req.contexts`` 与当前 ``req.prompt`` 中。
         """
         limit = self.ct_limit_rounds
         status_set: set[str] = set(self.ct_llm_status_filter)
@@ -574,6 +605,7 @@ class ChatMemoryPlugin(Star):
                     umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
+                    exclude_turn_id=exclude_turn_id or None,
                 )
 
             # 防御性全局排序（混合模式下 messages_raw 已排序，但保持一致）

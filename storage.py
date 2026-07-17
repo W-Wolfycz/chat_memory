@@ -808,6 +808,7 @@ class DBManager:
         full_group: bool = False,
         persona_id: Optional[str] = None,
         filter_by_persona: bool = False,
+        exclude_turn_id: Optional[str] = None,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
@@ -826,6 +827,9 @@ class DBManager:
 
         ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤；``persona_id`` 为空时
         过滤 ``IS NULL OR ''`` 的记录（匹配老库补列后的旧行）。
+
+        ``exclude_turn_id``：排除当前正在请求 LLM 的轮次，避免当前 user 同时出现在
+        takeover history 与 ProviderRequest.prompt 中。
         """
         await self.init_db()
         async with self.async_session() as session:
@@ -840,6 +844,10 @@ class DBManager:
             if conversation_id:
                 conditions.append("conversation_id = :cid")
                 params["cid"] = conversation_id
+
+            if exclude_turn_id:
+                conditions.append("(turn_id IS NULL OR turn_id != :exclude_turn_id)")
+                params["exclude_turn_id"] = exclude_turn_id
 
             if filter_by_persona:
                 if persona_id:

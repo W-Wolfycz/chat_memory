@@ -15,7 +15,10 @@ ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开
 - takeover 默认严格接管，支持字符预算、persona 隔离、跨会话/整群 scope 和内容白名单。
 - `max_content_length` 默认改为 `0`（不截断）；takeover 的 `limit_rounds` 只钳下限 1，不再限制上限。
 - `query_rounds` 收紧为严格完整配对；persona / 时间窗口条件会同步约束 assistant，历史重复 assistant 取最早一条。
-- 完成模块拆分、配置说明、依赖声明、README 和 36 项本地回归测试。
+- 数据库迁移改为在 `Star.initialize()` 阶段执行，失败时释放连接并让 AstrBot 将插件标记为加载失败。
+- 数据目录改用 `StarTools.get_data_dir("chat_memory")`，不再依赖工作目录或手工拼接宿主路径。
+- takeover 混合状态模式排除当前 `turn_id`，避免本轮 user 同时进入历史 contexts 与当前 prompt。
+- 完成模块拆分、配置说明、依赖声明、README、38 项本地回归测试，以及使用 AstrBot 自带 SQLAlchemy/aiosqlite 的临时数据库集成验证。
 
 ## 0.9.0 — 2026-07-15
 

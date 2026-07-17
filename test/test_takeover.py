@@ -46,6 +46,9 @@ for name in ["Plain", "Image", "Video", "Record", "File", "Face",
 
 sys.modules["astrbot.api.star"].Star = object
 sys.modules["astrbot.api.star"].Context = object
+sys.modules["astrbot.api.star"].StarTools = types.SimpleNamespace(
+    get_data_dir=lambda plugin_name: PLUGIN_DIR / ".test_data" / plugin_name,
+)
 
 
 class _EventMessageType(enum.Enum):
@@ -425,7 +428,10 @@ def test_takeover_mode_selection():
                 calls.append(("rounds_raw", kinds, all_match))
                 return []
             async def query_messages_raw(self, umo, cid, uid, lim, statuses, kinds, all_match, cross_umo=False, full_group=False, **kw):
-                calls.append(("messages_raw", statuses, kinds, all_match))
+                calls.append((
+                    "messages_raw", statuses, kinds, all_match,
+                    kw.get("exclude_turn_id"),
+                ))
                 return []
 
         p.db = _DB()
@@ -443,11 +449,14 @@ def test_takeover_mode_selection():
         p.ct_llm_status_filter = {"llm_success", "proactive"}
         p.ct_include_kinds = {"text"}
         p.ct_include_all_match = False
-        await p._takeover_query(_UMO_GROUP, "c1", "u1")
+        await p._takeover_query(
+            _UMO_GROUP, "c1", "u1", exclude_turn_id="turn-current",
+        )
         assert calls[-1][0] == "messages_raw"
         assert calls[-1][1] == {"llm_success", "proactive"}
         assert calls[-1][2] == {"text"}
         assert calls[-1][3] is False
+        assert calls[-1][4] == "turn-current"
 
         # 含 no_llm（空串）→ 混合模式
         p.ct_llm_status_filter = {"llm_success", ""}
@@ -465,6 +474,90 @@ def test_no_fire_and_forget_writes():
     assert "ok = await self._safe_insert(" in _main_src
     assert "update_user_llm_status=" in _main_src
     print("[T14] 关键写入直接 await，无 fire-and-forget 写入 ✓")
+
+
+def test_initialize_lifecycle():
+    """T46: initialize 启动期迁移；失败时 dispose 并继续抛出。"""
+    assert 'StarTools.get_data_dir("chat_memory")' in _main_src
+    assert "async def initialize(self) -> None:" in _main_src
+
+    _orig_logger = _mod_ns["logger"]
+    _mod_ns["logger"] = types.SimpleNamespace(
+        info=lambda *a, **kw: None,
+        warning=lambda *a, **kw: None,
+        debug=lambda *a, **kw: None,
+    )
+
+    async def _run():
+        calls = []
+
+        class _Engine:
+            async def dispose(self):
+                calls.append("dispose")
+
+        class _DB:
+            engine = _Engine()
+
+            async def init_db(self):
+                calls.append("init")
+
+        p = _make_plugin()
+        p.db = _DB()
+        p.auto_cleanup_days = 0
+        p._cleanup_started = False
+        p._cleanup_task = None
+        await p.initialize()
+        assert calls == ["init"]
+
+        class _FailDB:
+            engine = _Engine()
+
+            async def init_db(self):
+                calls.append("fail_init")
+                raise RuntimeError("init failed")
+
+        p.db = _FailDB()
+        try:
+            await p.initialize()
+        except RuntimeError as exc:
+            assert str(exc) == "init failed"
+        else:
+            raise AssertionError("initialize 失败必须向 AstrBot 继续抛出")
+        assert calls[-2:] == ["fail_init", "dispose"]
+
+    try:
+        asyncio.run(_run())
+    finally:
+        _mod_ns["logger"] = _orig_logger
+    print("[T46] initialize 启动期迁移 + 失败释放/抛出 ✓")
+
+
+def test_current_turn_excluded_from_mixed_takeover():
+    """T47: 混合模式排除当前 turn，避免 history 与 prompt 重复。"""
+    assert "exclude_turn_id=exclude_turn_id or None" in _main_src
+    assert "turn_id != :exclude_turn_id" in _storage_src
+
+    async def _run():
+        p = _make_plugin()
+        p.ct_llm_status_filter = {"llm_success", "llm_pending"}
+        received = {}
+
+        class _DB:
+            async def query_messages_raw(self, *args, **kwargs):
+                received.update(kwargs)
+                return []
+
+        p.db = _DB()
+        await p._takeover_query(
+            _UMO_GROUP,
+            "c1",
+            "u1",
+            exclude_turn_id="turn-current",
+        )
+        assert received["exclude_turn_id"] == "turn-current"
+
+    asyncio.run(_run())
+    print("[T47] takeover 混合模式排除当前 turn_id ✓")
 
 
 def test_takeover_mixed_limit_and_empty_policy():
@@ -1848,6 +1941,8 @@ def _run_all():
         test_takeover_query_matrix,
         test_takeover_mode_selection,
         test_no_fire_and_forget_writes,
+        test_initialize_lifecycle,
+        test_current_turn_excluded_from_mixed_takeover,
         test_takeover_mixed_limit_and_empty_policy,
         test_takeover_character_budget,
         test_records_unconditional_sort,
