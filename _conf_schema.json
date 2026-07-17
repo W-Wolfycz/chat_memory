@@ -85,13 +85,6 @@
         "default": false,
         "hint": "关闭时命中任一类型即可；开启时消息中的全部类型都必须在白名单内。"
       },
-      "prefix_enhance": {
-        "description": "前缀增强",
-        "type": "string",
-        "default": "time_sender",
-        "options": ["off", "time", "sender", "time_sender"],
-        "hint": "user 消息前缀：关闭、时间 [MM/DD HH:MM:SS]、发送者或两者组合。"
-      },
       "clear_native_history": {
         "description": "清理原生历史",
         "type": "bool",

@@ -42,6 +42,7 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             {
                 "context_takeover": {
                     "enable": True,
+                    # 旧配置即使仍残留也必须被忽略，身份前缀不可关闭。
                     "prefix_enhance": "off",
                     "llm_status_filter": ["llm_success"],
                     "include_content_kinds": ["text"],
@@ -81,10 +82,14 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             user_id="10001",
             conversation_id=cid,
         )
-        assert contexts == [
-            {"role": "user", "content": "公开 API 问题", "_no_save": True},
-            {"role": "assistant", "content": "公开 API 回答", "_no_save": True},
-        ]
+        assert [item["role"] for item in contexts] == ["user", "assistant"]
+        assert contexts[0]["content"].endswith("10001: 公开 API 问题")
+        assert contexts[0]["_no_save"] is True
+        assert contexts[1] == {
+            "role": "assistant",
+            "content": "公开 API 回答",
+            "_no_save": True,
+        }
         assert await plugin.build_takeover_contexts(
             umo=umo,
             user_id="",
@@ -147,10 +152,11 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             user_id="",
             conversation_id="conversation_group",
         )
-        assert [item["content"] for item in group_contexts] == [
-            "当前群问题",
-            "当前群回答",
-        ]
+        assert [item["role"] for item in group_contexts] == ["user", "assistant"]
+        assert group_contexts[0]["content"].endswith(
+            "[发言者] 10002: 当前群问题"
+        )
+        assert group_contexts[1]["content"] == "当前群回答"
         await plugin.terminate()
 
 

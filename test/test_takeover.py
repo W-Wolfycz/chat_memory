@@ -142,7 +142,6 @@ class _PluginStub(_ChatMemoryPlugin):
 def _make_plugin():
     p = _PluginStub()
     p.ct_enable = True
-    p.ct_prefix_enhance = "time_sender"
     p.ct_cross_session = False
     p.ct_full_group = False
     p.ct_limit_rounds = 5
@@ -302,9 +301,8 @@ def test_image_text_mixed():
     print("[T8] 图文混合保留文本，纯图丢弃 ✓")
 
 
-def test_prefix_off_solo_still_tagged():
+def test_prefix_is_mandatory_and_solo_still_tagged():
     p = _make_plugin()
-    p.ct_prefix_enhance = "off"
     records = [
         {"role": "user", "content": "hi", "sender_nickname": "Alice",
          "created_at": "2026-07-09 10:00:00", "content_kind": ["text"],
@@ -317,10 +315,101 @@ def test_prefix_off_solo_still_tagged():
          "llm_status": "llm_success"},
     ]
     out = p._takeover_normalize(records, _UMO_GROUP)
-    assert out[0]["content"] == "hi"
-    assert out[1]["content"] == "[主动] 推送"
-    assert out[2]["content"] == "收到"
-    print("[T10] prefix off + solo 仍有 tag ✓")
+    assert out[0]["content"] == "[07/09 10:00:00] Alice: hi"
+    assert out[1]["content"] == "[07/09 10:00:30] [主动] 推送"
+    assert out[2]["content"] == "[07/09 10:01:00] Alice: 收到"
+    schema = json.loads(_schema_src)
+    assert "prefix_enhance" not in schema["context_takeover"]["items"]
+    assert "ct_prefix_enhance" not in _main_src
+    print("[T10] 时间+发送者前缀强制启用，solo 保留时间与状态 tag ✓")
+
+
+def test_full_group_speaker_identity_and_system_instruction():
+    """T49: full-group 标记当前/其他发言者，system prompt 规则只追加一次。"""
+    p = _make_plugin()
+    records = [
+        {
+            "role": "user", "content": "当前用户发言", "user_id": "u1",
+            "sender_nickname": "Alice", "created_at": "2026-07-09 10:00:00",
+            "content_kind": ["text"], "llm_status": "llm_success",
+        },
+        {
+            "role": "user", "content": "其他用户发言", "user_id": "u2",
+            "sender_nickname": "Bob", "created_at": "2026-07-09 10:00:03",
+            "content_kind": ["text"], "llm_status": "",
+        },
+        {
+            "role": "assistant", "content": "历史回答", "user_id": "u1",
+            "created_at": "2026-07-09 10:00:05", "content_kind": ["text"],
+            "llm_status": "llm_success",
+        },
+    ]
+    out = p._takeover_normalize(
+        records,
+        _UMO_GROUP,
+        current_user_id="u1",
+        full_group=True,
+    )
+    assert [item["role"] for item in out] == ["user", "assistant"]
+    assert "[当前发言者] Alice: 当前用户发言" in out[0]["content"]
+    assert "[其他发言者] Bob: 其他用户发言" in out[0]["content"]
+    assert "合并群聊转录" not in out[0]["content"]
+
+    # 公开 API 没有当前 user 时使用中性标记，不把任何人误标为“其他”。
+    neutral = p._takeover_normalize(
+        records,
+        _UMO_GROUP,
+        current_user_id="",
+        full_group=True,
+    )
+    assert "[发言者] Alice: 当前用户发言" in neutral[0]["content"]
+    assert "[当前发言者]" not in neutral[0]["content"]
+    assert "[其他发言者]" not in neutral[0]["content"]
+
+    req = types.SimpleNamespace(system_prompt="原有系统提示")
+    p._append_full_group_instruction(req)
+    p._append_full_group_instruction(req)
+    assert req.system_prompt.startswith("原有系统提示\n\n")
+    assert req.system_prompt.count("[ChatMemory 群聊历史解释规则]") == 1
+    assert "当前用户的新请求位于历史 contexts 之后" in req.system_prompt
+
+    async def _run_hook():
+        async def _get_cid(umo):
+            return "conversation_demo"
+
+        async def _build(**kwargs):
+            return [
+                {"role": "user", "content": "历史问题", "_no_save": True},
+                {"role": "assistant", "content": "历史回答", "_no_save": True},
+            ]
+
+        reset_calls = []
+
+        async def _reset(umo, cid):
+            reset_calls.append((umo, cid))
+
+        class _Event:
+            unified_msg_origin = _UMO_GROUP
+
+            def get_sender_id(self):
+                return "u1"
+
+            def get_extra(self, key, default=None):
+                return default
+
+        p.ct_full_group = True
+        p._get_curr_cid = _get_cid
+        p.build_takeover_contexts = _build
+        p._safe_reset_history = _reset
+        p._log = lambda *args, **kwargs: None
+        hook_req = types.SimpleNamespace(system_prompt="人格提示", contexts=[])
+        await p.take_over_context(_Event(), hook_req)
+        assert hook_req.contexts[-1]["role"] == "assistant"
+        assert hook_req.system_prompt.count("[ChatMemory 群聊历史解释规则]") == 1
+        assert reset_calls == [(_UMO_GROUP, "conversation_demo")]
+
+    asyncio.run(_run_hook())
+    print("[T49] full-group 发言者身份标记 + system prompt 幂等注入 ✓")
 
 
 def test_no_llm_mapping():
@@ -607,12 +696,21 @@ def test_public_build_takeover_contexts_api():
 
         normalize_calls = []
 
-        def _normalize(records, umo, max_records=None, max_chars=0):
+        def _normalize(
+            records,
+            umo,
+            max_records=None,
+            max_chars=0,
+            current_user_id="",
+            full_group=False,
+        ):
             normalize_calls.append({
                 "records": records,
                 "umo": umo,
                 "max_records": max_records,
                 "max_chars": max_chars,
+                "current_user_id": current_user_id,
+                "full_group": full_group,
             })
             return [
                 {"role": "user", "content": "历史问题", "_no_save": True},
@@ -669,6 +767,8 @@ def test_public_build_takeover_contexts_api():
         }
         assert normalize_calls[-1]["max_records"] == 7
         assert normalize_calls[-1]["max_chars"] == 321
+        assert normalize_calls[-1]["current_user_id"] == "u1"
+        assert normalize_calls[-1]["full_group"] is False
 
         # 纯配对模式由 query_rounds_raw 控制轮数，normalize 不再二次按消息数截断。
         p.ct_llm_status_filter = {"llm_success"}
@@ -683,6 +783,8 @@ def test_public_build_takeover_contexts_api():
         assert calls[-1]["user_id"] == ""
         assert calls[-1]["cid"] == "conversation_group"
         assert calls[-1]["force_current_session"] is True
+        assert normalize_calls[-1]["current_user_id"] == ""
+        assert normalize_calls[-1]["full_group"] is True
 
         async def _no_current_cid(umo):
             return ""
@@ -749,7 +851,6 @@ def test_takeover_mixed_limit_and_empty_policy():
 def test_takeover_character_budget():
     """T45: 字符预算按完整 user 起点裁掉旧上下文，不伪装精确 token。"""
     p = _make_plugin()
-    p.ct_prefix_enhance = "off"
     records = []
     for idx in range(1, 4):
         records.extend([
@@ -2092,7 +2193,8 @@ def _run_all():
         test_tail_solo_pop,
         test_tail_paired_assistant_kept,
         test_image_text_mixed,
-        test_prefix_off_solo_still_tagged,
+        test_prefix_is_mandatory_and_solo_still_tagged,
+        test_full_group_speaker_identity_and_system_instruction,
         test_no_llm_mapping,
         test_takeover_query_matrix,
         test_takeover_mode_selection,

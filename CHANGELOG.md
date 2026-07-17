@@ -2,6 +2,17 @@
 
 ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前仍为 `2`。
 
+## 1.0.1 — 2026-07-17
+
+### 群聊身份与公开接管 API
+
+- 新增只读公开 API `build_takeover_contexts()`，供主动消息等独立 LLM 调用完整复用当前 takeover 的 scope、过滤、固定身份前缀与预算配置；接管关闭返回 `None`，启用但无可用上下文返回 `[]`。
+- 实际 `on_llm_request` 接管路径改为调用同一公开 API，避免内部接管与外部消费者行为分叉。
+- 修复 `cross_session + full_group + 空 user_id` 会退化为整个平台 scope 的 P1：公开 API 强制限制为当前 UMO + CID，storage 层同时禁止空用户进入跨 UMO 查询。
+- 删除可关闭身份信息的 `prefix_enhance` 配置，takeover user 历史统一强制使用时间 + 发送者前缀；旧配置字段直接忽略。
+- full-group 群聊历史增加 `[当前发言者]` / `[其他发言者]` 标记；当前用户未知时使用 `[发言者]`。ChatMemory 自身接管同时向 `system_prompt` 幂等追加群聊归因规则。
+- 本地回归测试扩充至 40 项，并通过 AstrBot 自带 SQLAlchemy/aiosqlite 的临时数据库集成验证。
+
 ## 1.0.0 — 2026-07-17
 
 ### 最终验证版
@@ -18,10 +29,7 @@ ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开
 - 数据库迁移改为在 `Star.initialize()` 阶段执行，失败时释放连接并让 AstrBot 将插件标记为加载失败。
 - 数据目录改用 `StarTools.get_data_dir("chat_memory")`，不再依赖工作目录或手工拼接宿主路径。
 - takeover 混合状态模式排除当前 `turn_id`，避免本轮 user 同时进入历史 contexts 与当前 prompt。
-- 新增只读公开 API `build_takeover_contexts()`，供主动消息等独立 LLM 调用完整复用当前 takeover 的 scope、过滤、前缀与预算配置；接管关闭返回 `None`，启用但无可用上下文返回 `[]`。
-- 实际 `on_llm_request` 接管路径改为调用同一公开 API，避免插件内部接管与外部消费者行为分叉；空 `user_id` 仅在明确启用群聊 `full_group` 时允许。
-- 修复 `cross_session + full_group + 空 user_id` 会退化为整个平台 scope 的 P1：公开 API 强制限制为当前 UMO + CID，storage 层同时禁止空用户进入跨 UMO 查询。
-- 完成模块拆分、配置说明、依赖声明、README、39 项本地回归测试，以及使用 AstrBot 自带 SQLAlchemy/aiosqlite 的临时数据库集成验证。
+- 完成模块拆分、配置说明、依赖声明、README、38 项本地回归测试，以及使用 AstrBot 自带 SQLAlchemy/aiosqlite 的临时数据库集成验证。
 
 ## 0.9.0 — 2026-07-15
 

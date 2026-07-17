@@ -4,6 +4,14 @@ from collections.abc import Iterable
 from typing import Optional
 
 
+FULL_GROUP_CONTEXT_INSTRUCTION = """[ChatMemory 群聊历史解释规则]
+ChatMemory 提供的历史 contexts 中，role=user 可能是合并后的连续群聊发言，
+不代表其中所有内容都来自当前用户。请严格依据每段的 [当前发言者] / [其他发言者]
+标记分别归因，不得把其他发言者的行为、饮食、偏好、关系或承诺归到当前用户。
+role=assistant 是你自己的历史回复；当前用户的新请求位于历史 contexts 之后。
+无法确定事实归属时，不要擅自断言。"""
+
+
 def strip_reasoning_prefix(text: str) -> str:
     """剥离 AstrBot 错误序列化进 Plain 的 reasoning parts 前缀。"""
     if not text.startswith("[{'type': 'think'"):
@@ -55,13 +63,15 @@ def is_pure_media(record: dict, media_kinds: set[str]) -> bool:
 class TakeoverContextBuilder:
     def __init__(
         self,
-        prefix_mode: str,
         media_kinds: Iterable[str],
+        current_user_id: str = "",
+        full_group: bool = False,
         proactive_status: str = "proactive",
         orphan_status: str = "orphan",
     ) -> None:
-        self.prefix_mode = prefix_mode
         self.media_kinds = set(media_kinds)
+        self.current_user_id = str(current_user_id or "").strip()
+        self.full_group = bool(full_group)
         self.proactive_status = proactive_status
         self.orphan_status = orphan_status
 
@@ -141,24 +151,31 @@ class TakeoverContextBuilder:
         return formatted
 
     def _apply_prefix(self, record: dict, content: str) -> str:
-        if self.prefix_mode == "off" or not content:
-            return content
         parts: list[str] = []
-        if self.prefix_mode in ("time", "time_sender"):
-            time_str = extract_time_str(record.get("created_at"))
-            if time_str:
-                parts.append(f"[{time_str}]")
-        if self.prefix_mode in ("sender", "time_sender"):
-            sender = record.get("sender_nickname") or record.get("user_id") or "?"
-            parts.append(f"{sender}:")
-        return f"{' '.join(parts)} {content}" if parts else content
+        time_str = extract_time_str(record.get("created_at"))
+        if time_str:
+            parts.append(f"[{time_str}]")
+        if self.full_group:
+            record_user_id = str(record.get("user_id") or "").strip()
+            if self.current_user_id:
+                speaker_tag = (
+                    "当前发言者"
+                    if record_user_id == self.current_user_id
+                    else "其他发言者"
+                )
+            else:
+                speaker_tag = "发言者"
+            parts.append(f"[{speaker_tag}]")
+        sender = record.get("sender_nickname") or record.get("user_id") or "?"
+        parts.append(f"{sender}:")
+        prefix = " ".join(parts)
+        return f"{prefix} {content}" if content else prefix
 
     def _apply_solo_prefix(self, record: dict, content: str, tag: str) -> str:
         parts: list[str] = []
-        if self.prefix_mode in ("time", "time_sender"):
-            time_str = extract_time_str(record.get("created_at"))
-            if time_str:
-                parts.append(f"[{time_str}]")
+        time_str = extract_time_str(record.get("created_at"))
+        if time_str:
+            parts.append(f"[{time_str}]")
         parts.append(f"[{tag}]")
         prefix = " ".join(parts)
         return f"{prefix} {content}" if content else prefix

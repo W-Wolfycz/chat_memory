@@ -40,6 +40,7 @@ from .message_classifier import (
     extract_text as _extract_text_impl,
 )
 from .context_builder import (
+    FULL_GROUP_CONTEXT_INSTRUCTION,
     TakeoverContextBuilder,
     extract_time_str as _extract_time_str_impl,
     is_pure_media as _is_pure_media_impl,
@@ -84,7 +85,6 @@ class ChatMemoryPlugin(Star):
         # "no_llm" 是 UI 占位符，DB 实际值是空串 ""
         ct_status_list = list(ct_status) if ct_status else ["llm_success"]
         self.ct_llm_status_filter = ["" if s == "no_llm" else s for s in ct_status_list]
-        self.ct_prefix_enhance = str(ct_conf.get("prefix_enhance", "time_sender"))
         # Kind 白名单：选中=需要；默认 ["text"]；空集合 = 不过滤（全部进入）
         self.ct_include_kinds: set[str] = set(ct_conf.get("include_content_kinds", ["text"]) or [])
         # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
@@ -506,6 +506,8 @@ class ChatMemoryPlugin(Star):
             await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
             return
 
+        if self.ct_full_group and self._is_group_umo(umo):
+            self._append_full_group_instruction(req)
         req.contexts = contexts
 
         if self.ct_clear_native_history:
@@ -616,10 +618,13 @@ class ChatMemoryPlugin(Star):
         umo: str,
         max_records: Optional[int] = None,
         max_chars: int = 0,
+        current_user_id: str = "",
+        full_group: bool = False,
     ) -> list[dict]:
         builder = TakeoverContextBuilder(
-            prefix_mode=self.ct_prefix_enhance,
             media_kinds=_MEDIA_KINDS,
+            current_user_id=current_user_id,
+            full_group=full_group,
             proactive_status=_LLM_PROACTIVE,
             orphan_status=_LLM_ORPHAN,
         )
@@ -627,6 +632,18 @@ class ChatMemoryPlugin(Star):
             records,
             max_records=max_records,
             max_chars=max_chars,
+        )
+
+    @staticmethod
+    def _append_full_group_instruction(req: ProviderRequest) -> None:
+        """把 full-group 转录解释规则追加到 system prompt，且同一请求只加一次。"""
+        existing = (getattr(req, "system_prompt", "") or "").strip()
+        if FULL_GROUP_CONTEXT_INSTRUCTION in existing:
+            return
+        req.system_prompt = (
+            f"{existing}\n\n{FULL_GROUP_CONTEXT_INSTRUCTION}"
+            if existing
+            else FULL_GROUP_CONTEXT_INSTRUCTION
         )
 
     @staticmethod
@@ -912,6 +929,8 @@ class ChatMemoryPlugin(Star):
             umo,
             max_records=self.ct_limit_rounds if mixed_mode else None,
             max_chars=self.ct_max_context_chars,
+            current_user_id=user_id,
+            full_group=effective_full_group,
         )
 
     # ── 内部工具 ──────────────────────────────────────
