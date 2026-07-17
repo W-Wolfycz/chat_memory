@@ -923,39 +923,39 @@ def _scope_filter(
     - T/T：混合语义 — 当前 umo 整群 + 其他 umo 当前 user
       → ``((umo = :scope_umo) OR (platform_id = :scope_pid AND umo != :scope_umo AND user_id = :scope_uid))``
 
-    ``user_id`` 为空时：所有 ``user_id`` 限制退化为不加（等价于整群/整 platform），
-    ``user_id`` 为空时保留边缘平台的整 scope 兜底行为。
+    ``user_id`` 为空时禁止进入跨 UMO scope：仅 ``full_group=True`` 可降级为当前 UMO，
+    其他组合返回恒假条件。公开 API 还会进一步把该场景限制在当前 CID。
     """
+    user_id = str(user_id or "").strip()
     pid = umo.split(":", 1)[0] if umo else ""
     has_uid = bool(user_id)
 
+    if not has_uid:
+        if full_group:
+            return "umo = :scope_umo", {"scope_umo": umo}
+        return "1 = 0", {}
+
     if cross_umo and full_group:
-        if has_uid:
-            cond = (
-                "((umo = :scope_umo) "
-                "OR (platform_id = :scope_pid AND umo != :scope_umo "
-                "AND user_id = :scope_uid))"
-            )
-            return cond, {"scope_umo": umo, "scope_pid": pid, "scope_uid": user_id}
-        return "platform_id = :scope_pid", {"scope_pid": pid}
+        cond = (
+            "((umo = :scope_umo) "
+            "OR (platform_id = :scope_pid AND umo != :scope_umo "
+            "AND user_id = :scope_uid))"
+        )
+        return cond, {"scope_umo": umo, "scope_pid": pid, "scope_uid": user_id}
 
     if cross_umo:
-        if has_uid:
-            return (
-                "platform_id = :scope_pid AND user_id = :scope_uid",
-                {"scope_pid": pid, "scope_uid": user_id},
-            )
-        return "platform_id = :scope_pid", {"scope_pid": pid}
+        return (
+            "platform_id = :scope_pid AND user_id = :scope_uid",
+            {"scope_pid": pid, "scope_uid": user_id},
+        )
 
     if full_group:
         return "umo = :scope_umo", {"scope_umo": umo}
 
-    if has_uid:
-        return (
-            "umo = :scope_umo AND user_id = :scope_uid",
-            {"scope_umo": umo, "scope_uid": user_id},
-        )
-    return "umo = :scope_umo", {"scope_umo": umo}
+    return (
+        "umo = :scope_umo AND user_id = :scope_uid",
+        {"scope_umo": umo, "scope_uid": user_id},
+    )
 
 
 _SELECT_COLS = (

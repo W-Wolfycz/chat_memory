@@ -495,26 +495,15 @@ class ChatMemoryPlugin(Star):
                     f"将仅匹配 persona_id IS NULL OR '' 的记录（老数据/未分配 persona 的消息）"
                 )
         current_turn_id = event.get_extra("chat_memory_turn_id") or ""
-        records = await self._takeover_query(
-            umo,
-            cid,
-            user_id,
-            persona_id,
+        contexts = await self.build_takeover_contexts(
+            umo=umo,
+            user_id=user_id,
+            conversation_id=cid,
+            persona_id=persona_id,
             exclude_turn_id=current_turn_id,
         )
-        if not records:
-            await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
-            return
-
-        mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
-        contexts = self._takeover_normalize(
-            records,
-            umo,
-            max_records=self.ct_limit_rounds if mixed_mode else None,
-            max_chars=self.ct_max_context_chars,
-        )
         if not contexts:
-            await self._handle_empty_takeover(event, req, umo, cid, "规整后为空")
+            await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
             return
 
         req.contexts = contexts
@@ -557,6 +546,7 @@ class ChatMemoryPlugin(Star):
         user_id: str,
         persona_id: str = "",
         exclude_turn_id: str = "",
+        force_current_session: bool = False,
     ) -> list[dict]:
         """按 cross_session / full_group / 配对模式 查询 CM 数据，返回扁平化 records 列表。
 
@@ -571,6 +561,8 @@ class ChatMemoryPlugin(Star):
         ``persona_id``：仅当 ``ct_filter_by_persona=True`` 时由调用方填入。
         ``exclude_turn_id``：混合模式排除本轮刚写入的 user，避免它同时出现在
         ``req.contexts`` 与当前 ``req.prompt`` 中。
+        ``force_current_session``：忽略 ``cross_session``，只查当前 UMO + CID；用于
+        ``full_group`` 下缺少 ``user_id`` 的只读公开调用，防止跨 UMO 范围失去用户约束。
         """
         limit = self.ct_limit_rounds
         status_set: set[str] = set(self.ct_llm_status_filter)
@@ -586,8 +578,9 @@ class ChatMemoryPlugin(Star):
 
         # cross_session：跨 CID（cid=None）+ 跨 umo（cross_umo=True）
         # 跨 umo 按 platform_id + user_id 聚合，实现群私聊互通
-        target_cid: Optional[str] = None if self.ct_cross_session else cid
-        cross_umo = self.ct_cross_session
+        effective_cross_session = self.ct_cross_session and not force_current_session
+        target_cid: Optional[str] = None if effective_cross_session else cid
+        cross_umo = effective_cross_session
 
         try:
             if is_pair_only:
@@ -864,6 +857,61 @@ class ChatMemoryPlugin(Star):
         return await self.db.query_rounds(
             umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
             persona_id=persona_id, since=since, until=until,
+        )
+
+    async def build_takeover_contexts(
+        self,
+        umo: str,
+        user_id: str,
+        conversation_id: Optional[str] = None,
+        persona_id: str = "",
+        exclude_turn_id: str = "",
+    ) -> Optional[list[dict]]:
+        """只读构建与当前 context takeover 完全一致的 LLM ``contexts``。
+
+        返回值语义：
+
+        - ``None``：``context_takeover.enable=false``；
+        - ``[]``：接管已启用，但会话、用户范围或规整后的记录为空；
+        - ``list[dict]``：已按当前接管配置完成查询、前缀增强与边界裁剪。
+
+        本方法不清理 AstrBot native history、不修改请求对象，也不写数据库。调用方未提供
+        ``conversation_id`` 时会读取 ``umo`` 的当前 conversation。空 ``user_id`` 仅在
+        ``full_group`` 已启用且 ``umo`` 确为群聊时允许；此时即使配置了
+        ``cross_session`` 也强制降级为当前 UMO + CID 的整群范围，避免空用户条件扩大到
+        整个平台。
+        """
+        if not self.ct_enable:
+            return None
+        if not umo:
+            return []
+
+        user_id = str(user_id or "").strip()
+        effective_full_group = self.ct_full_group and self._is_group_umo(umo)
+        if not user_id and not effective_full_group:
+            return []
+
+        cid = conversation_id or await self._get_curr_cid(umo)
+        if not cid:
+            return []
+
+        records = await self._takeover_query(
+            umo,
+            cid,
+            user_id,
+            persona_id,
+            exclude_turn_id=exclude_turn_id,
+            force_current_session=not bool(user_id),
+        )
+        if not records:
+            return []
+
+        mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
+        return self._takeover_normalize(
+            records,
+            umo,
+            max_records=self.ct_limit_rounds if mixed_mode else None,
+            max_chars=self.ct_max_context_chars,
         )
 
     # ── 内部工具 ──────────────────────────────────────

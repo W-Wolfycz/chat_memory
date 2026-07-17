@@ -141,6 +141,7 @@ class _PluginStub(_ChatMemoryPlugin):
 
 def _make_plugin():
     p = _PluginStub()
+    p.ct_enable = True
     p.ct_prefix_enhance = "time_sender"
     p.ct_cross_session = False
     p.ct_full_group = False
@@ -411,6 +412,20 @@ def test_takeover_query_matrix():
             assert calls[-1]["cross_umo"] is False
             assert calls[-1]["full_group"] is False, "私聊 full_group 应降级为 False"
 
+            # 矩阵 6: cross + full + 空 uid 的公开 API 安全降级 → 当前 CID 整群
+            p.ct_cross_session = True
+            p.ct_full_group = True
+            await p._takeover_query(
+                _UMO_GROUP,
+                "c1",
+                "",
+                force_current_session=True,
+            )
+            assert calls[-1]["cid"] == "c1"
+            assert calls[-1]["uid"] == ""
+            assert calls[-1]["cross_umo"] is False
+            assert calls[-1]["full_group"] is True
+
         asyncio.run(_run())
     finally:
         _mod_ns["logger"] = _orig_logger
@@ -558,6 +573,127 @@ def test_current_turn_excluded_from_mixed_takeover():
 
     asyncio.run(_run())
     print("[T47] takeover 混合模式排除当前 turn_id ✓")
+
+
+def test_public_build_takeover_contexts_api():
+    """T48: 公开只读 API 复用 takeover 配置，并守住空 user_id 范围边界。"""
+    assert "async def build_takeover_contexts(" in _main_src
+    assert "contexts = await self.build_takeover_contexts(" in _main_src
+
+    async def _run():
+        p = _make_plugin()
+        calls = []
+
+        async def _query(
+            umo,
+            cid,
+            user_id,
+            persona_id="",
+            exclude_turn_id="",
+            force_current_session=False,
+        ):
+            calls.append({
+                "umo": umo,
+                "cid": cid,
+                "user_id": user_id,
+                "persona_id": persona_id,
+                "exclude_turn_id": exclude_turn_id,
+                "force_current_session": force_current_session,
+            })
+            return [
+                {"role": "user", "content": "历史问题"},
+                {"role": "assistant", "content": "历史回答"},
+            ]
+
+        normalize_calls = []
+
+        def _normalize(records, umo, max_records=None, max_chars=0):
+            normalize_calls.append({
+                "records": records,
+                "umo": umo,
+                "max_records": max_records,
+                "max_chars": max_chars,
+            })
+            return [
+                {"role": "user", "content": "历史问题", "_no_save": True},
+                {"role": "assistant", "content": "历史回答", "_no_save": True},
+            ]
+
+        async def _current_cid(umo):
+            return "conversation_current"
+
+        async def _must_not_reset(*args, **kwargs):
+            raise AssertionError("只读 API 不得清理 native history")
+
+        p._takeover_query = _query
+        p._takeover_normalize = _normalize
+        p._get_curr_cid = _current_cid
+        p._safe_reset_history = _must_not_reset
+
+        # 接管关闭用 None 与“启用但无数据”的 [] 区分。
+        p.ct_enable = False
+        assert await p.build_takeover_contexts(_UMO_GROUP, "u1") is None
+        assert calls == []
+
+        p.ct_enable = True
+        p.ct_full_group = False
+        assert await p.build_takeover_contexts(_UMO_GROUP, "") == []
+        assert await p.build_takeover_contexts(_UMO_GROUP, "   ") == []
+        assert await p.build_takeover_contexts("", "u1") == []
+        assert calls == []
+
+        # 私聊中的 full_group 必须降级，空 user_id 仍不能扩大范围。
+        p.ct_full_group = True
+        assert await p.build_takeover_contexts(_UMO_DM, "") == []
+        assert calls == []
+
+        # conversation_id=None 时读取当前 CID；混合模式复用消息数和字符预算配置。
+        p.ct_full_group = False
+        p.ct_llm_status_filter = {"llm_success", "proactive"}
+        p.ct_limit_rounds = 7
+        p.ct_max_context_chars = 321
+        contexts = await p.build_takeover_contexts(
+            _UMO_GROUP,
+            "u1",
+            persona_id="persona_demo",
+            exclude_turn_id="turn_current",
+        )
+        assert contexts[0]["_no_save"] is True
+        assert calls[-1] == {
+            "umo": _UMO_GROUP,
+            "cid": "conversation_current",
+            "user_id": "u1",
+            "persona_id": "persona_demo",
+            "exclude_turn_id": "turn_current",
+            "force_current_session": False,
+        }
+        assert normalize_calls[-1]["max_records"] == 7
+        assert normalize_calls[-1]["max_chars"] == 321
+
+        # 纯配对模式由 query_rounds_raw 控制轮数，normalize 不再二次按消息数截断。
+        p.ct_llm_status_filter = {"llm_success"}
+        await p.build_takeover_contexts(_UMO_GROUP, "u1", "conversation_explicit")
+        assert calls[-1]["cid"] == "conversation_explicit"
+        assert normalize_calls[-1]["max_records"] is None
+
+        # 群聊 full_group 明确开启时才允许空 user_id；cross_session 必须被强制关闭。
+        p.ct_full_group = True
+        p.ct_cross_session = True
+        await p.build_takeover_contexts(_UMO_GROUP, "", "conversation_group")
+        assert calls[-1]["user_id"] == ""
+        assert calls[-1]["cid"] == "conversation_group"
+        assert calls[-1]["force_current_session"] is True
+
+        async def _no_current_cid(umo):
+            return ""
+
+        p._get_curr_cid = _no_current_cid
+        call_count = len(calls)
+        assert await p.build_takeover_contexts(_UMO_GROUP, "u1") == []
+        assert len(calls) == call_count
+
+    asyncio.run(_run())
+    print("[T48] build_takeover_contexts 返回语义、配置复用与空 user_id 边界 ✓")
 
 
 def test_takeover_mixed_limit_and_empty_policy():
@@ -1371,7 +1507,27 @@ def test_scope_filter_signature():
     # main.py takeover 调用时透传 cross_umo + full_group
     assert "cross_umo=cross_umo, full_group=effective_full_group" in _main_src, \
         "_takeover_query 应把 cross_umo + full_group 透传到 storage 层"
-    print("[T33] _scope_filter 签名 + 4 种 scope 组合贯通（schema → main → storage）✓")
+
+    # 空 user_id 防御：跨 UMO 不得退化为 platform_id 全量查询。
+    scope_node = next(
+        node for node in ast.parse(_storage_src).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_scope_filter"
+    )
+    scope_ns = {"Optional": __import__("typing").Optional}
+    exec(compile(ast.Module(body=[scope_node], type_ignores=[]), "scope_filter", "exec"), scope_ns)
+    scope_filter = scope_ns["_scope_filter"]
+    assert scope_filter(_UMO_GROUP, "", True, True) == (
+        "umo = :scope_umo",
+        {"scope_umo": _UMO_GROUP},
+    )
+    assert scope_filter(_UMO_GROUP, "", True, False) == ("1 = 0", {})
+    assert scope_filter(_UMO_GROUP, "", False, False) == ("1 = 0", {})
+    assert scope_filter(_UMO_GROUP, "   ", True, True) == (
+        "umo = :scope_umo",
+        {"scope_umo": _UMO_GROUP},
+    )
+    assert "platform_id" not in scope_filter(_UMO_GROUP, "", True, True)[0]
+    print("[T33] _scope_filter 4 种组合 + 空 user_id 禁止跨平台扩张 ✓")
 
 
 def test_takeover_modes_and_whitelist():
@@ -1943,6 +2099,7 @@ def _run_all():
         test_no_fire_and_forget_writes,
         test_initialize_lifecycle,
         test_current_turn_excluded_from_mixed_takeover,
+        test_public_build_takeover_contexts_api,
         test_takeover_mixed_limit_and_empty_policy,
         test_takeover_character_budget,
         test_records_unconditional_sort,
