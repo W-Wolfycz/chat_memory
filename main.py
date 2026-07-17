@@ -15,10 +15,12 @@
   - ``[]`` 空数组 = empty（如纯 @ 无文字、纯 Reply 无文字）
   - ``'at'`` / ``'reply'`` 不入 content_kind，用独立字段 ``at_id`` / ``reply_id`` 表达
 
-assistant 配对：``pair_id`` = 对应 user 的 ``message_id``；平台无 mid 时 NULL，无法配对。
+assistant 配对：新记录优先用内部 ``turn_id``；旧记录用 ``pair_id`` = 对应 user 的
+``message_id`` 回退。平台无 mid 时也可通过 ``turn_id`` 配对。
 """
 
 import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from typing import Optional, Union
@@ -29,41 +31,37 @@ from astrbot.api.star import Star, Context
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.message_components import (
-    Plain, Image, Video, Record, File, Face, At, AtAll, Reply, Forward,
-)
+from astrbot.api.message_components import Plain
 
 from .storage import DBManager
-
-# ── llm_status 取值 ─────────────────────────────────
-_LLM_DEFAULT = ""              # 默认（未走 LLM）
-_LLM_PENDING = "llm_pending"   # LLM 触发但 assistant 未成功
-_LLM_SUCCESS = "llm_success"   # LLM 路径且成功
-_LLM_PROACTIVE = "proactive"   # 主动消息（assistant 单边）
-_LLM_ORPHAN = "orphan"         # user 漏存
-
-# ── content_kind 取值 ───────────────────────────────
-_K_TEXT = "text"
-_K_IMAGE = "image"
-_K_VIDEO = "video"
-_K_VOICE = "voice"
-_K_FILE = "file"
-_K_FACE = "face"
-_K_FORWARD = "forward"
-_K_SYSTEM = "system_event"
-
-# 接管时需过滤的媒体 kind 集合（不含 system_event / 空数组）
-_MEDIA_KINDS = {_K_IMAGE, _K_VIDEO, _K_VOICE, _K_FILE, _K_FACE, _K_FORWARD}
-
-# terminate 时给 fire-and-forget task 的 flush 窗口（秒）：保护在写的 assistant 记录
-_TERMINATE_FLUSH_TIMEOUT = 5.0
-
+from .message_classifier import (
+    classify_assistant_chain as _classify_assistant_chain_impl,
+    classify_content as _classify_content_impl,
+    content_placeholder as _content_placeholder_impl,
+    extract_text as _extract_text_impl,
+)
+from .context_builder import (
+    TakeoverContextBuilder,
+    extract_time_str as _extract_time_str_impl,
+    is_pure_media as _is_pure_media_impl,
+    strip_reasoning_prefix as _strip_reasoning_prefix_impl,
+)
+from .models import (
+    LLM_DEFAULT as _LLM_DEFAULT,
+    LLM_ORPHAN as _LLM_ORPHAN,
+    LLM_PENDING as _LLM_PENDING,
+    LLM_PROACTIVE as _LLM_PROACTIVE,
+    LLM_SUCCESS as _LLM_SUCCESS,
+    MEDIA_KINDS as _MEDIA_KINDS,
+    SEND_ATTEMPTED as _SEND_ATTEMPTED,
+    SEND_PREPARED as _SEND_PREPARED,
+)
 
 class ChatMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
 
-        self.max_len = config.get("max_content_length", 500)
+        self.max_len = config.get("max_content_length", 0)
         self.auto_cleanup_days = config.get("auto_cleanup_days", 0)
 
         log_conf = config.get("log_config", {})
@@ -74,9 +72,15 @@ class ChatMemoryPlugin(Star):
         self.ct_enable = bool(ct_conf.get("enable", False))
         self.ct_cross_session = bool(ct_conf.get("cross_session", False))
         self.ct_full_group = bool(ct_conf.get("full_group", False))
-        # limit_rounds 钳到 [1, 100]：负数会让 SQLite LIMIT -1 等价无限制
-        self.ct_limit_rounds = max(1, min(100, int(ct_conf.get("limit_rounds", 30))))
+        # 只钳下限：避免负数触发 SQLite LIMIT -1（等价于不限制）；上限交给用户决定。
+        self.ct_limit_rounds = max(1, int(ct_conf.get("limit_rounds", 30)))
+        self.ct_max_context_chars = max(0, int(ct_conf.get("max_context_chars", 0)))
         self.ct_clear_native_history = bool(ct_conf.get("clear_native_history", True))
+        # 严格接管默认开启：CM 无可用记录时也显式置空 req.contexts，避免静默回退 native。
+        # 通用部署可按需开启 fallback；用户个人 LM×CM 部署保持严格接管。
+        self.ct_fallback_to_native_on_empty = bool(
+            ct_conf.get("fallback_to_native_on_empty", False)
+        )
         ct_status = ct_conf.get("llm_status_filter", ["llm_success"])
         # "no_llm" 是 UI 占位符，DB 实际值是空串 ""
         ct_status_list = list(ct_status) if ct_status else ["llm_success"]
@@ -103,8 +107,6 @@ class ChatMemoryPlugin(Star):
 
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_started = False
-        # fire-and-forget 任务的引用保活：CPython 不保证无引用 task 不被 GC
-        self._pending_tasks: set[asyncio.Task] = set()
 
         cleanup_desc = (
             f"自动清理 {self.auto_cleanup_days} 天前的记录"
@@ -125,20 +127,6 @@ class ChatMemoryPlugin(Star):
                 f"(mode={mode_repr}, limit={self.ct_limit_rounds}, "
                 f"clear_native={self.ct_clear_native_history})"
             )
-
-    # ── fire-and-forget 任务管理 ─────────────────────
-
-    def _spawn_tasks(self, *coros) -> None:
-        """并发调度多个协程并保活引用。
-
-        asyncio.create_task 创建的任务若无人持有引用，可能在完成前被 GC
-        （CPython 实现细节，3.11+ 相对稳定但仍不保证）。这里维护一个 set，
-        done callback 中自动清理，避免静默丢失。
-        """
-        for coro in coros:
-            task = asyncio.create_task(coro)
-            self._pending_tasks.add(task)
-            task.add_done_callback(self._pending_tasks.discard)
 
     # ── 自动清理 ─────────────────────────────────────
 
@@ -190,43 +178,7 @@ class ChatMemoryPlugin(Star):
 
     @staticmethod
     def _strip_reasoning_prefix(text: str) -> str:
-        """剥离 AstrBot 错误序列化的 reasoning parts 前缀。
-
-        AstrBot 部分 Provider（reasoning 模型如 GLM/DeepSeek/o1）会把 content parts 列表
-        ``[{'type': 'think', 'content': '...', 'encrypted': None}]`` 整体 str() 后塞到 Plain
-        组件，紧跟实际回复文本。这里字符级跟踪括号平衡（处理字符串/转义）找到列表结束位置，
-        返回剩余部分。
-
-        非该前缀格式直接返回原文；解析失败也返回原文（保守）。
-        """
-        if not text.startswith("[{'type': 'think'"):
-            return text
-        depth = 0
-        i = 0
-        n = len(text)
-        in_str = False
-        quote = ""
-        while i < n:
-            c = text[i]
-            if in_str:
-                if c == "\\" and i + 1 < n:
-                    i += 2
-                    continue
-                if c == quote:
-                    in_str = False
-                i += 1
-                continue
-            if c in ("'", '"'):
-                in_str = True
-                quote = c
-            elif c == "[":
-                depth += 1
-            elif c == "]":
-                depth -= 1
-                if depth == 0:
-                    return text[i + 1:].lstrip()
-            i += 1
-        return text
+        return _strip_reasoning_prefix_impl(text)
 
     def _log(self, msg: str):
         if self.debug_to_info:
@@ -236,143 +188,19 @@ class ChatMemoryPlugin(Star):
 
     @staticmethod
     def _extract_text(event: AstrMessageEvent) -> str:
-        try:
-            chain = event.get_messages() or []
-        except Exception:
-            chain = []
-        if chain:
-            parts = [comp.text for comp in chain if isinstance(comp, Plain)]
-            text = "".join(parts).strip()
-            if text:
-                return text
-        return getattr(event, "message_str", "") or ""
+        return _extract_text_impl(event)
 
     @staticmethod
     def _classify_content(event: AstrMessageEvent) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
-        """从消息组件链提取内容形态分类 + 上下文引用字段。
-
-        返回 ``(content_kind, at_id, reply_id, forward_id)``：
-        - ``content_kind``：去重后的 kind 列表（保持首次出现顺序）
-        - ``at_id`` / ``reply_id`` / ``forward_id``：对应组件的 ID（无则 None）
-
-        组件白名单：Plain/Image/Video/Record/File/Face/Forward 入 content_kind；
-        At/Reply 不入 kind，单独提取 ID；其他组件（AtAll/Poke/Json/Unknown 等）忽略。
-
-        OTHER_MESSAGE 类型（poke / 请求 / 通知）：强制 content_kind=['system_event']，覆盖其他形态。
-        """
-        try:
-            chain = event.get_messages() or []
-        except Exception:
-            chain = []
-        kind: list[str] = []
-        at_id: Optional[str] = None
-        reply_id: Optional[str] = None
-        forward_id: Optional[str] = None
-
-        def _push(k: str):
-            if k not in kind:
-                kind.append(k)
-
-        for comp in chain:
-            if isinstance(comp, Plain):
-                if (comp.text or "").strip():
-                    _push(_K_TEXT)
-            elif isinstance(comp, Image):
-                _push(_K_IMAGE)
-            elif isinstance(comp, Video):
-                _push(_K_VIDEO)
-            elif isinstance(comp, Record):
-                _push(_K_VOICE)
-            elif isinstance(comp, File):
-                _push(_K_FILE)
-            elif isinstance(comp, Face):
-                _push(_K_FACE)
-            elif isinstance(comp, Forward):
-                _push(_K_FORWARD)
-                if forward_id is None:
-                    fid = getattr(comp, "id", None)
-                    if fid:
-                        forward_id = str(fid)
-            elif isinstance(comp, AtAll):
-                # @全体成员：不入 at_id（避免 caller 误以为是 at 某个 ID）
-                pass
-            elif isinstance(comp, At):
-                if at_id is None:
-                    qq = getattr(comp, "qq", None)
-                    if qq:
-                        at_id = str(qq)
-            elif isinstance(comp, Reply):
-                if reply_id is None:
-                    rid = getattr(comp, "id", None)
-                    if rid:
-                        reply_id = str(rid)
-            # 其他组件（AtAll / Poke / Json / Unknown 等）忽略
-
-        # 回退：AstrBot 部分 Provider/适配器把 user 文本放在 event.message_str，
-        # message 组件链里没有非空 Plain（或 chain 为空）。此时若已无任何 kind，
-        # 但 message_str 非空，则补 text（与 _extract_text 的回退逻辑对齐）。
-        if not kind:
-            msg_str = (getattr(event, "message_str", "") or "").strip()
-            if msg_str:
-                kind.append(_K_TEXT)
-
-        # OTHER_MESSAGE（poke / 加好友请求 / 通知等）：强制 system_event
-        try:
-            mt = event.get_message_type()
-            mt_value = getattr(mt, "value", str(mt))
-            if mt_value == "OtherMessage":
-                kind = [_K_SYSTEM]
-        except Exception:
-            pass
-
-        return kind, at_id, reply_id, forward_id
+        return _classify_content_impl(event)
 
     @staticmethod
     def _classify_assistant_chain(chain) -> tuple[list[str], str]:
-        """从 BOT 回复组件链提取 ``(content_kind, text)``。
-
-        与 user 端 ``_classify_content`` 的差异：
-        - 不提取 ``at_id`` / ``reply_id`` / ``forward_id``（bot 主动回复一般不携带这些）
-        - 不做 ``message_str`` 回退（``result.chain`` 即为真相源）
-        - 不做 ``OtherMessage`` 强制覆盖（result 必然是 assistant 输出）
-
-        返回 ``(kind, text)``：
-        - ``kind``：去重后保留首次出现顺序；空列表表示完全空 chain
-        - ``text``：所有 Plain 组件拼接并 strip
-        """
-        kind: list[str] = []
-        parts: list[str] = []
-
-        def _push(k: str):
-            if k not in kind:
-                kind.append(k)
-
-        for comp in chain:
-            if isinstance(comp, Plain):
-                if (comp.text or "").strip():
-                    _push(_K_TEXT)
-                    parts.append(comp.text)
-            elif isinstance(comp, Image):
-                _push(_K_IMAGE)
-            elif isinstance(comp, Video):
-                _push(_K_VIDEO)
-            elif isinstance(comp, Record):
-                _push(_K_VOICE)
-            elif isinstance(comp, File):
-                _push(_K_FILE)
-            elif isinstance(comp, Face):
-                _push(_K_FACE)
-            elif isinstance(comp, Forward):
-                _push(_K_FORWARD)
-            # At / AtAll / Reply / Poke / Json / Unknown 等：assistant 端忽略
-        return kind, "".join(parts).strip()
+        return _classify_assistant_chain_impl(chain)
 
     @staticmethod
     def _content_placeholder(kind: list[str]) -> str:
-        """非文本内容的占位字符串（取第一个 kind）。"""
-        if not kind:
-            return ""
-        return f"[{kind[0]}]"
+        return _content_placeholder_impl(kind)
 
     async def _get_curr_cid(self, umo: str) -> str:
         try:
@@ -550,6 +378,9 @@ class ChatMemoryPlugin(Star):
         # 取当前生效 persona_id 缓存到 extras，capture_bot 复用避免二次查询
         persona_id = await self._get_effective_persona(umo, event, cid)
         event.set_extra("chat_memory_persona_id", persona_id)
+        # 内部 turn_id 不依赖平台 message_id；无 mid 平台也能建立 user/assistant 配对。
+        turn_id = event.get_extra("chat_memory_turn_id") or uuid.uuid4().hex
+        event.set_extra("chat_memory_turn_id", turn_id)
 
         audit = self._collect_audit_fields(event)
         ok = await self._safe_insert(
@@ -558,6 +389,7 @@ class ChatMemoryPlugin(Star):
             llm_status=_LLM_DEFAULT, content_kind=kind,
             at_id=at_id, reply_id=reply_id, forward_id=forward_id,
             persona_id=persona_id or None,
+            turn_id=turn_id,
             **audit,
         )
         if not ok:
@@ -592,10 +424,7 @@ class ChatMemoryPlugin(Star):
 
     @filter.on_llm_request()
     async def mark_llm_triggered(self, event: AstrMessageEvent, req: ProviderRequest):
-        """LLM 调用时：兜底重试 user 捕获 + 把 user.llm_status 从 '' 改成 'llm_pending'。
-
-        平台无 mid 时跳过升级（无法用 message_id 定位行）。
-        """
+        """LLM 调用时：兜底重试 user 捕获并按 ``turn_id`` 升级为 ``llm_pending``。"""
         if not event.get_extra("chat_memory_captured"):
             self._log(f"{self._log_prefix(event)} LLM 触发，补捕获 user（首条消息兜底）")
             ok = await self._capture_user_internal(event)
@@ -610,17 +439,12 @@ class ChatMemoryPlugin(Star):
 
         event.set_extra("chat_memory_llm_triggered", True)
 
-        # 平台无 mid 时跳过升级（无法用 message_id 定位）
-        if event.get_extra("chat_memory_no_mid"):
-            self._log(f"{self._log_prefix(event)} user 保持 ''（平台无 mid，跳过 llm_pending 升级）")
+        turn_id = event.get_extra("chat_memory_turn_id")
+        if not turn_id:
+            logger.warning(f"{self._log_prefix(event)} user 已捕获但缺少 turn_id，跳过 llm_status 更新")
             return
-
-        msg_id = event.get_extra("chat_memory_user_msg_id")
-        if not msg_id:
-            return
-
-        await self._safe_update_llm_status(umo, cid, msg_id, _LLM_PENDING)
-        self._log(f"{self._log_prefix(event)} user[{msg_id[:8]}] llm_status -> llm_pending")
+        await self._safe_update_llm_status_by_turn(umo, cid, turn_id, _LLM_PENDING)
+        self._log(f"{self._log_prefix(event)} turn[{turn_id[:8]}] llm_status -> llm_pending")
 
     # ── 上下文接管 ───────────────────────────────────
 
@@ -654,12 +478,18 @@ class ChatMemoryPlugin(Star):
                 )
         records = await self._takeover_query(umo, cid, user_id, persona_id)
         if not records:
-            self._log(f"{self._log_prefix(event)} 接管跳过：CM 无数据")
+            await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
             return
 
-        contexts = self._takeover_normalize(records, umo)
+        mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
+        contexts = self._takeover_normalize(
+            records,
+            umo,
+            max_records=self.ct_limit_rounds if mixed_mode else None,
+            max_chars=self.ct_max_context_chars,
+        )
         if not contexts:
-            self._log(f"{self._log_prefix(event)} 接管跳过：规整后为空")
+            await self._handle_empty_takeover(event, req, umo, cid, "规整后为空")
             return
 
         req.contexts = contexts
@@ -672,6 +502,28 @@ class ChatMemoryPlugin(Star):
             f"(cross_session={self.ct_cross_session}, full_group={self.ct_full_group}, "
             f"cid={cid[:8]})"
         )
+
+    async def _handle_empty_takeover(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        umo: str,
+        cid: str,
+        reason: str,
+    ) -> None:
+        """处理 takeover 空结果。
+
+        严格模式显式清空 ``req.contexts``，保证 CM 仍是唯一上下文源；兼容模式保留
+        AstrBot 已装载的 native contexts。两种模式都遵循 ``clear_native_history`` 配置。
+        """
+        if self.ct_fallback_to_native_on_empty:
+            self._log(f"{self._log_prefix(event)} 接管回退 native：{reason}")
+            return
+
+        req.contexts = []
+        if self.ct_clear_native_history:
+            await self._safe_reset_history(umo, cid)
+        self._log(f"{self._log_prefix(event)} 严格接管 contexts=0：{reason}")
 
     async def _takeover_query(
         self, umo: str, cid: str, user_id: str, persona_id: str = "",
@@ -733,134 +585,32 @@ class ChatMemoryPlugin(Star):
 
         return records
 
-    def _takeover_normalize(self, records: list[dict], umo: str) -> list[dict]:
-        """规整流水线：
-
-        过滤纯媒体 → user/solo-asst 加前缀 → 合并同 role（solo 自成一条）→
-        丢头部非 user → 丢尾部 solo assistant → 标 _no_save。
-
-        - **纯媒体过滤**：``content_kind`` 全是媒体 kind 的丢；图文混合（['text','image']）保留文本部分。
-        - **user 前缀**：``[MM/DD HH:MM:SS] Sender:``（按 prefix_enhance 配置）。
-        - **solo assistant 前缀**：proactive/orphan 这类单边 assistant 加 ``[主动]``/``[未配对]`` 标识，
-          可选带时间戳；让 LLM 知道"这是 bot 单方面说的，没有前置 user"。
-        - **合并**：连续同 role + 同 solo 标记的合并；solo 与非 solo 不合并（语义不同）。
-        - **丢尾部 solo assistant**：OpenAI 格式要求 messages 末尾不能是 assistant 单边（无对应 user），
-          否则 LLM 困惑"我刚主动说完话怎么又来 user"。末尾若是有配对的 llm_success assistant 保留（agent runner 追加 user_now 后合法）。
-        """
-        # 过滤纯媒体（图文混合保留）
-        records = [r for r in records if not self._is_pure_media(r)]
-
-        formatted: list[dict] = []
-        for r in records:
-            content = self._strip_reasoning_prefix(r.get("content", "") or "")
-            role = r.get("role", "user")
-            llm_status = r.get("llm_status", "")
-            is_solo = role == "assistant" and llm_status in (_LLM_PROACTIVE, _LLM_ORPHAN)
-
-            if role == "user":
-                content = self._apply_prefix(r, content)
-            elif is_solo:
-                tag = "主动" if llm_status == _LLM_PROACTIVE else "未配对"
-                content = self._apply_solo_prefix(r, content, tag)
-
-            formatted.append({"role": role, "content": content, "_solo": is_solo})
-
-        formatted = self._merge_with_solo(formatted)
-
-        # 丢头部非 user
-        while formatted and formatted[0]["role"] != "user":
-            formatted.pop(0)
-
-        # 丢尾部 solo assistant（proactive/orphan 这种单边不能结尾）
-        while formatted and formatted[-1]["role"] == "assistant" and formatted[-1].get("_solo"):
-            formatted.pop()
-
-        # 清理临时字段 + 标 _no_save
-        for c in formatted:
-            c.pop("_solo", None)
-            c["_no_save"] = True
-
-        return formatted
-
-    def _apply_prefix(self, record: dict, content: str) -> str:
-        """按 prefix_enhance 模式给 user content 加前缀。"""
-        mode = self.ct_prefix_enhance
-        if mode == "off" or not content:
-            return content
-
-        parts: list[str] = []
-        if mode in ("time", "time_sender"):
-            time_str = self._extract_time_str(record.get("created_at"))
-            if time_str:
-                parts.append(f"[{time_str}]")
-        if mode in ("sender", "time_sender"):
-            sender = record.get("sender_nickname") or record.get("user_id") or "?"
-            parts.append(f"{sender}:")
-
-        if parts:
-            return f"{' '.join(parts)} {content}"
-        return content
-
-    def _apply_solo_prefix(self, record: dict, content: str, tag: str) -> str:
-        """给单边 assistant（proactive/orphan）加前缀：可选时间戳 + [tag] 标识。
-
-        与 user 前缀风格一致但用方括号 tag 而非 sender（bot 自身昵称冗余）。
-        """
-        mode = self.ct_prefix_enhance
-        parts: list[str] = []
-        if mode in ("time", "time_sender"):
-            time_str = self._extract_time_str(record.get("created_at"))
-            if time_str:
-                parts.append(f"[{time_str}]")
-        parts.append(f"[{tag}]")
-        prefix = " ".join(parts)
-        return f"{prefix} {content}" if content else prefix
+    def _takeover_normalize(
+        self,
+        records: list[dict],
+        umo: str,
+        max_records: Optional[int] = None,
+        max_chars: int = 0,
+    ) -> list[dict]:
+        builder = TakeoverContextBuilder(
+            prefix_mode=self.ct_prefix_enhance,
+            media_kinds=_MEDIA_KINDS,
+            proactive_status=_LLM_PROACTIVE,
+            orphan_status=_LLM_ORPHAN,
+        )
+        return builder.normalize(
+            records,
+            max_records=max_records,
+            max_chars=max_chars,
+        )
 
     @staticmethod
     def _extract_time_str(created_at) -> str:
-        """从 created_at 字符串提取 ``MM/DD HH:MM:SS``。
-
-        支持 SQLite CURRENT_TIMESTAMP 格式 ``2026-07-08 14:30:25``、
-        ISO ``2026-07-08T14:30:25``。其他格式回退到原值字符串。
-        跨天对话（cross_session 拉跨天数据）时日期才有意义；同一天内秒位冗余但保留便于精确定位。
-        """
-        if not created_at:
-            return ""
-        s = str(created_at)
-        if len(s) >= 19 and s[10] in (" ", "T"):
-            # s[5:19] = "MM-DD HH:MM:SS"（空格）或 "MM-DDTHH:MM:SS"（ISO）
-            return s[5:19].replace("-", "/").replace("T", " ")
-        return s
+        return _extract_time_str_impl(created_at)
 
     @staticmethod
     def _is_pure_media(r: dict) -> bool:
-        """判定是否纯媒体：content_kind 非空且全部属于媒体 kind。
-
-        图文混合（如 ['text','image']）保留文本部分，不丢。
-        """
-        kind = r.get("content_kind") or []
-        if not kind:
-            return False
-        return all(k in _MEDIA_KINDS for k in kind)
-
-    @staticmethod
-    def _merge_with_solo(contexts: list[dict]) -> list[dict]:
-        """合并连续同 role + 同 solo 标记的消息。
-
-        - 连续 user 合并（每条独立前缀已应用，合并后空行分隔）
-        - 连续非 solo assistant 合并（如多轮 llm_success 紧邻）
-        - 连续 solo assistant 合并（如多条 proactive 推送）
-        - solo 与非 solo assistant 不合并（语义不同，分开保留可读性）
-        """
-        merged: list[dict] = []
-        for c in contexts:
-            last = merged[-1] if merged else None
-            if (last and last["role"] == c["role"]
-                    and last.get("_solo") == c.get("_solo")):
-                last["content"] += "\n\n" + c["content"]
-            else:
-                merged.append(dict(c))
-        return merged
+        return _is_pure_media_impl(r, _MEDIA_KINDS)
 
     @staticmethod
     def _is_group_umo(umo: str) -> bool:
@@ -883,7 +633,7 @@ class ChatMemoryPlugin(Star):
 
     @filter.on_decorating_result(priority=10)
     async def capture_bot(self, event: AstrMessageEvent):
-        """BOT 回复捕获：插入 assistant 记录，按 extras 判定 llm_status 与 pair_id。"""
+        """BOT 回复捕获：插入 prepared assistant，按 extras 判定状态与 turn 配对。"""
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
@@ -916,6 +666,13 @@ class ChatMemoryPlugin(Star):
         no_mid = bool(event.get_extra("chat_memory_no_mid"))
         capture_attempted = bool(event.get_extra("chat_memory_capture_attempted"))
         captured = bool(event.get_extra("chat_memory_captured"))
+        # 只有成功捕获的 user 才共享其 turn_id；orphan/proactive 必须保持单边，
+        # 避免后续 user 重试成功后把历史 orphan assistant 错配进正常轮次。
+        turn_id = (
+            (event.get_extra("chat_memory_turn_id") or uuid.uuid4().hex)
+            if captured
+            else uuid.uuid4().hex
+        )
 
         # 判定 assistant.llm_status + pair_id
         if not capture_attempted:
@@ -933,17 +690,12 @@ class ChatMemoryPlugin(Star):
         elif llm_triggered and result.is_llm_result():
             asst_status = _LLM_SUCCESS
             pair_id = user_msg_id if not no_mid else None
-            # user 从 llm_pending 升级到 llm_success（无 mid 时跳过：无法定位）
-            if not no_mid and user_msg_id:
-                self._spawn_tasks(self._safe_update_llm_status(
-                    umo, cid, user_msg_id, _LLM_SUCCESS,
-                ))
         else:
             # 走 capture_user 但没走 LLM（命令回复、set_result 等）
             asst_status = _LLM_DEFAULT
             pair_id = user_msg_id if not no_mid else None
             if no_mid:
-                self._log(f"{self._log_prefix(event)} assistant 平台无 mid，pair_id 留空")
+                self._log(f"{self._log_prefix(event)} assistant 平台无 mid，使用 turn_id 配对")
 
         content = self._truncate(bot_text) if bot_text else self._content_placeholder(asst_kind)
         # persona_id：优先从 extras（capture_user 已缓存）；兜底重查
@@ -951,17 +703,46 @@ class ChatMemoryPlugin(Star):
         if persona_id is None:
             persona_id = await self._get_effective_persona(umo, event, cid)
         audit = self._collect_audit_fields(event)
-        self._spawn_tasks(self._safe_insert(
+        event.set_extra("chat_memory_assistant_turn_id", turn_id)
+        ok = await self._safe_insert(
             umo, cid, user_id, "assistant", content,
             message_id=None, pair_id=pair_id,
             llm_status=asst_status, content_kind=asst_kind,
             persona_id=persona_id or None,
+            turn_id=turn_id,
+            send_status=_SEND_PREPARED,
+            update_user_llm_status=(
+                _LLM_SUCCESS if asst_status == _LLM_SUCCESS else None
+            ),
             **audit,
-        ))
+        )
+        if not ok:
+            logger.warning(
+                f"{self._log_prefix(event)} assistant prepared 写入失败，turn={turn_id[:8]}"
+            )
         self._log(
             f"{self._log_prefix(event)} bot[{asst_status or 'default'}] -> "
             f"{user_id}@{cid[:8]}: {content[:60]}..."
         )
+
+    @filter.after_message_sent()
+    async def mark_send_attempted(self, event: AstrMessageEvent):
+        """标记 assistant 已完成 AstrBot 发送流程。
+
+        AstrBot 的 RespondStage 即使捕获平台发送异常也会触发此 Hook，因此状态名严格
+        使用 ``send_attempted``，不宣称平台已送达。流式/主动发送若绕过此 Hook，则保持
+        ``prepared``，供后续诊断。
+        """
+        turn_id = event.get_extra("chat_memory_assistant_turn_id")
+        if not turn_id:
+            return
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if not umo:
+            return
+        cid = event.get_extra("chat_memory_cid") or await self._get_curr_cid(umo)
+        if not cid:
+            return
+        await self._safe_update_send_status(umo, cid, turn_id, _SEND_ATTEMPTED)
 
     # ── reset / new 处理 ─────────────────────────────
 
@@ -1065,6 +846,8 @@ class ChatMemoryPlugin(Star):
         sender_nickname: Optional[str] = None, raw_timestamp: Optional[int] = None,
         at_id: Optional[str] = None, reply_id: Optional[str] = None,
         forward_id: Optional[str] = None, persona_id: Optional[str] = None,
+        turn_id: Optional[str] = None, send_status: str = "",
+        update_user_llm_status: Optional[str] = None,
     ) -> bool:
         try:
             await self.db.insert(
@@ -1076,19 +859,30 @@ class ChatMemoryPlugin(Star):
                 raw_timestamp=raw_timestamp,
                 at_id=at_id, reply_id=reply_id, forward_id=forward_id,
                 persona_id=persona_id,
+                turn_id=turn_id, send_status=send_status,
+                update_user_llm_status=update_user_llm_status,
             )
             return True
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 写入失败: {e}")
             return False
 
-    async def _safe_update_llm_status(
-        self, umo: str, cid: str, message_id: str, new_status: str,
+    async def _safe_update_llm_status_by_turn(
+        self, umo: str, cid: str, turn_id: str, new_status: str,
     ) -> int:
         try:
-            return await self.db.update_llm_status(umo, cid, message_id, new_status)
+            return await self.db.update_llm_status_by_turn(umo, cid, turn_id, new_status)
         except Exception as e:
-            logger.warning(f"{self._log_prefix()} 更新 llm_status 失败: {e}")
+            logger.warning(f"{self._log_prefix()} 按 turn_id 更新 llm_status 失败: {e}")
+            return 0
+
+    async def _safe_update_send_status(
+        self, umo: str, cid: str, turn_id: str, new_status: str,
+    ) -> int:
+        try:
+            return await self.db.update_send_status(umo, cid, turn_id, new_status)
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} 更新 send_status 失败: {e}")
             return 0
 
     # ── 生命周期终止 ─────────────────────────────────
@@ -1110,21 +904,7 @@ class ChatMemoryPlugin(Star):
                 logger.warning(f"{self._log_prefix()} 清理 task 停止异常: {e}")
             self._cleanup_task = None
 
-        # 2. fire-and-forget task：先给 flush 窗口（保护在写的 assistant 记录），超时才 cancel
-        pending = [t for t in self._pending_tasks if not t.done()]
-        if pending:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=_TERMINATE_FLUSH_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                for t in pending:
-                    t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-        self._pending_tasks.clear()
-
-        # 3. 释放 DB 连接池
+        # 2. 释放 DB 连接池（关键写入均直接 await，不再维护后台写入任务）
         try:
             await self.db.engine.dispose()
         except Exception as e:

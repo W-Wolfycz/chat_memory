@@ -2,8 +2,8 @@
   "max_content_length": {
     "description": "单条记录最大字符数",
     "type": "int",
-    "default": 500,
-    "hint": "超长文本会被截断存储。0 表示不限制。"
+    "default": 0,
+    "hint": "0 表示不限制；设置为正数时，超长文本会按字符数截断存储。"
   },
   "auto_cleanup_days": {
     "description": "自动清理天数",
@@ -33,7 +33,7 @@
   "context_takeover": {
     "description": "上下文接管",
     "type": "object",
-    "hint": "让 CM 接管对话上下文，跨重启 / 跨会话 / 跨用户保留完整记忆。",
+    "hint": "使用 ChatMemory 记录替换 LLM 的历史上下文。",
     "items": {
       "enable": {
         "description": "启用接管",
@@ -45,58 +45,70 @@
         "description": "跨会话目标（群私聊互通）",
         "type": "bool",
         "default": false,
-        "hint": "开启后，同一用户在其他群 / 私聊的对话也进入上下文。与 full_group 同时开启时：当前群整群 + 其他群/私聊仅当前 user（不会跨到别的用户在其他 umo 的对话）。"
+        "hint": "同一用户在其他群聊和私聊中的记录也进入当前上下文。与整群消息同时开启时，其他会话仍只取当前用户。"
       },
       "full_group": {
         "description": "整群消息",
         "type": "bool",
         "default": false,
-        "hint": "开启后，群内其他人的发言也会进入上下文（仅对群聊生效，私聊自动忽略）。昵称会作为前缀注入。"
+        "hint": "群内其他成员的消息也会进入模型上下文；私聊中无效。"
       },
       "limit_rounds": {
         "description": "注入轮数/消息数",
         "type": "int",
         "default": 30,
-        "hint": "注入的轮数或消息数。仅选 llm_success 时为轮数（user-assistant 一对为一轮），选了其他状态（如 proactive/no_llm）时退化为消息数（单条记录）。"
+        "hint": "仅选择 llm_success 时按轮数计算，否则按消息数计算。最小为 1，不限制上限。"
+      },
+      "max_context_chars": {
+        "description": "上下文字符预算",
+        "type": "int",
+        "default": 0,
+        "hint": "上下文最大字符数；0 表示不限制，超出时从最旧内容开始裁剪。"
       },
       "llm_status_filter": {
         "description": "状态过滤",
         "type": "list",
         "options": ["llm_success", "llm_pending", "no_llm", "proactive", "orphan"],
         "default": ["llm_success"],
-        "hint": "选哪些状态的消息进入上下文。详见 README 状态过滤章节。"
+        "hint": "选择允许进入上下文的消息状态；默认仅使用成功配对。"
       },
       "include_content_kinds": {
         "description": "内容白名单",
         "type": "list",
         "options": ["text", "image", "video", "voice", "file", "face", "forward", "system_event"],
         "default": ["text"],
-        "hint": "takeover 时只让含这些 kind 的消息进入 LLM 上下文（capture 照常全量入库）。默认仅 text → 纯图 / poke 通知 / 命令回复等都不进。清空所有选项=不过滤，全部进入。混合消息（如 text+image）如何处理见下方「全部命中」开关。"
+        "hint": "只注入选中的内容类型；清空表示不过滤。混合消息由“全部命中”控制。"
       },
       "include_all_match": {
         "description": "全部命中（ALL 模式）",
         "type": "bool",
         "default": false,
-        "hint": "控制混合消息的处理方式。关闭=ANY（默认，只要有一个 kind 命中白名单即放行，如 ['text','image'] 在白名单=[text] 时进入）；启用=ALL（消息所有 kind 都必须在白名单内，['text','image'] 在白名单=[text] 时被滤掉，只放行纯 text）。"
+        "hint": "关闭时命中任一类型即可；开启时消息中的全部类型都必须在白名单内。"
       },
       "prefix_enhance": {
         "description": "前缀增强",
         "type": "string",
         "default": "time_sender",
         "options": ["off", "time", "sender", "time_sender"],
-        "hint": "给每条 user 消息加前缀。off=不加；time=[HH:MM]；sender=昵称:；time_sender=两者都加（默认）。合并连发时各条原始消息仍保留各自前缀。"
+        "hint": "user 消息前缀：关闭、时间 [MM/DD HH:MM:SS]、发送者或两者组合。"
       },
       "clear_native_history": {
         "description": "清理原生历史",
         "type": "bool",
         "default": true,
-        "hint": "每轮清空系统自带的对话历史，避免重复。建议保持开启。"
+        "hint": "接管后清空 AstrBot 原生历史，避免上下文重复。建议保持开启。"
+      },
+      "fallback_to_native_on_empty": {
+        "description": "空结果时回退原生历史",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭时空结果会清空上下文；开启时保留 AstrBot 原生历史。"
       },
       "filter_by_persona": {
         "description": "按 persona 隔离",
         "type": "bool",
         "default": false,
-        "hint": "启用后查询严格按当前 persona 过滤——切换 persona 时旧 persona 时期的对话自动隔离，切回后自然回归。persona_id 为空（如老库 ALTER 补列后的旧行）会跳过过滤避免老数据全被滤光。与 cross_session=T 协同可获得完整体验：切 persona + /new + 切回旧 persona 仍能拉到旧 cid 的旧数据。cross_session=F 时 /new 后切回旧 persona 拿不到旧 cid 数据（cid 维度卡死，非 persona 问题）。"
+        "hint": "只使用当前 persona 的记录；空 persona 只匹配未标记 persona 的旧记录。跨 /new 查询需同时开启跨会话目标。"
       }
     }
   }
