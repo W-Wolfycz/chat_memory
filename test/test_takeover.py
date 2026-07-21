@@ -101,6 +101,15 @@ exec(
 )
 setattr(pkg, "models", models_mod)
 
+relation_codec_mod = types.ModuleType("chat_memory.relation_codec")
+relation_codec_mod.__file__ = str(PLUGIN_DIR / "relation_codec.py")
+sys.modules["chat_memory.relation_codec"] = relation_codec_mod
+exec(
+    compile((PLUGIN_DIR / "relation_codec.py").read_text(), "relation_codec.py", "exec"),
+    relation_codec_mod.__dict__,
+)
+setattr(pkg, "relation_codec", relation_codec_mod)
+
 # main.py 的组件分类已拆到独立模块；在无 AstrBot 安装的本地测试中手动加载它。
 classifier_mod = types.ModuleType("chat_memory.message_classifier")
 classifier_mod.__file__ = str(PLUGIN_DIR / "message_classifier.py")
@@ -703,6 +712,7 @@ def test_public_build_takeover_contexts_api():
             max_chars=0,
             current_user_id="",
             full_group=False,
+            target_map=None,
         ):
             normalize_calls.append({
                 "records": records,
@@ -711,6 +721,7 @@ def test_public_build_takeover_contexts_api():
                 "max_chars": max_chars,
                 "current_user_id": current_user_id,
                 "full_group": full_group,
+                "target_map": target_map,
             })
             return [
                 {"role": "user", "content": "历史问题", "_no_save": True},
@@ -1205,12 +1216,14 @@ def test_public_api_new_params():
     # query_latest 签名含 persona_id/since/until（返回 list[dict]）
     assert (
         "persona_id: Optional[str] = None,\n        since: Optional[datetime] = None,\n"
-        "        until: Optional[datetime] = None,\n    ) -> list[dict]:"
+        "        until: Optional[datetime] = None,\n        from_oldest: bool = False,\n"
+        "    ) -> list[dict]:"
     ) in _storage_src, "query_latest 签名应含 persona_id/since/until"
     # query_rounds 签名含 persona_id/since/until（返回 list[list[dict]]）
     assert (
         "persona_id: Optional[str] = None,\n        since: Optional[datetime] = None,\n"
-        "        until: Optional[datetime] = None,\n    ) -> list[list[dict]]:"
+        "        until: Optional[datetime] = None,\n        from_oldest: bool = False,\n"
+        "    ) -> list[list[dict]]:"
     ) in _storage_src, "query_rounds 签名应含 persona_id/since/until"
     # main.py 透传
     assert "persona_id=persona_id, since=since, until=until," in _main_src, \
@@ -1859,6 +1872,55 @@ def test_classify_content_components_extraction():
     print("[T31] _classify_content 组件提取（含 v2.3.5 message_chain 修复回归）✓")
 
 
+def test_relation_template_and_reply_rendering():
+    """T50: At 按位置模板化，Reply snapshot/turn 在 takeover 中可读呈现。"""
+    p = _make_plugin()
+    components = sys.modules["astrbot.api.message_components"]
+    Plain = components.Plain
+    At = components.At
+    Reply = components.Reply
+
+    p1 = Plain(); p1.text = "我觉得 "
+    at1 = At(); at1.qq = "10001"; at1.name = "Alice"
+    p2 = Plain(); p2.text = " 说得对，"
+    at2 = At(); at2.qq = "10002"; at2.name = "Bob"
+    p3 = Plain(); p3.text = " 可能不同意"
+    reply = Reply(); reply.id = "message_demo"; reply.sender_id = "bot_demo"
+    reply.sender_nickname = "Bot"; reply.message_str = "下午四点有空"
+
+    class _Event:
+        message_str = ""
+        def get_messages(self):
+            return [reply, p1, at1, p2, at2, p3]
+
+    template, relation = p._build_relation_seed(_Event())
+    assert template == "我觉得 ⟦CM_AT:0⟧ 说得对，⟦CM_AT:1⟧ 可能不同意"
+    assert [item["nickname"] for item in relation["mentions"]] == ["Alice", "Bob"]
+    assert relation["reply"]["fallback_text"] == "下午四点有空"
+
+    rendered = relation_codec_mod.render_content_template(template, relation)
+    assert rendered == "我觉得 [提及:Alice] 说得对，[提及:Bob] 可能不同意"
+    assert relation_codec_mod.render_content_template("旧文本 ⟦CM_AT:0⟧", None) == \
+        "旧文本 ⟦CM_AT:0⟧"
+
+    records = [{
+        "role": "user", "content": rendered, "user_id": "u1",
+        "sender_nickname": "Caller", "created_at": "2026-07-22 12:00:00",
+        "content_kind": ["text"], "llm_status": "llm_success",
+        "relation_data": {
+            "v": 1, "mentions": relation["mentions"],
+            "reply": {
+                "resolution": "snapshot", "target_nickname": "Bot",
+                "fallback_text": "下午四点有空",
+            },
+        },
+    }]
+    out = p._takeover_normalize(records, _UMO_GROUP)
+    assert "[回复 → Bot | 原文: 下午四点有空]" in out[0]["content"]
+    assert "[提及:Alice]" in out[0]["content"]
+    print("[T50] At 模板 + Reply snapshot 上下文渲染 ✓")
+
+
 def test_assistant_chain_classification():
     """T35: _classify_assistant_chain — BOT 回复组件链分类（CR2 #5 修复）。
 
@@ -1999,7 +2061,7 @@ def test_turn_id_pairing_and_send_status():
     assert "turn_id         TEXT" in _storage_src
     assert "send_status     TEXT NOT NULL DEFAULT ''" in _storage_src
     assert "ux_cm_turn_role" in _storage_src
-    assert "_SCHEMA_VERSION = 2" in _storage_src
+    assert "_SCHEMA_VERSION = 3" in _storage_src
     assert "PRAGMA user_version" in _storage_src
     assert "update_llm_status_by_turn" in _storage_src
     assert "update_send_status" in _storage_src
@@ -2054,19 +2116,19 @@ def test_schema_v2_and_atomic_finalize_sql():
             if node.targets[0].id in {"_CREATE_TABLE_SQL", "_INDEX_DEFINITIONS", "_SCHEMA_VERSION", "_SELECT_COLS"}:
                 assignments[node.targets[0].id] = ast.literal_eval(node.value)
 
-    assert assignments["_SCHEMA_VERSION"] == 2
+    assert assignments["_SCHEMA_VERSION"] == 3
     conn = sqlite3.connect(":memory:")
     conn.execute(assignments["_CREATE_TABLE_SQL"])
     for sql in assignments["_INDEX_DEFINITIONS"].values():
         conn.execute(sql)
-    conn.execute("PRAGMA user_version = 2")
+    conn.execute("PRAGMA user_version = 3")
     selected = conn.execute(
         assignments["_SELECT_COLS"] + " FROM chat_memory_records LIMIT 1"
     ).description
-    assert len(selected) == 22, "_SELECT_COLS 应与 _row_to_dict 的 22 个位置一致"
+    assert len(selected) == 23, "_SELECT_COLS 应与 _row_to_dict 的 23 个位置一致"
 
     columns = {r[1] for r in conn.execute("PRAGMA table_info(chat_memory_records)")}
-    assert {"turn_id", "send_status"}.issubset(columns)
+    assert {"turn_id", "send_status", "relation_data"}.issubset(columns)
     index_tables = {
         name: table for name, table in conn.execute(
             "SELECT name, tbl_name FROM sqlite_master WHERE type='index'"
@@ -2217,6 +2279,7 @@ def _run_all():
         test_takeover_normalize_strips_think,
         test_classify_content_message_str_fallback,
         test_classify_content_components_extraction,
+        test_relation_template_and_reply_rendering,
         test_assistant_chain_classification,
         test_assistant_pairing_regression,
         test_turn_id_pairing_and_send_status,

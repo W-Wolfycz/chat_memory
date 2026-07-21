@@ -171,6 +171,44 @@ async def _run() -> None:
 
             await _verify_plugin_lifecycle(tmp_root)
 
+            legacy_dir = tmp_root / "legacy_v2"
+            legacy_dir.mkdir()
+            legacy_path = legacy_dir / "chat_memory.db"
+            with closing(sqlite3.connect(legacy_path)) as conn:
+                conn.execute(
+                    "CREATE TABLE chat_memory_records ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, umo TEXT NOT NULL, "
+                    "conversation_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL, "
+                    "content TEXT NOT NULL DEFAULT '', message_id TEXT, pair_id TEXT, "
+                    "llm_status TEXT NOT NULL DEFAULT '', content_kind TEXT NOT NULL DEFAULT '[]', "
+                    "platform_id TEXT, platform_name TEXT, message_type TEXT, session_id TEXT, "
+                    "self_id TEXT, group_id TEXT, sender_nickname TEXT, raw_timestamp INTEGER, "
+                    "at_id TEXT, reply_id TEXT, forward_id TEXT, persona_id TEXT, "
+                    "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, turn_id TEXT, "
+                    "send_status TEXT NOT NULL DEFAULT '')"
+                )
+                conn.execute(
+                    "INSERT INTO chat_memory_records "
+                    "(umo, conversation_id, user_id, role, content, turn_id) "
+                    "VALUES ('platform_demo:FriendMessage:10001', 'legacy', '10001', "
+                    "'user', '旧记录', 'legacy_turn')"
+                )
+                conn.execute("PRAGMA user_version = 2")
+                conn.commit()
+            legacy_db = DBManager(legacy_dir, tz=ZoneInfo("UTC"))
+            await legacy_db.init_db()
+            legacy_rows = await legacy_db.query_latest(
+                "platform_demo:FriendMessage:10001", "legacy", "10001"
+            )
+            assert legacy_rows[0]["content"] == "旧记录"
+            assert legacy_rows[0]["relation_data"] is None
+            await legacy_db.engine.dispose()
+            with closing(sqlite3.connect(legacy_path)) as conn:
+                assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+                assert "relation_data" in {
+                    row[1] for row in conn.execute("PRAGMA table_info(chat_memory_records)")
+                }
+
             db = DBManager(tmp_root / "storage", tz=ZoneInfo("UTC"))
             try:
                 await db.init_db()
@@ -208,6 +246,22 @@ async def _run() -> None:
                     turn_id="turn_current",
                 )
 
+                oldest = await db.query_latest(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_demo",
+                    "10001",
+                    limit=1,
+                    from_oldest=True,
+                )
+                latest = await db.query_latest(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_demo",
+                    "10001",
+                    limit=1,
+                )
+                assert [item["content"] for item in oldest] == ["历史问题"]
+                assert [item["content"] for item in latest] == ["当前问题"]
+
                 rounds = await db.query_rounds(
                     "platform_demo:FriendMessage:10001",
                     "conversation_demo",
@@ -217,6 +271,50 @@ async def _run() -> None:
                 )
                 assert len(rounds) == 1
                 assert [item["content"] for item in rounds[0]] == ["历史问题", "历史回答"]
+
+                for turn_id, question, answer in (
+                    ("turn_round_old", "最旧轮问题", "最旧轮回答"),
+                    ("turn_round_new", "最新轮问题", "最新轮回答"),
+                ):
+                    await db.insert(
+                        "platform_demo:FriendMessage:10001",
+                        "conversation_round_order",
+                        "10001",
+                        "user",
+                        question,
+                        llm_status="llm_pending",
+                        content_kind=["text"],
+                        turn_id=turn_id,
+                    )
+                    await db.insert(
+                        "platform_demo:FriendMessage:10001",
+                        "conversation_round_order",
+                        "10001",
+                        "assistant",
+                        answer,
+                        llm_status="llm_success",
+                        content_kind=["text"],
+                        turn_id=turn_id,
+                        send_status="prepared",
+                        update_user_llm_status="llm_success",
+                    )
+                oldest_round = await db.query_rounds(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_round_order",
+                    "10001",
+                    limit_rounds=1,
+                    llm_status="llm_success",
+                    from_oldest=True,
+                )
+                latest_round = await db.query_rounds(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_round_order",
+                    "10001",
+                    limit_rounds=1,
+                    llm_status="llm_success",
+                )
+                assert oldest_round[0][0]["content"] == "最旧轮问题"
+                assert latest_round[0][0]["content"] == "最新轮问题"
 
                 mixed = await db.query_messages_raw(
                     "platform_demo:FriendMessage:10001",
@@ -231,10 +329,10 @@ async def _run() -> None:
                 await db.engine.dispose()
                 with closing(sqlite3.connect(db.db_path)) as conn:
                     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-                    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+                    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
                     assert conn.execute(
                         "SELECT COUNT(*) FROM chat_memory_records"
-                    ).fetchone()[0] == 3
+                    ).fetchone()[0] == 7
             finally:
                 await db.engine.dispose()
         finally:

@@ -37,6 +37,7 @@ from .message_classifier import (
     classify_assistant_chain as _classify_assistant_chain_impl,
     classify_content as _classify_content_impl,
     content_placeholder as _content_placeholder_impl,
+    build_relation_seed as _build_relation_seed_impl,
     extract_text as _extract_text_impl,
 )
 from .context_builder import (
@@ -56,6 +57,7 @@ from .models import (
     SEND_ATTEMPTED as _SEND_ATTEMPTED,
     SEND_PREPARED as _SEND_PREPARED,
 )
+from .relation_codec import dump_relation_data, truncate_content_template
 
 class ChatMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -217,6 +219,10 @@ class ChatMemoryPlugin(Star):
         return _classify_assistant_chain_impl(chain)
 
     @staticmethod
+    def _build_relation_seed(event: AstrMessageEvent) -> tuple[str, Optional[dict]]:
+        return _build_relation_seed_impl(event)
+
+    @staticmethod
     def _content_placeholder(kind: list[str]) -> str:
         return _content_placeholder_impl(kind)
 
@@ -375,7 +381,8 @@ class ChatMemoryPlugin(Star):
             return False
 
         kind, at_id, reply_id, forward_id = self._classify_content(event)
-        user_text = self._extract_text(event)
+        user_template, relation_data = self._build_relation_seed(event)
+        user_text = user_template or self._extract_text(event)
 
         # content 决定：有文本用文本；否则用占位；empty（[] + 无引用字段）用空串
         if user_text:
@@ -401,13 +408,21 @@ class ChatMemoryPlugin(Star):
         event.set_extra("chat_memory_turn_id", turn_id)
 
         audit = self._collect_audit_fields(event)
+        if relation_data and relation_data.get("reply"):
+            relation_data["reply"] = await self._resolve_reply_relation(
+                umo=umo,
+                platform_id=str(audit.get("platform_id") or ""),
+                self_id=str(audit.get("self_id") or ""),
+                reply_seed=relation_data["reply"],
+            )
         ok = await self._safe_insert(
-            umo, cid, user_id, "user", self._truncate(content),
+            umo, cid, user_id, "user", truncate_content_template(content, self.max_len),
             message_id=msg_id or None, pair_id=None,
             llm_status=_LLM_DEFAULT, content_kind=kind,
             at_id=at_id, reply_id=reply_id, forward_id=forward_id,
             persona_id=persona_id or None,
             turn_id=turn_id,
+            relation_data=dump_relation_data(relation_data),
             **audit,
         )
         if not ok:
@@ -431,6 +446,32 @@ class ChatMemoryPlugin(Star):
         event.set_extra("chat_memory_llm_triggered", False)
         event.set_extra("chat_memory_no_mid", no_mid)
         return True
+
+    async def _resolve_reply_relation(
+        self,
+        umo: str,
+        platform_id: str,
+        self_id: str,
+        reply_seed: dict,
+    ) -> dict:
+        """精确 user turn 优先；Bot、缺失或歧义目标统一保存最小快照。"""
+        target_user_id = str(reply_seed.get("target_user_id") or "").strip()
+        source_id = str(reply_seed.get("source_id") or "").strip()
+        is_bot_reply = bool(target_user_id and self_id and target_user_id == self_id)
+        if not is_bot_reply and source_id:
+            target = await self.db.resolve_user_reply_target(umo, platform_id, source_id)
+            if target:
+                return {
+                    "resolution": "turn",
+                    "target_turn_id": target.get("turn_id"),
+                    "target_role": "user",
+                }
+        return {
+            "resolution": "snapshot",
+            "target_user_id": target_user_id,
+            "target_nickname": str(reply_seed.get("target_nickname") or "").strip(),
+            "fallback_text": str(reply_seed.get("fallback_text") or "").strip(),
+        }
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1000)
     async def capture_user(self, event: AstrMessageEvent):
@@ -620,6 +661,7 @@ class ChatMemoryPlugin(Star):
         max_chars: int = 0,
         current_user_id: str = "",
         full_group: bool = False,
+        target_map: Optional[dict[tuple[str, str], dict]] = None,
     ) -> list[dict]:
         builder = TakeoverContextBuilder(
             media_kinds=_MEDIA_KINDS,
@@ -627,6 +669,7 @@ class ChatMemoryPlugin(Star):
             full_group=full_group,
             proactive_status=_LLM_PROACTIVE,
             orphan_status=_LLM_ORPHAN,
+            target_map=target_map,
         )
         return builder.normalize(
             records,
@@ -838,6 +881,7 @@ class ChatMemoryPlugin(Star):
         persona_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
+        from_oldest: bool = False,
     ) -> list[dict]:
         """查询会话历史。``user_id`` 为空时返回该会话所有用户的混合记录（群聊场景）。
 
@@ -846,10 +890,12 @@ class ChatMemoryPlugin(Star):
         ``role_filter`` 给定时仅返回 role 匹配的记录（``'user'`` / ``'assistant'``）。
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点，tz-aware 自动转 UTC）。
+        ``from_oldest=True`` 时从最旧记录开始截取；返回顺序始终为时间正序。
         """
         return await self.db.query_latest(
             umo, conversation_id, user_id, limit, llm_status, content_kind, role_filter,
             persona_id=persona_id, since=since, until=until,
+            from_oldest=from_oldest,
         )
 
     async def query_rounds(
@@ -863,6 +909,7 @@ class ChatMemoryPlugin(Star):
         persona_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
+        from_oldest: bool = False,
     ) -> list[list[dict]]:
         """按轮次返回 user-assistant 配对。每轮 ``[user_dict, assistant_dict]`` 两条。
 
@@ -870,10 +917,12 @@ class ChatMemoryPlugin(Star):
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``。user + assistant 都加。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加，保证配对
         在时间窗口内；EXISTS 子查不限时间，保持"有配对"语义）。
+        ``from_oldest=True`` 时从最旧完整轮次开始截取；返回顺序始终为时间正序。
         """
         return await self.db.query_rounds(
             umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
             persona_id=persona_id, since=since, until=until,
+            from_oldest=from_oldest,
         )
 
     async def build_takeover_contexts(
@@ -923,6 +972,18 @@ class ChatMemoryPlugin(Star):
         if not records:
             return []
 
+        target_turn_ids: list[str] = []
+        for record in records:
+            relation = record.get("relation_data")
+            reply = relation.get("reply") if isinstance(relation, dict) else None
+            if isinstance(reply, dict) and reply.get("resolution") == "turn":
+                target_turn_ids.append(str(reply.get("target_turn_id") or ""))
+        target_map = (
+            await self.db.query_turn_targets(umo, target_turn_ids)
+            if target_turn_ids
+            else {}
+        )
+
         mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
         return self._takeover_normalize(
             records,
@@ -931,6 +992,7 @@ class ChatMemoryPlugin(Star):
             max_chars=self.ct_max_context_chars,
             current_user_id=user_id,
             full_group=effective_full_group,
+            target_map=target_map,
         )
 
     # ── 内部工具 ──────────────────────────────────────
@@ -946,6 +1008,7 @@ class ChatMemoryPlugin(Star):
         at_id: Optional[str] = None, reply_id: Optional[str] = None,
         forward_id: Optional[str] = None, persona_id: Optional[str] = None,
         turn_id: Optional[str] = None, send_status: str = "",
+        relation_data: Optional[str] = None,
         update_user_llm_status: Optional[str] = None,
     ) -> bool:
         try:
@@ -959,6 +1022,7 @@ class ChatMemoryPlugin(Star):
                 at_id=at_id, reply_id=reply_id, forward_id=forward_id,
                 persona_id=persona_id,
                 turn_id=turn_id, send_status=send_status,
+                relation_data=relation_data,
                 update_user_llm_status=update_user_llm_status,
             )
             return True

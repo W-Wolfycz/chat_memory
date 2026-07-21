@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.0.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=2`。
+当前发布版本：`1.1.0`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
 
 ## 特性
 
@@ -25,7 +25,10 @@
 | `content_kind` | `text` / `image` / `video` / `voice` / `file` / `face` / `forward` / `system_event` | JSON 数组，可多值 |
 | | `[]` 空数组 | empty（如纯 @BOT 无文字、纯 Reply 无文字） |
 
-`at` / `reply` 不入 `content_kind`，用独立字段 `at_id` / `reply_id` 表达。
+`at` / `reply` 不入 `content_kind`。`reply_id` 保留平台引用 ID；`at_id` 已弃用但在
+1.x 继续双写第一个普通 At，以兼容旧调用方。新消息通过 `relation_data` 保存完整有序 At
+参数与 Reply 关系，正文在库内使用 `⟦CM_AT:n⟧` 模板，查询返回的 `content` 会渲染为
+`[提及:昵称]`，并额外提供原始 `content_template`。
 
 **配对规则**：新记录用内部 `turn_id` 关联 user-assistant；旧记录继续用 `pair_id` 关联 user `message_id`。`proactive` / `orphan` 仍由 `llm_status` 表达单边语义。平台无 `message_id` 时新记录也能配对。
 
@@ -69,7 +72,8 @@ CREATE TABLE chat_memory_records (
     persona_id      TEXT,                           -- 生效 persona，用于可选隔离
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     turn_id         TEXT,                           -- ChatMemory 内部轮次 ID，不依赖平台 message_id
-    send_status     TEXT NOT NULL DEFAULT ''        -- assistant: prepared / send_attempted
+    send_status     TEXT NOT NULL DEFAULT '',       -- assistant: prepared / send_attempted
+    relation_data   TEXT                             -- v1 At 模板参数 + Reply turn/snapshot
 );
 ```
 
@@ -77,13 +81,13 @@ CREATE TABLE chat_memory_records (
 >
 > **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（**UTC naive 存储**，与 schema default `CURRENT_TIMESTAMP` 对齐；**查询返回时按 AstrBot `timezone` 配置转成配置时区 naive 字符串**）。
 >
-> **测试版数据库升级**：启动时使用 `PRAGMA user_version` + 实际列检查。已有 `llm_status` 的 0.x 数据库会增量补 `persona_id` / `turn_id` / `send_status`；更早、缺少 `llm_status` 的表不会猜测字段语义，而是先 RENAME 为 `chat_memory_records_backup_<ts>` 再建立当前主表。迁移后会校验索引绑定，并将数据库 schema version 写为 2。
+> **测试版数据库升级**：启动时使用 `PRAGMA user_version` + 实际列检查。已有 `llm_status` 的数据库会增量补 `persona_id` / `turn_id` / `send_status` / `relation_data`；更早、缺少 `llm_status` 的表不会猜测字段语义，而是先 RENAME 为 `chat_memory_records_backup_<ts>` 再建立当前主表。迁移后会校验索引绑定，并将数据库 schema version 写为 3。
 
 > **turn_id 与发送状态**：1.0.0 的实时写入和状态升级统一使用内部 `turn_id`；历史记录查询仍保留 `message_id` / `pair_id` 回退，确保现有数据库中的旧轮次可读。`send_status=prepared` 表示 assistant 已写入、准备发送；`send_attempted` 仅表示 AstrBot 发送流程结束/已尝试，不等价于平台送达回执。
 
 ### 升级与备份
 
-- 已有 0.x 数据库可直接启动 1.0.1，当前增量迁移已用旧库一致性快照验证。
+- 已有 schema v2 数据库可直接启动 1.1.0；迁移仅增加 nullable `relation_data`，旧行内容不重写。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -111,8 +115,8 @@ cm = _resolve_chat_memory(context)
 
 | 函数 | 参数 | 返回 |
 |---|---|---|
-| `query_history` | `umo, conversation_id, user_id=None, limit=20, llm_status=None, content_kind=None, role_filter=None, persona_id=None, since=None, until=None` | `list[dict]`，按时间正序 |
-| `query_rounds` | `umo, conversation_id, user_id=None, limit_rounds=10, llm_status=None, content_kind=None, persona_id=None, since=None, until=None` | `list[list[dict]]`，按 `turn_id` 配对；旧数据回退 `pair_id` |
+| `query_history` | `umo, conversation_id, user_id=None, limit=20, llm_status=None, content_kind=None, role_filter=None, persona_id=None, since=None, until=None, from_oldest=False` | `list[dict]`，按时间正序 |
+| `query_rounds` | `umo, conversation_id, user_id=None, limit_rounds=10, llm_status=None, content_kind=None, persona_id=None, since=None, until=None, from_oldest=False` | `list[list[dict]]`，按 `turn_id` 配对；旧数据回退 `pair_id` |
 | `build_takeover_contexts` | `umo, user_id, conversation_id=None, persona_id="", exclude_turn_id=""` | `list[dict] \| None`，按当前接管配置构建可直接传给 LLM 的 contexts |
 
 **参数行为**
@@ -125,7 +129,16 @@ cm = _resolve_chat_memory(context)
 - `persona_id`：`None` 不过滤；非空按值过滤；空串 `""` 严格过滤 `IS NULL OR ''`
 - `since` / `until` 给定时按 `created_at` 过滤时间窗口（含端点）；`datetime` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 `CURRENT_TIMESTAMP` 对齐）
 - 返回记录同时提供 `created_at`（配置时区 naive 字符串）和明确的 `created_at_utc`（UTC ISO 8601 字符串）。新调用方应使用 `created_at_utc` 作为 UTC 游标。
+- `from_oldest=false` 保持原行为：选最新 N 条/轮后按时间正序返回；设为 `true` 时从最旧记录开始选 N 条/轮，返回顺序仍为正序。
+- 新关系记录的 `content` 是渲染后的可读文本，`content_template` 是库内原始模板，`relation_data` 是结构化 At/Reply 数据；旧记录的 `relation_data` 为 `None`，不会推测性回填。
 - `query_rounds` 的配对检查会复用 persona / 时间条件，避免过滤后返回孤立 user
+
+### 群聊 At / Reply 关系
+
+- At 按 MessageChain 原始位置写成 `⟦CM_AT:0⟧` 等带索引模板；`relation_data.mentions` 按出现顺序保存参数，重复 At 不去重，AtAll 使用 `{"all": true}`。
+- 普通成员 Reply 只用同一平台实例、同一 UMO 下唯一的 `reply_id → user.message_id` 精确解析为 `target_turn_id`；零命中或多命中都不猜测。
+- 引用 Bot/assistant 时不做时间或内容启发式匹配，直接保存 AstrBot Reply 组件提供的昵称与最多 300 字符文本快照；其他无法精确解析的 Reply 同样降级为快照。
+- takeover 会把关系渲染为 `[回复 → 昵称 | 原文: ...]` 与正文中的 `[提及:昵称]`。旧记录没有 `relation_data` 时完全保持旧格式。
 
 **`build_takeover_contexts` 返回语义**
 

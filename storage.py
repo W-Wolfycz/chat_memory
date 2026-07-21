@@ -1,4 +1,4 @@
-"""chat_memory — 异步 SQLite 存储层（schema v2）。
+"""chat_memory — 异步 SQLite 存储层（schema v3）。
 
 Schema 说明：
 - ``llm_status``：LLM 配对状态（单值）。'' = 默认（未走 LLM），
@@ -25,6 +25,7 @@ from sqlalchemy import bindparam, event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from .models import VALID_LLM_STATUSES, VALID_SEND_STATUSES
+from .relation_codec import parse_relation_data, render_content_template
 
 
 _CREATE_TABLE_SQL = """\
@@ -53,10 +54,11 @@ CREATE TABLE IF NOT EXISTS chat_memory_records (
     persona_id      TEXT,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     turn_id         TEXT,
-    send_status     TEXT NOT NULL DEFAULT ''
+    send_status     TEXT NOT NULL DEFAULT '',
+    relation_data   TEXT
 )"""
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _INDEX_DEFINITIONS = {
     "ix_cm_umo_cid_user": (
@@ -171,6 +173,10 @@ class DBManager:
                             "ALTER TABLE chat_memory_records "
                             "ADD COLUMN send_status TEXT NOT NULL DEFAULT ''"
                         ))
+                    if "relation_data" not in existing_cols:
+                        await conn.execute(text(
+                            "ALTER TABLE chat_memory_records ADD COLUMN relation_data TEXT"
+                        ))
                 await conn.execute(text(_CREATE_TABLE_SQL))
                 for idx_sql in _INDEX_DEFINITIONS.values():
                     await conn.execute(text(idx_sql))
@@ -215,6 +221,7 @@ class DBManager:
         persona_id: Optional[str] = None,
         turn_id: Optional[str] = None,
         send_status: str = "",
+        relation_data: Optional[str] = None,
         update_user_llm_status: Optional[str] = None,
     ) -> None:
         await self.init_db()
@@ -254,12 +261,12 @@ class DBManager:
                     "platform_id, platform_name, message_type, session_id, self_id, "
                     "group_id, sender_nickname, raw_timestamp, "
                     "at_id, reply_id, forward_id, persona_id, created_at, "
-                    "turn_id, send_status) "
+                    "turn_id, send_status, relation_data) "
                     "VALUES (:umo, :cid, :uid, :role, :content, :mid, :pid, "
                     ":lstatus, :ckind, "
                     ":pid_plat, :pname, :mtype, :sid, :self_id, "
                     ":gid, :nick, :rts, :at_id, :reply_id, :fwd_id, :per_id, :now, "
-                    ":turn_id, :send_status)"
+                    ":turn_id, :send_status, :relation_data)"
                 ),
                 {
                     "umo": umo,
@@ -286,6 +293,7 @@ class DBManager:
                     "now": datetime.now(timezone.utc).replace(tzinfo=None),
                     "turn_id": turn_id,
                     "send_status": send_status,
+                    "relation_data": relation_data,
                 },
             )
             await session.commit()
@@ -350,6 +358,7 @@ class DBManager:
         persona_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
+        from_oldest: bool = False,
     ) -> list[dict]:
         """查询最近 N 条记录（按时间升序返回）。
 
@@ -360,7 +369,6 @@ class DBManager:
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点）；
         ``datetime`` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 ``CURRENT_TIMESTAMP`` 对齐）。
-
         ``limit`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）导致全库返回。
         """
         await self.init_db()
@@ -416,14 +424,17 @@ class DBManager:
             where = " AND ".join(conditions)
             params["lim"] = limit
 
+            order = "ASC" if from_oldest else "DESC"
             sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
+                                           f"ORDER BY created_at {order}, id {order} LIMIT :lim")
             for name in expanding_binds:
                 sql_text = sql_text.bindparams(bindparam(name, expanding=True))
 
             result = await session.execute(sql_text, params)
             rows = result.fetchall()
-            return [_row_to_dict(r, self._tz) for r in reversed(rows)]
+            if not from_oldest:
+                rows.reverse()
+            return [_row_to_dict(r, self._tz) for r in rows]
 
     async def query_rounds(
         self,
@@ -436,6 +447,7 @@ class DBManager:
         persona_id: Optional[str] = None,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
+        from_oldest: bool = False,
     ) -> list[list[dict]]:
         """按配对返回对话轮次。每轮保证 ``[user_dict, assistant_dict]`` 两条。
 
@@ -449,7 +461,6 @@ class DBManager:
         和配对 EXISTS 子查；``datetime`` tz-aware 自动转 UTC naive。
         结果严格为完整 ``[user_dict, assistant_dict]``，不会返回孤立 user；历史重复 assistant
         时按 ``created_at ASC, id ASC`` 取最早的一条。
-
         ``limit_rounds`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）。
         """
         await self.init_db()
@@ -527,13 +538,16 @@ class DBManager:
             where = " AND ".join(conditions)
             user_params["lim"] = limit_rounds
 
+            order = "ASC" if from_oldest else "DESC"
             sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
+                                           f"ORDER BY created_at {order}, id {order} LIMIT :lim")
             for name in expanding_binds:
                 sql_text = sql_text.bindparams(bindparam(name, expanding=True))
 
             result = await session.execute(sql_text, user_params)
-            user_rows = list(reversed(result.fetchall()))  # 升序
+            user_rows = list(result.fetchall())
+            if not from_oldest:
+                user_rows.reverse()
 
             if not user_rows:
                 return []
@@ -593,6 +607,67 @@ class DBManager:
                 if assistants:
                     rounds.append([_row_to_dict(r, self._tz), assistants[0]])
             return rounds
+
+    async def resolve_user_reply_target(
+        self,
+        umo: str,
+        platform_id: str,
+        reply_id: str,
+    ) -> Optional[dict]:
+        """用平台 Reply.id 唯一解析同一 UMO 内的 user turn；歧义时拒绝猜测。"""
+        await self.init_db()
+        if not umo or not reply_id:
+            return None
+        conditions = [
+            "umo = :umo",
+            "role = 'user'",
+            "message_id = :reply_id",
+            "turn_id IS NOT NULL",
+            "turn_id <> ''",
+        ]
+        params = {"umo": umo, "reply_id": reply_id}
+        if platform_id:
+            conditions.append("platform_id = :platform_id")
+            params["platform_id"] = platform_id
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    _SELECT_COLS + " FROM chat_memory_records WHERE "
+                    + " AND ".join(conditions)
+                    + " ORDER BY created_at DESC, id DESC LIMIT 2"
+                ),
+                params,
+            )
+            rows = result.fetchall()
+            if len(rows) != 1:
+                return None
+            return _row_to_dict(rows[0], self._tz)
+
+    async def query_turn_targets(
+        self,
+        umo: str,
+        turn_ids: list[str],
+    ) -> dict[tuple[str, str], dict]:
+        """批量读取引用目标，key 为 ``(turn_id, role)``。"""
+        await self.init_db()
+        clean_ids = sorted({str(value) for value in turn_ids if value})
+        if not clean_ids:
+            return {}
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    _SELECT_COLS
+                    + " FROM chat_memory_records WHERE turn_id IN :turn_ids "
+                    "ORDER BY created_at ASC, id ASC"
+                ).bindparams(bindparam("turn_ids", expanding=True)),
+                {"turn_ids": clean_ids},
+            )
+            targets: dict[tuple[str, str], dict] = {}
+            for row in result.fetchall():
+                record = _row_to_dict(row, self._tz)
+                key = (str(record.get("turn_id") or ""), str(record.get("role") or ""))
+                targets.setdefault(key, record)
+            return targets
 
     async def delete_by_conversation(self, umo: str, conversation_id: str) -> int:
         """清除某个 conversation_id 下的所有记录（用于 /reset）。"""
@@ -962,7 +1037,7 @@ _SELECT_COLS = (
     "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
     "platform_id, platform_name, message_type, session_id, self_id, "
     "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, "
-    "persona_id, created_at, turn_id, send_status"
+    "persona_id, created_at, turn_id, send_status, relation_data"
 )
 
 # 列位置索引（与 _SELECT_COLS 一一对应）
@@ -970,7 +1045,7 @@ _SELECT_COLS = (
 # 5 llm_status | 6 content_kind | 7 platform_id | 8 platform_name | 9 message_type
 # 10 session_id | 11 self_id | 12 group_id | 13 sender_nickname | 14 raw_timestamp
 # 15 at_id | 16 reply_id | 17 forward_id | 18 persona_id | 19 created_at
-# 20 turn_id | 21 send_status
+# 20 turn_id | 21 send_status | 22 relation_data
 
 
 def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
@@ -999,9 +1074,12 @@ def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
     else:
         created_at_str = str(created_at_raw)
         created_at_utc = str(created_at_raw)
+    relation_data = parse_relation_data(r[22])
+    content_template = r[1]
     return {
         "role": r[0],
-        "content": r[1],
+        "content": render_content_template(content_template, relation_data),
+        "content_template": content_template,
         "user_id": r[2],
         "message_id": r[3],
         "pair_id": r[4],
@@ -1024,4 +1102,5 @@ def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
         "created_at_utc": created_at_utc,
         "turn_id": r[20],
         "send_status": r[21],
+        "relation_data": relation_data,
     }

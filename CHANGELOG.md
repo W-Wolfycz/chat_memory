@@ -1,6 +1,16 @@
 # Changelog
 
-ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前仍为 `2`。
+ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前为 `3`。
+
+## 1.1.0 — 2026-07-22
+
+### 群聊 Reply / At 关系与最旧端查询
+
+- 数据库 schema 升至 v3，仅新增 nullable `relation_data`；旧记录不回填、不猜测，关系增强只对升级后的新数据生效。
+- At 按 MessageChain 原始位置写入带索引模板，完整有序参数存入 `relation_data.mentions`；查询对外继续返回渲染后的 `content`，并新增 `content_template`。`at_id` 标记弃用，但 1.x 继续双写第一个普通 At 保持兼容。
+- 普通成员 Reply 仅通过同一平台实例、同一 UMO 下唯一的 `reply_id → user.message_id → target_turn_id` 精确关联；引用 Bot 或无法唯一解析时保存最小快照，不使用 timestamp/content 启发式匹配。
+- takeover 增加明确的 Reply/At 关系转录与防指令混淆说明，引用目标按 turn 批量读取，避免 N+1 查询。
+- `query_history()` / `query_rounds()` 末尾新增 `from_oldest=False`；显式设为 `true` 时从最旧记录/轮次开始截取，返回结果仍保持时间正序。
 
 ## 1.0.1 — 2026-07-17
 
