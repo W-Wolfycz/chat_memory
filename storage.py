@@ -359,15 +359,21 @@ class DBManager:
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         from_oldest: bool = False,
+        after_id: Optional[int] = None,
+        content_kind_all_match: bool = False,
     ) -> list[dict]:
         """查询最近 N 条记录（按时间升序返回）。
 
         ``user_id`` 为 None / 空字符串时不按用户过滤，返回该会话下所有用户的混合记录。
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
-        ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
+        ``content_kind`` 支持 str 或 list[str]：默认返回 content_kind JSON 数组中
+        **任一包含**这些值的记录；``content_kind_all_match=True`` 时只保留非空且
+        全部 kind 都属于白名单的记录。
         ``role_filter`` 给定时仅返回 role 匹配的记录。
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点）；
+        ``after_id`` 必须与 ``since`` 一起使用，此时下界变为严格的
+        ``(created_at, id) > (since, after_id)`` keyset 游标。
         ``datetime`` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 ``CURRENT_TIMESTAMP`` 对齐）。
         ``limit`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）导致全库返回。
         """
@@ -399,17 +405,33 @@ class DBManager:
                 else:
                     kind_list = list(content_kind)
                 if kind_list:
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value IN :kinds)"
-                    )
+                    if content_kind_all_match:
+                        conditions.append(
+                            "EXISTS (SELECT 1 FROM json_each(content_kind)) "
+                            "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
+                            "WHERE value NOT IN :kinds)"
+                        )
+                    else:
+                        conditions.append(
+                            "EXISTS (SELECT 1 FROM json_each(content_kind) "
+                            "WHERE value IN :kinds)"
+                        )
                     params["kinds"] = kind_list
                     expanding_binds.append("kinds")
 
             since_norm = _normalize_dt(since)
             until_norm = _normalize_dt(until)
+            if after_id is not None and since_norm is None:
+                raise ValueError("after_id requires since")
             if since_norm:
-                conditions.append("created_at >= :since")
+                if after_id is None:
+                    conditions.append("created_at >= :since")
+                else:
+                    conditions.append(
+                        "(created_at > :since OR "
+                        "(created_at = :since AND id > :after_id))"
+                    )
+                    params["after_id"] = int(after_id)
                 params["since"] = since_norm
             if until_norm:
                 conditions.append("created_at <= :until")
@@ -448,6 +470,8 @@ class DBManager:
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         from_oldest: bool = False,
+        after_id: Optional[int] = None,
+        content_kind_all_match: bool = False,
     ) -> list[list[dict]]:
         """按配对返回对话轮次。每轮保证 ``[user_dict, assistant_dict]`` 两条。
 
@@ -455,10 +479,13 @@ class DBManager:
         因此 ``limit_rounds`` 轮对应 ``2 * limit_rounds`` 条记录。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 按配对字段返回）。
+        ``content_kind_all_match=True`` 时，user 的 content_kind 必须非空且全部属于
+        ``content_kind`` 白名单。
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``。persona
         条件同时作用于 user、assistant 和配对 EXISTS 子查。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤，条件同时作用于 user、assistant
-        和配对 EXISTS 子查；``datetime`` tz-aware 自动转 UTC naive。
+        和配对 EXISTS 子查；``after_id`` 与 ``since`` 同时使用时，下界改为严格的
+        ``(created_at, id)`` keyset 游标；``datetime`` tz-aware 自动转 UTC naive。
         结果严格为完整 ``[user_dict, assistant_dict]``，不会返回孤立 user；历史重复 assistant
         时按 ``created_at ASC, id ASC`` 取最早的一条。
         ``limit_rounds`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）。
@@ -491,17 +518,33 @@ class DBManager:
                 else:
                     kind_list = list(content_kind)
                 if kind_list:
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value IN :kinds)"
-                    )
+                    if content_kind_all_match:
+                        conditions.append(
+                            "EXISTS (SELECT 1 FROM json_each(content_kind)) "
+                            "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
+                            "WHERE value NOT IN :kinds)"
+                        )
+                    else:
+                        conditions.append(
+                            "EXISTS (SELECT 1 FROM json_each(content_kind) "
+                            "WHERE value IN :kinds)"
+                        )
                     user_params["kinds"] = kind_list
                     expanding_binds.append("kinds")
 
             since_norm = _normalize_dt(since)
             until_norm = _normalize_dt(until)
+            if after_id is not None and since_norm is None:
+                raise ValueError("after_id requires since")
             if since_norm:
-                conditions.append("created_at >= :since")
+                if after_id is None:
+                    conditions.append("created_at >= :since")
+                else:
+                    conditions.append(
+                        "(created_at > :since OR "
+                        "(created_at = :since AND id > :after_id))"
+                    )
+                    user_params["after_id"] = int(after_id)
                 user_params["since"] = since_norm
             if until_norm:
                 conditions.append("created_at <= :until")
@@ -524,7 +567,13 @@ class DBManager:
                 "AND a.pair_id = chat_memory_records.message_id))",
             ]
             if since_norm:
-                pair_exists.append("AND a.created_at >= :since")
+                if after_id is None:
+                    pair_exists.append("AND a.created_at >= :since")
+                else:
+                    pair_exists.append(
+                        "AND (a.created_at > :since OR "
+                        "(a.created_at = :since AND a.id > :after_id))"
+                    )
             if until_norm:
                 pair_exists.append("AND a.created_at <= :until")
             if persona_id is not None:
@@ -569,7 +618,14 @@ class DBManager:
                     "pids": user_msg_ids or ["__no_message_id__"],
                 }
                 if since_norm:
-                    asst_conditions.append("created_at >= :since")
+                    if after_id is None:
+                        asst_conditions.append("created_at >= :since")
+                    else:
+                        asst_conditions.append(
+                            "(created_at > :since OR "
+                            "(created_at = :since AND id > :after_id))"
+                        )
+                        asst_params["after_id"] = int(after_id)
                     asst_params["since"] = since_norm
                 if until_norm:
                     asst_conditions.append("created_at <= :until")
@@ -1037,7 +1093,7 @@ _SELECT_COLS = (
     "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
     "platform_id, platform_name, message_type, session_id, self_id, "
     "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, "
-    "persona_id, created_at, turn_id, send_status, relation_data"
+    "persona_id, created_at, turn_id, send_status, relation_data, id"
 )
 
 # 列位置索引（与 _SELECT_COLS 一一对应）
@@ -1045,7 +1101,7 @@ _SELECT_COLS = (
 # 5 llm_status | 6 content_kind | 7 platform_id | 8 platform_name | 9 message_type
 # 10 session_id | 11 self_id | 12 group_id | 13 sender_nickname | 14 raw_timestamp
 # 15 at_id | 16 reply_id | 17 forward_id | 18 persona_id | 19 created_at
-# 20 turn_id | 21 send_status | 22 relation_data
+# 20 turn_id | 21 send_status | 22 relation_data | 23 id
 
 
 def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
@@ -1103,4 +1159,5 @@ def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
         "turn_id": r[20],
         "send_status": r[21],
         "relation_data": relation_data,
+        "record_id": int(r[23]),
     }

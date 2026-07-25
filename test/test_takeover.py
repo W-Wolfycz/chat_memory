@@ -334,7 +334,7 @@ def test_prefix_is_mandatory_and_solo_still_tagged():
 
 
 def test_full_group_speaker_identity_and_system_instruction():
-    """T49: full-group 标记当前/其他发言者，system prompt 规则只追加一次。"""
+    """T49: full-group 只标当前发言者，system prompt 规则只追加一次。"""
     p = _make_plugin()
     records = [
         {
@@ -361,7 +361,8 @@ def test_full_group_speaker_identity_and_system_instruction():
     )
     assert [item["role"] for item in out] == ["user", "assistant"]
     assert "[当前发言者] Alice: 当前用户发言" in out[0]["content"]
-    assert "[其他发言者] Bob: 其他用户发言" in out[0]["content"]
+    assert "Bob: 其他用户发言" in out[0]["content"]
+    assert "[其他发言者]" not in out[0]["content"]
     assert "合并群聊转录" not in out[0]["content"]
 
     # 公开 API 没有当前 user 时使用中性标记，不把任何人误标为“其他”。
@@ -418,7 +419,221 @@ def test_full_group_speaker_identity_and_system_instruction():
         assert reset_calls == [(_UMO_GROUP, "conversation_demo")]
 
     asyncio.run(_run_hook())
-    print("[T49] full-group 发言者身份标记 + system prompt 幂等注入 ✓")
+    print("[T49] full-group 仅标当前发言者 + system prompt 幂等注入 ✓")
+
+
+def test_cross_session_source_aliases_and_system_instruction():
+    """T53: 跨会话使用请求内匿名来源；当前来源零标记，昵称变化不影响映射。"""
+    p = _make_plugin()
+
+    # 新参数追加在旧参数之后，保持内部规整器既有 positional 调用兼容。
+    legacy_builder = context_builder_mod.TakeoverContextBuilder(
+        set(), "u1", True, "proactive", "orphan", {},
+    )
+    assert legacy_builder.proactive_status == "proactive"
+    assert legacy_builder.orphan_status == "orphan"
+    assert legacy_builder.cross_session is False
+    assert legacy_builder.paired_rounds is False
+
+    def _pair(
+        *,
+        platform_id="aiocqhttp",
+        message_type="GroupMessage",
+        session_id="g1",
+        group_id="g1",
+        nickname="Alice",
+        user_content="问题",
+        assistant_content="回答",
+    ):
+        common = {
+            "user_id": "u1",
+            "platform_id": platform_id,
+            "message_type": message_type,
+            "session_id": session_id,
+            "group_id": group_id,
+            "content_kind": ["text"],
+            "llm_status": "llm_success",
+        }
+        return [
+            {
+                **common,
+                "role": "user",
+                "content": user_content,
+                "sender_nickname": nickname,
+                "created_at": "2026-07-24 10:00:00",
+            },
+            {
+                **common,
+                "role": "assistant",
+                "content": assistant_content,
+                "created_at": "2026-07-24 10:00:01",
+            },
+        ]
+
+    records = []
+    records += _pair(user_content="当前群", assistant_content="当前回答")
+    records += _pair(
+        session_id="g2", group_id="g2", nickname="旧昵称",
+        user_content="外群一", assistant_content="外群回答一",
+    )
+    records += _pair(
+        session_id="g2", group_id="g2", nickname="新昵称",
+        user_content="外群一续", assistant_content="外群回答二",
+    )
+    records += _pair(
+        session_id="g3", group_id="g3",
+        user_content="外群二", assistant_content="外群回答三",
+    )
+    records.append({
+        "role": "assistant", "content": "外群主动提醒", "user_id": "u1",
+        "created_at": "2026-07-24 10:00:30", "content_kind": ["text"],
+        "llm_status": "proactive", "platform_id": "aiocqhttp",
+        "message_type": "GroupMessage", "session_id": "g2", "group_id": "g2",
+    })
+    records += _pair(
+        message_type="FriendMessage", session_id="u1", group_id="",
+        user_content="私聊", assistant_content="私聊回答",
+    )
+    records += _pair(
+        message_type="OtherMessage", session_id="channel_demo", group_id="",
+        user_content="其他会话", assistant_content="其他会话回答",
+    )
+    records += [
+        {
+            "role": "user", "content": "来源缺失", "user_id": "u1",
+            "sender_nickname": "Alice", "created_at": "2026-07-24 10:01:00",
+            "content_kind": ["text"], "llm_status": "llm_success",
+        },
+        {
+            "role": "assistant", "content": "未知回答", "user_id": "u1",
+            "created_at": "2026-07-24 10:01:01",
+            "content_kind": ["text"], "llm_status": "llm_success",
+        },
+    ]
+
+    out = p._takeover_normalize(
+        records,
+        _UMO_GROUP,
+        current_user_id="u1",
+        full_group=True,
+        cross_session=True,
+        paired_rounds=True,
+    )
+    joined = "\n".join(item["content"] for item in out)
+    assert "[当前发言者] Alice: 当前群" in joined
+    assert "[群1] 旧昵称: 外群一" in joined
+    assert "[群1] 新昵称: 外群一续" in joined
+    assert "外群回答一" in joined and "外群回答二" in joined
+    assert "[群2] Alice: 外群二" in joined
+    assert "[私1] Alice: 私聊" in joined
+    assert "[会1] Alice: 其他会话" in joined
+    assert "[未知] Alice: 来源缺失" in joined
+    assert "未知回答" in joined
+    assert "[群1] [主动] 外群主动提醒" in joined
+    assert "[本人]" not in joined
+    paired_assistants = [item["content"] for item in out if item["role"] == "assistant"]
+    assert not any(content.startswith("[群1]") for content in paired_assistants)
+    assert "g2" not in joined and "g3" not in joined and "channel_demo" not in joined
+    assert "[群1]" not in out[0]["content"] and "[私1]" not in out[0]["content"]
+
+    # 外部旧行缺 platform_id 时不猜当前平台，明确降级为未知来源。
+    partial_source = p._takeover_normalize(
+        [{
+            "role": "user", "content": "外部字段不完整", "user_id": "u1",
+            "sender_nickname": "Alice", "created_at": "2026-07-24 10:02:00",
+            "content_kind": ["text"], "llm_status": "llm_success",
+            "message_type": "GroupMessage", "session_id": "g_missing",
+            "group_id": "g_missing",
+        }],
+        _UMO_GROUP,
+        current_user_id="u1",
+        full_group=False,
+        cross_session=True,
+        paired_rounds=True,
+    )
+    assert partial_source[0]["content"].startswith(
+        "[07/24 10:02:00] [未知] Alice:"
+    )
+
+    # 关闭 cross_session 后完全回到旧前缀，不引入来源协议。
+    legacy = p._takeover_normalize(
+        records[:4],
+        _UMO_GROUP,
+        current_user_id="u1",
+        full_group=True,
+        cross_session=False,
+    )
+    legacy_text = "\n".join(item["content"] for item in legacy)
+    assert "[群1]" not in legacy_text
+    assert legacy_text.count("[当前发言者]") == 2
+
+    # 混合状态按全局时间线组织，assistant 不能假设紧邻配对 user，需自带来源。
+    mixed = p._takeover_normalize(
+        records[:4],
+        _UMO_GROUP,
+        current_user_id="u1",
+        full_group=True,
+        cross_session=True,
+        paired_rounds=False,
+    )
+    assert any(
+        item["role"] == "assistant" and item["content"].startswith("[群1]")
+        for item in mixed
+    )
+
+    req = types.SimpleNamespace(system_prompt="人格提示")
+    p._append_cross_session_instruction(req)
+    p._append_cross_session_instruction(req)
+    assert req.system_prompt.count("[ChatMemory 跨会话来源规则]") == 1
+    assert "无来源标记=当前会话" in req.system_prompt
+    assert "user_id 必定属于当前用户" in req.system_prompt
+    assert "成功配对模式的 assistant 跟随前一条 user" in req.system_prompt
+
+    async def _run_hook():
+        async def _get_cid(umo):
+            return "conversation_demo"
+
+        async def _build(**kwargs):
+            return [
+                {"role": "user", "content": "[群1] 历史问题", "_no_save": True},
+                {"role": "assistant", "content": "[群1] 历史回答", "_no_save": True},
+            ]
+
+        async def _reset(*args):
+            return None
+
+        class _Event:
+            unified_msg_origin = _UMO_GROUP
+
+            def get_sender_id(self):
+                return "u1"
+
+            def get_extra(self, key, default=None):
+                return default
+
+        p.ct_cross_session = True
+        p.ct_full_group = False
+        p._get_curr_cid = _get_cid
+        p.build_takeover_contexts = _build
+        p._safe_reset_history = _reset
+        p._log = lambda *args, **kwargs: None
+        hook_req = types.SimpleNamespace(system_prompt="人格提示", contexts=[])
+        await p.take_over_context(_Event(), hook_req)
+        assert hook_req.system_prompt.count("[ChatMemory 跨会话来源规则]") == 1
+
+        async def _build_current_only(**kwargs):
+            return [
+                {"role": "user", "content": "当前历史问题", "_no_save": True},
+                {"role": "assistant", "content": "当前历史回答", "_no_save": True},
+            ]
+
+        p.build_takeover_contexts = _build_current_only
+        current_req = types.SimpleNamespace(system_prompt="人格提示", contexts=[])
+        await p.take_over_context(_Event(), current_req)
+        assert "[ChatMemory 跨会话来源规则]" not in current_req.system_prompt
+
+    asyncio.run(_run_hook())
+    print("[T53] 跨会话匿名来源 + 昵称变化稳定映射 + 紧凑提示词 ✓")
 
 
 def test_no_llm_mapping():
@@ -713,6 +928,8 @@ def test_public_build_takeover_contexts_api():
             current_user_id="",
             full_group=False,
             target_map=None,
+            cross_session=False,
+            paired_rounds=False,
         ):
             normalize_calls.append({
                 "records": records,
@@ -722,6 +939,8 @@ def test_public_build_takeover_contexts_api():
                 "current_user_id": current_user_id,
                 "full_group": full_group,
                 "target_map": target_map,
+                "cross_session": cross_session,
+                "paired_rounds": paired_rounds,
             })
             return [
                 {"role": "user", "content": "历史问题", "_no_save": True},
@@ -780,12 +999,15 @@ def test_public_build_takeover_contexts_api():
         assert normalize_calls[-1]["max_chars"] == 321
         assert normalize_calls[-1]["current_user_id"] == "u1"
         assert normalize_calls[-1]["full_group"] is False
+        assert normalize_calls[-1]["cross_session"] is False
+        assert normalize_calls[-1]["paired_rounds"] is False
 
         # 纯配对模式由 query_rounds_raw 控制轮数，normalize 不再二次按消息数截断。
         p.ct_llm_status_filter = {"llm_success"}
         await p.build_takeover_contexts(_UMO_GROUP, "u1", "conversation_explicit")
         assert calls[-1]["cid"] == "conversation_explicit"
         assert normalize_calls[-1]["max_records"] is None
+        assert normalize_calls[-1]["paired_rounds"] is True
 
         # 群聊 full_group 明确开启时才允许空 user_id；cross_session 必须被强制关闭。
         p.ct_full_group = True
@@ -796,6 +1018,8 @@ def test_public_build_takeover_contexts_api():
         assert calls[-1]["force_current_session"] is True
         assert normalize_calls[-1]["current_user_id"] == ""
         assert normalize_calls[-1]["full_group"] is True
+        assert normalize_calls[-1]["cross_session"] is False
+        assert normalize_calls[-1]["paired_rounds"] is True
 
         async def _no_current_cid(umo):
             return ""
@@ -882,7 +1106,7 @@ def test_takeover_character_budget():
 
 
 def test_records_unconditional_sort():
-    """T15: _takeover_query 末尾无条件排序（mock query_rounds_raw 返回倒序）。"""
+    """T15: 配对模式按整轮排序并保持相邻；混合模式按全局时间排序。"""
     _orig_logger = _mod_ns["logger"]
     _mod_ns["logger"] = types.SimpleNamespace(
         info=lambda *a, **kw: None, warning=lambda *a, **kw: None, debug=lambda *a, **kw: None,
@@ -904,7 +1128,7 @@ def test_records_unconditional_sort():
                         [{"role": "user", "content": "earlier", "created_at": "2026-07-09 10:00:00",
                           "content_kind": ["text"], "llm_status": "llm_success",
                           "sender_nickname": "A", "user_id": "u1", "message_id": "m1", "pair_id": None},
-                         {"role": "assistant", "content": "a1", "created_at": "2026-07-09 10:00:05",
+                         {"role": "assistant", "content": "a1", "created_at": "2026-07-09 12:00:05",
                           "content_kind": ["text"], "llm_status": "llm_success",
                           "sender_nickname": "bot", "user_id": "u1", "message_id": "a1", "pair_id": "m1"}],
                     ]
@@ -912,12 +1136,26 @@ def test_records_unconditional_sort():
             p.db = _UnsortedDB()
 
             recs = await p._takeover_query(_UMO_GROUP, "c1", "u1")
-            assert recs[0]["content"] == "earlier", f"应按时间排序，实际首条: {recs[0]['content']}"
+            assert [item["content"] for item in recs] == [
+                "earlier", "a1", "later", "a2",
+            ], "配对模式必须按 user 时间排序整轮，不能让全局时间线拆散 user/assistant"
+
+            class _MixedDB:
+                async def query_messages_raw(self, *args, **kwargs):
+                    return [
+                        {"role": "user", "content": "later", "created_at": "2026-07-09 11:00:00"},
+                        {"role": "user", "content": "earlier", "created_at": "2026-07-09 10:00:00"},
+                    ]
+
+            p.ct_llm_status_filter = {"llm_success", "proactive"}
+            p.db = _MixedDB()
+            mixed = await p._takeover_query(_UMO_GROUP, "c1", "u1")
+            assert [item["content"] for item in mixed] == ["earlier", "later"]
 
         asyncio.run(_run())
     finally:
         _mod_ns["logger"] = _orig_logger
-    print("[T15] records 无条件 sort ✓")
+    print("[T15] 配对整轮排序 + 混合全局排序 ✓")
 
 
 def test_wal_pragma_registered():
@@ -1213,18 +1451,22 @@ def test_public_api_new_params():
         "_normalize_dt 应把 tz-aware 转 UTC naive"
     assert "if dt.tzinfo is not None:" in _storage_src
 
-    # query_latest 签名含 persona_id/since/until（返回 list[dict]）
+    # query_latest 签名含 persona_id/since/until/keyset（返回 list[dict]）
     assert (
         "persona_id: Optional[str] = None,\n        since: Optional[datetime] = None,\n"
         "        until: Optional[datetime] = None,\n        from_oldest: bool = False,\n"
+        "        after_id: Optional[int] = None,\n"
+        "        content_kind_all_match: bool = False,\n"
         "    ) -> list[dict]:"
-    ) in _storage_src, "query_latest 签名应含 persona_id/since/until"
-    # query_rounds 签名含 persona_id/since/until（返回 list[list[dict]]）
+    ) in _storage_src, "query_latest 签名应含 persona_id/since/until/keyset"
+    # query_rounds 签名含 persona_id/since/until/keyset（返回 list[list[dict]]）
     assert (
         "persona_id: Optional[str] = None,\n        since: Optional[datetime] = None,\n"
         "        until: Optional[datetime] = None,\n        from_oldest: bool = False,\n"
+        "        after_id: Optional[int] = None,\n"
+        "        content_kind_all_match: bool = False,\n"
         "    ) -> list[list[dict]]:"
-    ) in _storage_src, "query_rounds 签名应含 persona_id/since/until"
+    ) in _storage_src, "query_rounds 签名应含 persona_id/since/until/keyset"
     # main.py 透传
     assert "persona_id=persona_id, since=since, until=until," in _main_src, \
         "main.py 应把三参数透传到 db 层"
@@ -1348,6 +1590,51 @@ def test_public_api_new_params():
 
     conn.close()
     print("[T39] 对外 API persona_id/since/until（静态 + 真实 sqlite + EXISTS 语义）✓")
+
+
+def test_composite_cursor_and_public_all_filter():
+    """T52: 公开查询支持严格 (created_at, id) 游标与 SQL 级 ALL 白名单。"""
+    assert '"record_id": int(r[23])' in _storage_src
+    assert "after_id requires since" in _storage_src
+    assert "(created_at = :since AND id > :after_id)" in _storage_src
+    assert "(a.created_at = :since AND a.id > :after_id)" in _storage_src
+    assert "content_kind_all_match=content_kind_all_match" in _main_src
+    assert '"EXISTS (SELECT 1 FROM json_each(content_kind)) "' in _storage_src
+    assert '"AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "' in _storage_src
+    assert '"WHERE value NOT IN :kinds)"' in _storage_src
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE chat_memory_records ("
+        "id INTEGER PRIMARY KEY, created_at DATETIME, content_kind TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO chat_memory_records VALUES (?, ?, ?)",
+        [
+            (1, "2026-07-23 10:00:00", '["text"]'),
+            (2, "2026-07-23 10:00:00", '["text","image"]'),
+            (3, "2026-07-23 10:00:00", '["text"]'),
+            (4, "2026-07-23 10:00:01", '["text"]'),
+        ],
+    )
+    page = conn.execute(
+        "SELECT id FROM chat_memory_records WHERE "
+        "(created_at > ? OR (created_at = ? AND id > ?)) "
+        "ORDER BY created_at ASC, id ASC",
+        ("2026-07-23 10:00:00", "2026-07-23 10:00:00", 1),
+    ).fetchall()
+    assert [row[0] for row in page] == [2, 3, 4]
+
+    strict_all = conn.execute(
+        "SELECT id FROM chat_memory_records WHERE "
+        "EXISTS (SELECT 1 FROM json_each(content_kind)) "
+        "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
+        "WHERE value NOT IN (?)) ORDER BY id",
+        ("text",),
+    ).fetchall()
+    assert [row[0] for row in strict_all] == [1, 3, 4]
+    conn.close()
+    print("[T52] 复合游标 + SQL 级 ALL 白名单 ✓")
 
 
 def test_cron_not_marked_attempted():
@@ -2125,7 +2412,7 @@ def test_schema_v2_and_atomic_finalize_sql():
     selected = conn.execute(
         assignments["_SELECT_COLS"] + " FROM chat_memory_records LIMIT 1"
     ).description
-    assert len(selected) == 23, "_SELECT_COLS 应与 _row_to_dict 的 23 个位置一致"
+    assert len(selected) == 24, "_SELECT_COLS 应与 _row_to_dict 的 24 个位置一致"
 
     columns = {r[1] for r in conn.execute("PRAGMA table_info(chat_memory_records)")}
     assert {"turn_id", "send_status", "relation_data"}.issubset(columns)
@@ -2212,6 +2499,58 @@ def test_after_message_sent_marks_attempted():
     print("[T44] after_message_sent → send_attempted（非 delivered）✓")
 
 
+def test_core_flag_reset_new_detection():
+    """T51: 核心清理标志成立后，从事件文本识别 reset/new。"""
+    p = _make_plugin()
+
+    class _Event:
+        def __init__(self, text):
+            self.message_str = text
+
+        def get_message_str(self):
+            return self.message_str
+
+    for text in ("reset", "/reset", "RESET", "prefix reset"):
+        assert p._get_context_control_command(_Event(text)) == "reset", text
+    for text in ("new", "/new", "NEW", "prefix new"):
+        assert p._get_context_control_command(_Event(text)) == "new", text
+    assert p._get_context_control_command(_Event("unknown")) == ""
+
+    calls = []
+
+    async def _run():
+        async def _cid(umo):
+            return "conversation_demo"
+
+        class _DB:
+            async def count_by_conversation(self, umo, cid):
+                calls.append(("count", umo, cid))
+                return 2
+
+            async def delete_by_conversation(self, umo, cid):
+                calls.append(("delete", umo, cid))
+                return 2
+
+        p._get_curr_cid = _cid
+        p.db = _DB()
+        p._log = lambda *args, **kwargs: None
+        await p._on_reset_or_new(_Event("reset"), _UMO_GROUP, "reset")
+        await p._on_reset_or_new(_Event("new"), _UMO_GROUP, "new")
+
+    original_logger = _mod_ns["logger"]
+    _mod_ns["logger"] = types.SimpleNamespace(
+        warning=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+    )
+    try:
+        asyncio.run(_run())
+    finally:
+        _mod_ns["logger"] = original_logger
+    assert [item[0] for item in calls] == ["count", "delete"]
+    assert "result_text" not in _main_src
+    print("[T51] 核心标志前提下 reset/new 事件文本识别 ✓")
+
+
 def test_terminate_lifecycle():
     """T22: terminate 停止清理循环并释放 DB engine。"""
     import asyncio
@@ -2257,6 +2596,7 @@ def _run_all():
         test_image_text_mixed,
         test_prefix_is_mandatory_and_solo_still_tagged,
         test_full_group_speaker_identity_and_system_instruction,
+        test_cross_session_source_aliases_and_system_instruction,
         test_no_llm_mapping,
         test_takeover_query_matrix,
         test_takeover_mode_selection,
@@ -2272,6 +2612,7 @@ def _run_all():
         test_v236_hardening,
         test_persona_filter_pipeline,
         test_public_api_new_params,
+        test_composite_cursor_and_public_all_filter,
         test_cron_not_marked_attempted,
         test_terminate_lifecycle,
         test_takeover_modes_and_whitelist,
@@ -2285,6 +2626,7 @@ def _run_all():
         test_turn_id_pairing_and_send_status,
         test_schema_v2_and_atomic_finalize_sql,
         test_after_message_sent_marks_attempted,
+        test_core_flag_reset_new_detection,
         test_raw_sql_whitelist,
         test_cross_umo_full_group_mixed_sql,
         test_scope_filter_signature,

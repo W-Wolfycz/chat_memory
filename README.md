@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.1.0`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
+当前发布版本：`1.1.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
 
 ## 特性
 
@@ -87,7 +87,7 @@ CREATE TABLE chat_memory_records (
 
 ### 升级与备份
 
-- 已有 schema v2 数据库可直接启动 1.1.0；迁移仅增加 nullable `relation_data`，旧行内容不重写。
+- 已有 schema v2 数据库可直接启动 1.1.1；首次迁移仅增加 nullable `relation_data`。已有 schema v3 数据库不会重写，1.1.1 后续增加的查询 API 与上下文来源标记也不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -115,8 +115,8 @@ cm = _resolve_chat_memory(context)
 
 | 函数 | 参数 | 返回 |
 |---|---|---|
-| `query_history` | `umo, conversation_id, user_id=None, limit=20, llm_status=None, content_kind=None, role_filter=None, persona_id=None, since=None, until=None, from_oldest=False` | `list[dict]`，按时间正序 |
-| `query_rounds` | `umo, conversation_id, user_id=None, limit_rounds=10, llm_status=None, content_kind=None, persona_id=None, since=None, until=None, from_oldest=False` | `list[list[dict]]`，按 `turn_id` 配对；旧数据回退 `pair_id` |
+| `query_history` | `umo, conversation_id, user_id=None, limit=20, llm_status=None, content_kind=None, role_filter=None, persona_id=None, since=None, until=None, from_oldest=False, after_id=None, content_kind_all_match=False` | `list[dict]`，按时间正序 |
+| `query_rounds` | `umo, conversation_id, user_id=None, limit_rounds=10, llm_status=None, content_kind=None, persona_id=None, since=None, until=None, from_oldest=False, after_id=None, content_kind_all_match=False` | `list[list[dict]]`，按 `turn_id` 配对；旧数据回退 `pair_id` |
 | `build_takeover_contexts` | `umo, user_id, conversation_id=None, persona_id="", exclude_turn_id=""` | `list[dict] \| None`，按当前接管配置构建可直接传给 LLM 的 contexts |
 
 **参数行为**
@@ -130,6 +130,8 @@ cm = _resolve_chat_memory(context)
 - `since` / `until` 给定时按 `created_at` 过滤时间窗口（含端点）；`datetime` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 `CURRENT_TIMESTAMP` 对齐）
 - 返回记录同时提供 `created_at`（配置时区 naive 字符串）和明确的 `created_at_utc`（UTC ISO 8601 字符串）。新调用方应使用 `created_at_utc` 作为 UTC 游标。
 - `from_oldest=false` 保持原行为：选最新 N 条/轮后按时间正序返回；设为 `true` 时从最旧记录开始选 N 条/轮，返回顺序仍为正序。
+- 每条公开查询结果包含内部只读 `record_id`。`since + after_id` 同时提供时使用严格 `(created_at, id)` keyset 下界，适合稳定分页；只传 `since` 时仍保持原有含端点语义。
+- `content_kind_all_match=true` 将 ALL 白名单直接下推 SQLite；默认 `false` 保持原有 ANY 语义。
 - 新关系记录的 `content` 是渲染后的可读文本，`content_template` 是库内原始模板，`relation_data` 是结构化 At/Reply 数据；旧记录的 `relation_data` 为 `None`，不会推测性回填。
 - `query_rounds` 的配对检查会复用 persona / 时间条件，避免过滤后返回孤立 user
 
@@ -145,6 +147,7 @@ cm = _resolve_chat_memory(context)
 - `context_takeover.enable=false` 时返回 `None`
 - 接管已启用但 CID、用户范围、查询记录或规整结果为空时返回 `[]`
 - 完整复用 CM 当前接管查询与规整逻辑，自动遵循 scope、状态、内容白名单、Persona、固定身份前缀、条数和字符预算
+- `cross_session=true` 且结果实际包含其他会话时，来源使用请求内匿名短标记：当前会话不加标记，其他群聊为 `[群1]` / `[群2]`，其他私聊为 `[私1]`；同一请求内稳定复用，真实群号、群名和 UMO 不进入 contexts
 - 只读构建 contexts：不清理 AstrBot native history、不修改数据库，也不修改调用方请求对象
 - `conversation_id=None` 时读取该 UMO 的当前 CID；没有当前 CID 时返回 `[]`
 - `user_id=""` 仅在 `full_group=true` 且 UMO 确为群聊时允许；此时忽略 `cross_session`，严格限制为当前 UMO + 当前 CID 的整群记录。其他情况返回 `[]`
@@ -207,6 +210,7 @@ CM 在所有 `on_llm_request` 钩子中最后执行（priority=-100）；注入�
 
 > **full_group 仅群聊生效**：私聊自动降级为本用户。
 > **隐私**：full_group 开启后，群内其他人发言及昵称会注入 LLM。时间、发送者和身份前缀属于正确归因所需的协议字段，不提供关闭选项。
+> **跨会话来源**：无来源标记表示当前会话；`[群N]` / `[私N]` / `[会N]` 表示其他来源，同一标记只在本次请求内有效。跨会话查询的其他来源 user 历史必定属于当前 `user_id`，来源标签优先，不再重复添加“本人”标签；来源字段缺失时使用 `[未知]`，不进行猜测或跨来源归并。
 > **scope 实现**：storage 层 `_scope_filter(umo, user_id, cross_umo, full_group)` 按 4 种组合构造 WHERE — F/F=`umo+user_id`、T/F=`platform_id+user_id`、F/T=`umo`、T/T=前两者 OR。跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 保证 user/assistant 在同一 umo 内配对。空 `user_id` 不允许进入跨 UMO scope：仅 `full_group` 可降级到当前 UMO，公开 API 会进一步固定当前 CID。
 
 ### 状态过滤
@@ -252,12 +256,63 @@ user 历史始终带时间和发送者前缀，不再提供关闭配置：
 
 ```text
 [MM/DD HH:MM:SS] [当前发言者] SenderName: content
-[MM/DD HH:MM:SS] [其他发言者] SenderName: content
+[MM/DD HH:MM:SS] OtherSenderName: content
 ```
 
-如果公开 API 调用方未提供 `user_id`，使用中性的 `[发言者]`。ChatMemory 自身接管还会向 `system_prompt` 追加固定的群聊解释规则，要求模型按标记分别归因；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
+已知当前 `user_id` 时，当前会话中只给当前用户添加 `[当前发言者]`，当前会话内未标记消息表示群内其他成员，减少重复 token；每段仍保留实际昵称。跨会话的 `[群N]` / `[私N]` / `[会N]` 标签优先于这条群内规则，且其 user 历史已由查询范围保证属于当前用户。若公开 API 调用方未提供 `user_id`，则无法建立“当前”参照，继续给所有人使用中性的 `[发言者]`。ChatMemory 自身接管还会向 `system_prompt` 追加固定解释规则；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
 
-配对 assistant 不加前缀（角色已明确是 bot 自身）；单边 assistant 使用 `[MM/DD HH:MM:SS] [主动]` / `[未配对]`。
+开启 `cross_session` 时，其他来源的 user 带短来源标记，当前会话保持零额外来源 token。查询范围已经保证其他来源的 user 属于当前 `user_id`，不再添加“本人”标签。成功配对模式中，assistant 的 role 已明确，直接继承紧邻 user 的来源；主动/孤立 assistant 因没有可继承的 user 而保留来源标记。混合状态模式可能拆开配对，因此外部来源 assistant 也会显式标记。单边 assistant 使用 `[MM/DD HH:MM:SS] [主动]` / `[未配对]`。
+
+例如，`ProviderRequest.contexts` 的成功配对模式实际是 OpenAI 兼容的 JSON：
+
+```json
+[
+  {
+    "role": "user",
+    "content": "[07/23 19:00:00] [当前发言者] Alice: 当前群消息",
+    "_no_save": true
+  },
+  {
+    "role": "assistant",
+    "content": "当前群回答",
+    "_no_save": true
+  },
+  {
+    "role": "user",
+    "content": "[07/23 20:00:00] [群1] Alice: 另一个群的历史消息",
+    "_no_save": true
+  },
+  {
+    "role": "assistant",
+    "content": "另一个群中的历史回复",
+    "_no_save": true
+  },
+  {
+    "role": "user",
+    "content": "[07/23 21:00:00] [私1] Alice: 私聊历史消息",
+    "_no_save": true
+  },
+  {
+    "role": "assistant",
+    "content": "私聊回答",
+    "_no_save": true
+  }
+]
+```
+
+这里不是给 assistant 文本再加一层 `[群1]`：`role="assistant"` 已经表示这是 Bot
+回复，且在成功配对模式中它紧跟带 `[群1]` 的 user，来源由相邻轮次继承。只有混合
+状态导致 assistant 可能与对应 user 分离时，assistant 才会显式带来源，例如：
+
+```json
+{
+  "role": "assistant",
+  "content": "[群1] 外群中的未配对/混合状态回复",
+  "_no_save": true
+}
+```
+
+短标记只在单次请求内编号，不持久化，也不受群昵称变化影响。没有实际其他来源时不会注入跨会话说明，避免无效 token。
 
 ### 配置项
 
@@ -313,7 +368,7 @@ user 历史始终带时间和发送者前缀，不再提供关闭配置：
 ## 已知限制
 
 - **首条消息是非 LLM 命令时漏存**：cid 尚未创建，且无 LLM 钩子兜底
-- **/reset 与 /new 区分靠文本匹配**：AstrBot 未提供官方区分 API；若 bot 回复碰巧含 "reset" 字样会误判清库
+- **信任核心 `/reset` / `/new` 标志**：仅在 AstrBot 核心设置 `_clean_group_context_session` 后，CM 才从当前事件文本中查找 `reset` 或 `new` 以区分操作；不再根据 Bot 回复文本猜测。若可信标志存在却无法识别命令，CM 记录异常并放弃本次会话操作。
 
 ## 依赖
 

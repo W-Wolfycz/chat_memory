@@ -41,6 +41,7 @@ from .message_classifier import (
     extract_text as _extract_text_impl,
 )
 from .context_builder import (
+    CROSS_SESSION_CONTEXT_INSTRUCTION,
     FULL_GROUP_CONTEXT_INSTRUCTION,
     TakeoverContextBuilder,
     extract_time_str as _extract_time_str_impl,
@@ -549,6 +550,12 @@ class ChatMemoryPlugin(Star):
 
         if self.ct_full_group and self._is_group_umo(umo):
             self._append_full_group_instruction(req)
+        if (
+            self.ct_cross_session
+            and user_id
+            and self._has_cross_session_labels(contexts)
+        ):
+            self._append_cross_session_instruction(req)
         req.contexts = contexts
 
         if self.ct_clear_native_history:
@@ -627,11 +634,17 @@ class ChatMemoryPlugin(Star):
 
         try:
             if is_pair_only:
-                # 配对模式：按轮数
+                # 配对模式：按 user 时间排序整轮，并保持 user/assistant 相邻。
                 rounds = await self.db.query_rounds_raw(
                     umo, target_cid, user_id, limit, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
+                )
+                rounds.sort(
+                    key=lambda rnd: (
+                        str(rnd[0].get("created_at") or "") if rnd else "",
+                        int(rnd[0].get("record_id") or 0) if rnd else 0,
+                    )
                 )
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
@@ -643,9 +656,7 @@ class ChatMemoryPlugin(Star):
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
                     exclude_turn_id=exclude_turn_id or None,
                 )
-
-            # 防御性全局排序（混合模式下 messages_raw 已排序，但保持一致）
-            if records:
+                # 混合模式没有严格轮次结构，按全局时间线排序。
                 records.sort(key=lambda r: r.get("created_at") or "")
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
@@ -662,11 +673,16 @@ class ChatMemoryPlugin(Star):
         current_user_id: str = "",
         full_group: bool = False,
         target_map: Optional[dict[tuple[str, str], dict]] = None,
+        cross_session: bool = False,
+        paired_rounds: bool = False,
     ) -> list[dict]:
         builder = TakeoverContextBuilder(
             media_kinds=_MEDIA_KINDS,
             current_user_id=current_user_id,
             full_group=full_group,
+            current_umo=umo,
+            cross_session=cross_session,
+            paired_rounds=paired_rounds,
             proactive_status=_LLM_PROACTIVE,
             orphan_status=_LLM_ORPHAN,
             target_map=target_map,
@@ -687,6 +703,27 @@ class ChatMemoryPlugin(Star):
             f"{existing}\n\n{FULL_GROUP_CONTEXT_INSTRUCTION}"
             if existing
             else FULL_GROUP_CONTEXT_INSTRUCTION
+        )
+
+    @staticmethod
+    def _append_cross_session_instruction(req: ProviderRequest) -> None:
+        """把跨会话来源规则追加到 system prompt，且同一请求只加一次。"""
+        existing = (getattr(req, "system_prompt", "") or "").strip()
+        if CROSS_SESSION_CONTEXT_INSTRUCTION in existing:
+            return
+        req.system_prompt = (
+            f"{existing}\n\n{CROSS_SESSION_CONTEXT_INSTRUCTION}"
+            if existing
+            else CROSS_SESSION_CONTEXT_INSTRUCTION
+        )
+
+    @staticmethod
+    def _has_cross_session_labels(contexts: list[dict]) -> bool:
+        """仅在规整结果实际含其他/未知来源时启用跨会话提示词。"""
+        markers = ("[群", "[私", "[会", "[未知]")
+        return any(
+            any(marker in str(context.get("content") or "") for marker in markers)
+            for context in contexts
         )
 
     @staticmethod
@@ -723,9 +760,16 @@ class ChatMemoryPlugin(Star):
         if not umo:
             return
 
-        # /reset / /new 检测
+        # /reset / /new 检测：信任 AstrBot 核心设置的会话清理标志，再从当前
+        # 事件文本中识别具体命令；不依赖可能被本地化或改写的 Bot 回复文本。
         if event.get_extra("_clean_group_context_session"):
-            await self._on_reset_or_new(event, umo)
+            control_command = self._get_context_control_command(event)
+            if control_command:
+                await self._on_reset_or_new(event, umo, control_command)
+                return
+            logger.warning(
+                f"{self._log_prefix(event)} 核心会话清理标志存在，但事件文本无法区分 reset/new"
+            )
             return
 
         result = event.get_result()
@@ -831,34 +875,41 @@ class ChatMemoryPlugin(Star):
 
     # ── reset / new 处理 ─────────────────────────────
 
-    async def _on_reset_or_new(self, event: AstrMessageEvent, umo: str):
-        """区分 /reset 和 /new，分别处理。
+    @staticmethod
+    def _get_context_control_command(event: AstrMessageEvent) -> str:
+        """在核心可信清理标志成立后，从事件文本区分 ``reset`` / ``new``。"""
+        try:
+            message = event.get_message_str()
+        except Exception:
+            message = getattr(event, "message_str", "")
+        message = str(message or "").lower()
+        if "reset" in message:
+            return "reset"
+        if "new" in message:
+            return "new"
+        return ""
+
+    async def _on_reset_or_new(
+        self,
+        event: AstrMessageEvent,
+        umo: str,
+        command: str,
+    ):
+        """按已经严格识别的 ``reset`` / ``new`` 分别处理。
 
         /reset: CID 不变，清空历史 → 清除该 CID 下所有存档记录。
         /new:   产生新 CID → 旧 CID 记录保留。
-
-        ⚠️ 已知脆弱点：AstrBot 仅提供 ``_clean_group_context_session`` extra 标识
-        "属于 reset/new 类"，不区分具体哪个。这里靠 result 文本含 "reset" 区分——
-        若 bot 回复内容里碰巧含 "reset" 字样（如"已重置"翻译为英文回复），会误判为 /reset
-        并清库。AstrBot 当前无官方区分 API，这是无奈之举。
         """
         cid = await self._get_curr_cid(umo)
         if not cid:
             return
 
-        result = event.get_result()
-        result_text = ""
-        if result and result.chain:
-            result_text = "".join(
-                comp.text for comp in result.chain if isinstance(comp, Plain)
-            )
-
-        if "reset" in result_text.lower():
-            # 删除前 SELECT count + warning（审计痕迹，CR1 P1-2）：误判时日志可追溯
+        if command == "reset":
+            # 删除前 SELECT count + warning，保留可追溯审计痕迹。
             count = await self.db.count_by_conversation(umo, cid)
             if count > 0:
                 logger.warning(
-                    f"{self._log_prefix(event)} /reset 即将清除 CID={cid[:8]} 下 {count} 条存档（不可逆，result_text 命中 'reset'）"
+                    f"{self._log_prefix(event)} /reset 即将清除 CID={cid[:8]} 下 {count} 条存档（不可逆）"
                 )
                 deleted = await self.db.delete_by_conversation(umo, cid)
                 logger.info(f"{self._log_prefix(event)} /reset 完成：实际清除 {deleted} 条")
@@ -882,20 +933,26 @@ class ChatMemoryPlugin(Star):
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         from_oldest: bool = False,
+        after_id: Optional[int] = None,
+        content_kind_all_match: bool = False,
     ) -> list[dict]:
         """查询会话历史。``user_id`` 为空时返回该会话所有用户的混合记录（群聊场景）。
 
         ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
-        ``content_kind`` 支持 str 或 list[str]：返回 content_kind JSON 数组中**任一包含**这些值的记录。
+        ``content_kind`` 支持 str 或 list[str]；``content_kind_all_match=True``
+        时使用严格白名单语义（非空且全部 kind 都在白名单内）。
         ``role_filter`` 给定时仅返回 role 匹配的记录（``'user'`` / ``'assistant'``）。
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点，tz-aware 自动转 UTC）。
+        ``after_id`` 与 ``since`` 同时提供时使用严格 ``(created_at, id)`` 下界。
         ``from_oldest=True`` 时从最旧记录开始截取；返回顺序始终为时间正序。
         """
         return await self.db.query_latest(
             umo, conversation_id, user_id, limit, llm_status, content_kind, role_filter,
             persona_id=persona_id, since=since, until=until,
             from_oldest=from_oldest,
+            after_id=after_id,
+            content_kind_all_match=content_kind_all_match,
         )
 
     async def query_rounds(
@@ -910,19 +967,24 @@ class ChatMemoryPlugin(Star):
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         from_oldest: bool = False,
+        after_id: Optional[int] = None,
+        content_kind_all_match: bool = False,
     ) -> list[list[dict]]:
         """按轮次返回 user-assistant 配对。每轮 ``[user_dict, assistant_dict]`` 两条。
 
         ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 仍按配对字段返回）。
         ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``。user + assistant 都加。
-        ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加，保证配对
-        在时间窗口内；EXISTS 子查不限时间，保持"有配对"语义）。
+        ``since`` / ``until`` 给定时按 ``created_at`` 过滤（user + assistant 都加）。
+        ``after_id`` 与 ``since`` 同时提供时使用严格 ``(created_at, id)`` 下界；
+        ``content_kind_all_match=True`` 时使用严格内容白名单语义。
         ``from_oldest=True`` 时从最旧完整轮次开始截取；返回顺序始终为时间正序。
         """
         return await self.db.query_rounds(
             umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
             persona_id=persona_id, since=since, until=until,
             from_oldest=from_oldest,
+            after_id=after_id,
+            content_kind_all_match=content_kind_all_match,
         )
 
     async def build_takeover_contexts(
@@ -939,7 +1001,10 @@ class ChatMemoryPlugin(Star):
 
         - ``None``：``context_takeover.enable=false``；
         - ``[]``：接管已启用，但会话、用户范围或规整后的记录为空；
-        - ``list[dict]``：已按当前接管配置完成查询、前缀增强与边界裁剪。
+        - ``list[dict]``：已按当前接管配置完成查询、前缀增强与边界裁剪。开启
+          ``cross_session`` 且结果含其他来源时，其他来源的 user 会带请求内匿名的
+          ``[群1]`` / ``[私1]`` / ``[会1]`` 标记；paired assistant 继承前一条 user
+          的来源，当前会话不加来源标记。
 
         本方法不清理 AstrBot native history、不修改请求对象，也不写数据库。调用方未提供
         ``conversation_id`` 时会读取 ``umo`` 的当前 conversation。空 ``user_id`` 仅在
@@ -992,6 +1057,8 @@ class ChatMemoryPlugin(Star):
             max_chars=self.ct_max_context_chars,
             current_user_id=user_id,
             full_group=effective_full_group,
+            cross_session=self.ct_cross_session and bool(user_id),
+            paired_rounds=not mixed_mode,
             target_map=target_map,
         )
 

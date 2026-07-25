@@ -12,9 +12,12 @@ import sqlite3
 import sys
 import tempfile
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
+
+from sqlalchemy import text
 
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -316,6 +319,73 @@ async def _run() -> None:
                 assert oldest_round[0][0]["content"] == "最旧轮问题"
                 assert latest_round[0][0]["content"] == "最新轮问题"
 
+                # 同时间戳跨页必须依靠 (created_at, id) 严格推进，不能用 +1 微秒
+                # 跳过仍位于同一时间戳的后续记录。
+                for index, kinds in enumerate(
+                    (["text"], ["text", "image"], ["text"], ["text"]), 1
+                ):
+                    await db.insert(
+                        "platform_demo:FriendMessage:10001",
+                        "conversation_keyset",
+                        "10001",
+                        "user",
+                        f"游标记录{index}",
+                        llm_status="llm_success",
+                        content_kind=kinds,
+                        turn_id=f"turn_keyset_{index}",
+                    )
+                async with db.async_session() as session:
+                    await session.execute(
+                        text(
+                            "UPDATE chat_memory_records "
+                            "SET created_at = '2026-07-23 10:00:00' "
+                            "WHERE conversation_id = 'conversation_keyset'"
+                        )
+                    )
+                    await session.commit()
+
+                first_page = await db.query_latest(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_keyset",
+                    "10001",
+                    limit=2,
+                    from_oldest=True,
+                )
+                second_page = await db.query_latest(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_keyset",
+                    "10001",
+                    limit=10,
+                    since=datetime(2026, 7, 23, 10, 0, 0),
+                    after_id=first_page[-1]["record_id"],
+                    from_oldest=True,
+                )
+                combined_ids = [
+                    item["record_id"] for item in first_page + second_page
+                ]
+                assert len(combined_ids) == len(set(combined_ids)) == 4
+                assert [item["content"] for item in first_page + second_page] == [
+                    "游标记录1",
+                    "游标记录2",
+                    "游标记录3",
+                    "游标记录4",
+                ]
+
+                strict_all = await db.query_latest(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_keyset",
+                    "10001",
+                    limit=10,
+                    content_kind=["text"],
+                    content_kind_all_match=True,
+                    from_oldest=True,
+                )
+                assert [item["content"] for item in strict_all] == [
+                    "游标记录1",
+                    "游标记录3",
+                    "游标记录4",
+                ]
+
                 mixed = await db.query_messages_raw(
                     "platform_demo:FriendMessage:10001",
                     "conversation_demo",
@@ -332,7 +402,7 @@ async def _run() -> None:
                     assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
                     assert conn.execute(
                         "SELECT COUNT(*) FROM chat_memory_records"
-                    ).fetchone()[0] == 7
+                    ).fetchone()[0] == 11
             finally:
                 await db.engine.dispose()
         finally:
