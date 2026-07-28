@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.1.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
+当前发布版本：`1.1.2`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
 
 ## 特性
 
@@ -87,7 +87,7 @@ CREATE TABLE chat_memory_records (
 
 ### 升级与备份
 
-- 已有 schema v2 数据库可直接启动 1.1.1；首次迁移仅增加 nullable `relation_data`。已有 schema v3 数据库不会重写，1.1.1 后续增加的查询 API 与上下文来源标记也不修改表结构或既有记录。
+- 已有 schema v2 数据库可直接启动 1.1.2；首次迁移仅增加 nullable `relation_data`。已有 schema v3 数据库不会重写，1.1.2 的提示词优化、查询 API 与上下文来源标记也不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -259,7 +259,7 @@ user 历史始终带时间和发送者前缀，不再提供关闭配置：
 [MM/DD HH:MM:SS] OtherSenderName: content
 ```
 
-已知当前 `user_id` 时，当前会话中只给当前用户添加 `[当前发言者]`，当前会话内未标记消息表示群内其他成员，减少重复 token；每段仍保留实际昵称。跨会话的 `[群N]` / `[私N]` / `[会N]` 标签优先于这条群内规则，且其 user 历史已由查询范围保证属于当前用户。若公开 API 调用方未提供 `user_id`，则无法建立“当前”参照，继续给所有人使用中性的 `[发言者]`。ChatMemory 自身接管还会向 `system_prompt` 追加固定解释规则；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
+已知当前 `user_id` 时，当前会话中只给当前用户添加 `[当前发言者]`，当前会话内未标记消息表示群内其他成员，减少重复 token；每段仍保留实际昵称。跨会话的 `[群N]` / `[私N]` / `[会N]` 标签优先于这条群内规则，且其 user 历史已由查询范围保证属于当前用户。若公开 API 调用方未提供 `user_id`，则无法建立“当前”参照，继续给所有人使用中性的 `[发言者]`。ChatMemory 自身接管还会向 `system_prompt` 追加固定解释规则，明确 `[当前发言者]` 只是交互对象而非 assistant 应续写扮演的角色，`role=assistant` 才是 assistant 自己的历史回复；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
 
 开启 `cross_session` 时，其他来源的 user 带短来源标记，当前会话保持零额外来源 token。查询范围已经保证其他来源的 user 属于当前 `user_id`，不再添加“本人”标签。成功配对模式中，assistant 的 role 已明确，直接继承紧邻 user 的来源；主动/孤立 assistant 因没有可继承的 user 而保留来源标记。混合状态模式可能拆开配对，因此外部来源 assistant 也会显式标记。单边 assistant 使用 `[MM/DD HH:MM:SS] [主动]` / `[未配对]`。
 

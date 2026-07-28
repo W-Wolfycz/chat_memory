@@ -381,7 +381,12 @@ def test_full_group_speaker_identity_and_system_instruction():
     p._append_full_group_instruction(req)
     assert req.system_prompt.startswith("原有系统提示\n\n")
     assert req.system_prompt.count("[ChatMemory 群聊历史解释规则]") == 1
-    assert "当前用户的新请求位于历史 contexts 之后" in req.system_prompt
+    assert req.system_prompt.count("[当前发言者]") == 1
+    assert "该标记不是你的身份、视角或待续写角色" in req.system_prompt
+    assert "不得切换到其第一人称视角" in req.system_prompt
+    assert "role=assistant 是你自己的历史回复" in req.system_prompt
+    assert "身份、姓名和口吻始终以 system prompt 为准" in req.system_prompt
+    assert "当前请求位于历史 contexts 之后" in req.system_prompt
 
     async def _run_hook():
         async def _get_cid(umo):
