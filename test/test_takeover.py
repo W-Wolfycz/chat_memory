@@ -2398,7 +2398,7 @@ def test_current_turn_focus_late_hook():
         assert untouched_req.system_prompt == "人格"
 
     asyncio.run(_run())
-    assert "@filter.on_llm_request(priority=-299)" in _main_src
+    assert "@filter.on_llm_request(priority=-1000)" in _main_src
     print("[T55] 当前轮末尾锚 + 历史 user 边界 + 临时注入幂等 ✓")
 
 

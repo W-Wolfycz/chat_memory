@@ -524,7 +524,7 @@ class ChatMemoryPlugin(Star):
     async def take_over_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """接管 req.contexts，注入 CM 数据 + 清空 native history。
 
-        priority=-100 晚于常规钩子执行；最终当前轮焦点由 priority=-299 的独立钩子补齐。
+        priority=-100 晚于常规钩子执行；最终当前轮焦点由 priority=-1000 的独立钩子补齐。
         与 mark_llm_triggered(默认 0) 顺序：先标记 llm_pending，后接管（CM 已落库再读取）。
         """
         if not self.ct_enable:
@@ -580,7 +580,7 @@ class ChatMemoryPlugin(Star):
             f"cid={cid[:8]})"
         )
 
-    @filter.on_llm_request(priority=-299)
+    @filter.on_llm_request(priority=-1000)
     async def inject_current_turn_focus(
         self,
         event: AstrMessageEvent,

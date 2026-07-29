@@ -195,7 +195,7 @@ contexts = await cm.build_takeover_contexts(
 
 默认采用**严格接管**：即使 CM 查询无数据或过滤后为空，也会显式把 `req.contexts` 置空，不会静默回退到 native history。若确实需要兼容回退，可开启 `fallback_to_native_on_empty`。
 
-CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚阶段 `priority=-299` 追加，尽量位于其他记忆/上下文注入之后。AstrBot 仍按 priority 从大到小执行，第三方插件若注册更低值仍可继续修改请求。CM 新增的焦点 part 使用 `mark_as_temp()`，不写入 native history。
+CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚阶段 `priority=-1000` 追加，尽量位于其他记忆/上下文注入之后。AstrBot 仍按 priority 从大到小执行，第三方插件若注册更低值仍可继续修改请求。CM 新增的焦点 part 使用 `mark_as_temp()`，不写入 native history。
 
 ### 接管范围
 

@@ -6,7 +6,7 @@ ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开
 
 ### 中性来源 XML、当前轮 Reply/At 焦点与历史尾部隔离
 
-- contexts 接管继续保持 `priority=-100`；新增 `priority=-299` 的晚阶段焦点钩子，仅在 CM takeover 实际生效时运行，并在现有 `extra_user_content_parts` 末尾追加临时 `<cm_current>`。
+- contexts 接管继续保持 `priority=-100`；新增 `priority=-1000` 的晚阶段焦点钩子，仅在 CM takeover 实际生效时运行，并在现有 `extra_user_content_parts` 末尾追加临时 `<cm_current>`。
 - 普通消息使用最短 `<cm_current/>`；Reply/At 消息以 XML mixed content 保留 At 原始位置，指向 Bot 时统一写 `target="assistant"`，其他目标只写昵称，不泄露账号 ID。
 - 不重复 AstrBot 已提供的 `<Quoted Message>` 引用全文，不给当前消息增加时间；当前锚使用 `mark_as_temp()`，不写入 native history 或 CM 数据库。
 - 当最终历史 contexts 以 `role=user` 结尾时，临时追加 `<cm_history_tail/>`，固定规则明确最终 role=user 才是当前请求，禁止改答历史尾部或把交互对象续写/扮演成 assistant 自身。
