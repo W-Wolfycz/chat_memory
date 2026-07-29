@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.1.2`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
+当前发布版本：`1.1.3`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
 
 ## 特性
 
@@ -87,7 +87,7 @@ CREATE TABLE chat_memory_records (
 
 ### 升级与备份
 
-- 已有 schema v2 数据库可直接启动 1.1.2；首次迁移仅增加 nullable `relation_data`。已有 schema v3 数据库不会重写，1.1.2 的提示词优化、查询 API 与上下文来源标记也不修改表结构或既有记录。
+- 已有 schema v2 数据库可直接启动 1.1.3；首次迁移仅增加 nullable `relation_data`。已有 schema v3 数据库不会重写；1.1.3 的来源 XML 与当前轮焦点锚都只改变请求时展示，不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -147,7 +147,7 @@ cm = _resolve_chat_memory(context)
 - `context_takeover.enable=false` 时返回 `None`
 - 接管已启用但 CID、用户范围、查询记录或规整结果为空时返回 `[]`
 - 完整复用 CM 当前接管查询与规整逻辑，自动遵循 scope、状态、内容白名单、Persona、固定身份前缀、条数和字符预算
-- `cross_session=true` 且结果实际包含其他会话时，来源使用请求内匿名短标记：当前会话不加标记，其他群聊为 `[群1]` / `[群2]`，其他私聊为 `[私1]`；同一请求内稳定复用，真实群号、群名和 UMO 不进入 contexts
+- `cross_session=true` 且结果实际包含其他会话时，使用请求内中性 XML 元数据：当前会话不加标记，其他来源统一为 `<cm s="1"/>` / `<cm s="2"/>`；同一请求内稳定复用，来源类型、真实群号、群名和 UMO 不进入 contexts
 - 只读构建 contexts：不清理 AstrBot native history、不修改数据库，也不修改调用方请求对象
 - `conversation_id=None` 时读取该 UMO 的当前 CID；没有当前 CID 时返回 `[]`
 - `user_id=""` 仅在 `full_group=true` 且 UMO 确为群聊时允许；此时忽略 `cross_session`，严格限制为当前 UMO + 当前 CID 的整群记录。其他情况返回 `[]`
@@ -195,7 +195,7 @@ contexts = await cm.build_takeover_contexts(
 
 默认采用**严格接管**：即使 CM 查询无数据或过滤后为空，也会显式把 `req.contexts` 置空，不会静默回退到 native history。若确实需要兼容回退，可开启 `fallback_to_native_on_empty`。
 
-CM 在所有 `on_llm_request` 钩子中最后执行（priority=-100）；注入内容标 `_no_save`，不回写 native。
+CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚阶段 `priority=-299` 追加，尽量位于其他记忆/上下文注入之后。AstrBot 仍按 priority 从大到小执行，第三方插件若注册更低值仍可继续修改请求。CM 新增的焦点 part 使用 `mark_as_temp()`，不写入 native history。
 
 ### 接管范围
 
@@ -210,7 +210,7 @@ CM 在所有 `on_llm_request` 钩子中最后执行（priority=-100）；注入�
 
 > **full_group 仅群聊生效**：私聊自动降级为本用户。
 > **隐私**：full_group 开启后，群内其他人发言及昵称会注入 LLM。时间、发送者和身份前缀属于正确归因所需的协议字段，不提供关闭选项。
-> **跨会话来源**：无来源标记表示当前会话；`[群N]` / `[私N]` / `[会N]` 表示其他来源，同一标记只在本次请求内有效。跨会话查询的其他来源 user 历史必定属于当前 `user_id`，来源标签优先，不再重复添加“本人”标签；来源字段缺失时使用 `[未知]`，不进行猜测或跨来源归并。
+> **跨会话来源**：无来源元数据表示当前会话；`<cm s="N"/>` 表示其他来源，同一编号只在本次请求内有效，`<cm s="?"/>` 表示来源字段不足。N 不编码群聊/私聊类型、人物、时间顺序或重要性。跨会话查询的其他来源 user 历史必定属于当前 `user_id`，不再重复添加“本人”标签，也不进行猜测或跨来源归并。
 > **scope 实现**：storage 层 `_scope_filter(umo, user_id, cross_umo, full_group)` 按 4 种组合构造 WHERE — F/F=`umo+user_id`、T/F=`platform_id+user_id`、F/T=`umo`、T/T=前两者 OR。跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 保证 user/assistant 在同一 umo 内配对。空 `user_id` 不允许进入跨 UMO scope：仅 `full_group` 可降级到当前 UMO，公开 API 会进一步固定当前 CID。
 
 ### 状态过滤
@@ -259,9 +259,47 @@ user 历史始终带时间和发送者前缀，不再提供关闭配置：
 [MM/DD HH:MM:SS] OtherSenderName: content
 ```
 
-已知当前 `user_id` 时，当前会话中只给当前用户添加 `[当前发言者]`，当前会话内未标记消息表示群内其他成员，减少重复 token；每段仍保留实际昵称。跨会话的 `[群N]` / `[私N]` / `[会N]` 标签优先于这条群内规则，且其 user 历史已由查询范围保证属于当前用户。若公开 API 调用方未提供 `user_id`，则无法建立“当前”参照，继续给所有人使用中性的 `[发言者]`。ChatMemory 自身接管还会向 `system_prompt` 追加固定解释规则，明确 `[当前发言者]` 只是交互对象而非 assistant 应续写扮演的角色，`role=assistant` 才是 assistant 自己的历史回复；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
+已知当前 `user_id` 时，当前会话中只给当前用户添加 `[当前发言者]`，当前会话内未标记消息表示群内其他成员，减少重复 token；每段仍保留实际昵称。跨会话的 `<cm s="N"/>` 元数据只负责区分外部来源，且其 user 历史已由查询范围保证属于当前用户。若公开 API 调用方未提供 `user_id`，则无法建立“当前”参照，继续给所有人使用中性的 `[发言者]`。ChatMemory 自身接管还会向 `system_prompt` 追加固定解释规则，明确 `[当前发言者]` 只是交互对象而非 assistant 应续写扮演的角色，`role=assistant` 才是 assistant 自己的历史回复；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
 
-开启 `cross_session` 时，其他来源的 user 带短来源标记，当前会话保持零额外来源 token。查询范围已经保证其他来源的 user 属于当前 `user_id`，不再添加“本人”标签。成功配对模式中，assistant 的 role 已明确，直接继承紧邻 user 的来源；主动/孤立 assistant 因没有可继承的 user 而保留来源标记。混合状态模式可能拆开配对，因此外部来源 assistant 也会显式标记。单边 assistant 使用 `[MM/DD HH:MM:SS] [主动]` / `[未配对]`。
+### 当前轮焦点与 Reply / At
+
+AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `contexts`。1.1.3 会在本轮 user 的所有既有临时内容之后，追加一个最短的当前轮 XML 锚：
+
+- 普通消息、没有 Reply/At：`<cm_current/>`
+- Reply/At：使用 `<reply>` / `<mention>`，正文中的 At 保持原始位置
+- Reply/At 指向 Bot self ID：只写 `target="assistant"`；其他成员只写昵称，不向 LLM 暴露账号 ID
+- AstrBot 已生成的 `<Quoted Message>` 继续负责引用原文；CM 不重复快照全文
+- 若历史 `contexts` 恰好以 `role=user` 结尾，仅在该请求副本末尾加 `<cm_history_tail/>`，明确它不是当前消息
+- 当前消息不加时间：它本来就是 provider 正在处理的最新 user；历史时间前缀保持不变
+
+例如，用户 Reply Bot 的一段话，并在正文中间再次 At Bot 时，最终请求的关键部分会类似：
+
+```json
+{
+  "prompt": "你看，这句话说得对吗？",
+  "contexts": [
+    {
+      "role": "user",
+      "content": "[07/29 20:00:00] [当前发言者] Alice: 上一句较长的历史发言\n<cm_history_tail/>",
+      "_no_save": true
+    }
+  ],
+  "extra_user_content_parts": [
+    {
+      "type": "text",
+      "text": "<Quoted Message>\nAssistantDemo: 被引用的原文\n</Quoted Message>"
+    },
+    {
+      "type": "text",
+      "text": "<cm_current>\n<reply target=\"assistant\"/>\n<message>你看，<mention target=\"assistant\"/> 这句话说得对吗？</message>\n</cm_current>"
+    }
+  ]
+}
+```
+
+最后一个 part 在运行时已 `mark_as_temp()`；部分 dump 工具只调用 Pydantic `model_dump()`，不会显示其私有 `_no_save` 状态。旧版本曾被模型复制进 assistant 正文开头的 `[群N]` / `[私N]` / `[会N]` / `[未知]`，1.1.3 会在构建请求时仅从 assistant 历史开头做展示层清理，不改数据库，也不删除 user 原文中的同样文本。
+
+开启 `cross_session` 时，其他来源的 user 带中性 `<cm s="N"/>` 元数据，当前会话保持零额外来源 token。N 只用于本次请求内的来源等价判断，不携带“群/私/会”语义，也不表示优先级或回答焦点。查询范围已经保证其他来源的 user 属于当前 `user_id`，不再添加“本人”标签。成功配对模式中，assistant 的 role 已明确，直接继承紧邻 user 的来源；主动/孤立 assistant 因没有可继承的 user 而保留来源元数据。混合状态模式可能拆开配对，因此外部来源 assistant 也会显式携带元数据。单边 assistant 使用 `[MM/DD HH:MM:SS] [主动]` / `[未配对]`。
 
 例如，`ProviderRequest.contexts` 的成功配对模式实际是 OpenAI 兼容的 JSON：
 
@@ -279,40 +317,40 @@ user 历史始终带时间和发送者前缀，不再提供关闭配置：
   },
   {
     "role": "user",
-    "content": "[07/23 20:00:00] [群1] Alice: 另一个群的历史消息",
+    "content": "[07/23 20:00:00] <cm s=\"1\"/> Alice: 另一个来源的历史消息",
     "_no_save": true
   },
   {
     "role": "assistant",
-    "content": "另一个群中的历史回复",
+    "content": "另一个来源中的历史回复",
     "_no_save": true
   },
   {
     "role": "user",
-    "content": "[07/23 21:00:00] [私1] Alice: 私聊历史消息",
+    "content": "[07/23 21:00:00] <cm s=\"2\"/> Alice: 第二个外部来源的历史消息",
     "_no_save": true
   },
   {
     "role": "assistant",
-    "content": "私聊回答",
+    "content": "第二个外部来源中的历史回复",
     "_no_save": true
   }
 ]
 ```
 
-这里不是给 assistant 文本再加一层 `[群1]`：`role="assistant"` 已经表示这是 Bot
-回复，且在成功配对模式中它紧跟带 `[群1]` 的 user，来源由相邻轮次继承。只有混合
+这里不是给 assistant 文本再加一层 `<cm s="1"/>`：`role="assistant"` 已经表示这是 Bot
+回复，且在成功配对模式中它紧跟带来源元数据的 user，来源由相邻轮次继承。只有混合
 状态导致 assistant 可能与对应 user 分离时，assistant 才会显式带来源，例如：
 
 ```json
 {
   "role": "assistant",
-  "content": "[群1] 外群中的未配对/混合状态回复",
+  "content": "<cm s=\"1\"/> 外部来源中的未配对/混合状态回复",
   "_no_save": true
 }
 ```
 
-短标记只在单次请求内编号，不持久化，也不受群昵称变化影响。没有实际其他来源时不会注入跨会话说明，避免无效 token。
+来源编号只在单次请求内分配，不持久化，也不受群昵称变化影响。没有实际其他来源时不会注入跨会话说明，避免无效 token。
 
 ### 配置项
 

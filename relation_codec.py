@@ -1,5 +1,6 @@
 """ChatMemory 消息关系模板的编解码工具。"""
 
+from html import escape as xml_escape
 import json
 import re
 from typing import Any, Optional
@@ -75,6 +76,77 @@ def render_content_template(template: str, relation_data: Any) -> str:
 
     rendered = AT_TOKEN_RE.sub(replace, template or "")
     return rendered.replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+
+
+def _current_mention_xml(mention: Any, self_id: str) -> str:
+    if isinstance(mention, dict) and mention.get("all"):
+        target = "all"
+    elif isinstance(mention, dict):
+        target_user_id = str(mention.get("user_id") or "").strip()
+        if self_id and target_user_id == self_id:
+            target = "assistant"
+        else:
+            target = mention_label(mention)
+    else:
+        target = "未知成员"
+    return f'<mention target="{xml_escape(target, quote=True)}"/>'
+
+
+def _current_message_xml(template: str, mentions: list[Any], self_id: str) -> str:
+    """把正文模板转成 XML mixed content，同时保持 At 的原始位置。"""
+    value = template or ""
+    parts: list[str] = []
+    cursor = 0
+    found = False
+    for match in AT_TOKEN_RE.finditer(value):
+        found = True
+        plain = value[cursor:match.start()].replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+        parts.append(xml_escape(plain, quote=True))
+        index = int(match.group(1))
+        mention = mentions[index] if index < len(mentions) else None
+        parts.append(_current_mention_xml(mention, self_id))
+        cursor = match.end()
+    tail = value[cursor:].replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+    parts.append(xml_escape(tail, quote=True))
+
+    # 正常的新消息一定有带索引 placeholder；这里仅为损坏/第三方构造数据保底，
+    # 不猜位置，只按关系数组顺序保留提及对象。
+    if mentions and not found:
+        parts.extend(_current_mention_xml(item, self_id) for item in mentions)
+    return "".join(parts)
+
+
+def build_current_turn_xml(
+    template: str,
+    relation_data: Any,
+    self_id: str,
+) -> str:
+    """构建本轮 Reply/At 焦点锚；只输出昵称或 assistant，不暴露账号 ID。"""
+    data = parse_relation_data(relation_data)
+    if not data:
+        return "<cm_current/>"
+
+    mentions = data.get("mentions") or []
+    reply = data.get("reply")
+    if not mentions and not isinstance(reply, dict):
+        return "<cm_current/>"
+
+    lines = ["<cm_current>"]
+    if isinstance(reply, dict):
+        target_user_id = str(reply.get("target_user_id") or "").strip()
+        if reply.get("target_role") == "assistant" or (
+            self_id and target_user_id == self_id
+        ):
+            target = "assistant"
+        else:
+            target = str(reply.get("target_nickname") or "").strip() or "未知成员"
+        lines.append(f'<reply target="{xml_escape(target, quote=True)}"/>')
+
+    message = _current_message_xml(template, mentions, str(self_id or "").strip())
+    if message:
+        lines.append(f"<message>{message}</message>")
+    lines.append("</cm_current>")
+    return "\n".join(lines)
 
 
 def truncate_reply_snapshot(text: str) -> str:

@@ -2,6 +2,21 @@
 
 ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前为 `3`。
 
+## 1.1.3 — 2026-07-29
+
+### 中性来源 XML、当前轮 Reply/At 焦点与历史尾部隔离
+
+- contexts 接管继续保持 `priority=-100`；新增 `priority=-299` 的晚阶段焦点钩子，仅在 CM takeover 实际生效时运行，并在现有 `extra_user_content_parts` 末尾追加临时 `<cm_current>`。
+- 普通消息使用最短 `<cm_current/>`；Reply/At 消息以 XML mixed content 保留 At 原始位置，指向 Bot 时统一写 `target="assistant"`，其他目标只写昵称，不泄露账号 ID。
+- 不重复 AstrBot 已提供的 `<Quoted Message>` 引用全文，不给当前消息增加时间；当前锚使用 `mark_as_temp()`，不写入 native history 或 CM 数据库。
+- 当最终历史 contexts 以 `role=user` 结尾时，临时追加 `<cm_history_tail/>`，固定规则明确最终 role=user 才是当前请求，禁止改答历史尾部或把交互对象续写/扮演成 assistant 自身。
+- 仅在请求展示层清理旧 assistant 正文开头的 `[群N]` / `[私N]` / `[会N]` / `[未知]` 污染；不修改数据库，也不清理 user 原文或正文中间的同形文本。
+- 数据库 schema 仍为 v3，无迁移、无新增配置；公开 `build_takeover_contexts()` 继续只返回历史 contexts，当前轮锚只由真实 LLM Hook 临时注入。
+- 将重复且带场景语义的 `[群N]` / `[私N]` / `[会N]` 替换为中性 `<cm s="N"/>`；所有外部来源统一按首次出现顺序编号，不再向 LLM 暴露来源类型。
+- 当前会话仍不增加来源元数据，字段不足时使用 `<cm s="?"/>`；paired assistant 继续继承紧邻 user，只有混合或独立 assistant 显式携带元数据。
+- 固定规则明确 N 只是单次请求内的来源等价编号，不代表人物、时间顺序、重要性、场景焦点或回复目标，回答重点始终由当前请求决定。
+- 数据库 schema 仍为 v3，不迁移、不重写既有记录；`build_takeover_contexts()` 的来源展示协议发生变化，调用方应把返回值视为 LLM-ready contexts，不应解析旧方括号标签。
+
 ## 1.1.2 — 2026-07-28
 
 ### 群聊交互对象与 assistant 视角切割

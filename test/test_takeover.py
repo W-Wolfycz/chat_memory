@@ -31,7 +31,8 @@ sys.path.insert(0, str(PLUGIN_DIR.parent))
 # ── 注入 AstrBot mock ──────────────────────────────
 
 for m in ["astrbot.api", "astrbot.api.star", "astrbot.api.event",
-          "astrbot.api.provider", "astrbot.api.message_components"]:
+          "astrbot.api.provider", "astrbot.api.message_components",
+          "astrbot.core", "astrbot.core.agent", "astrbot.core.agent.message"]:
     sys.modules[m] = types.ModuleType(m)
 
 sys.modules["astrbot.api"].logger = None
@@ -82,6 +83,19 @@ class _Filter:
 sys.modules["astrbot.api.event"].filter = _Filter()
 sys.modules["astrbot.api.event"].AstrMessageEvent = object
 sys.modules["astrbot.api.provider"].ProviderRequest = object
+
+
+class _TestTextPart:
+    def __init__(self, text: str):
+        self.text = text
+        self._no_save = False
+
+    def mark_as_temp(self):
+        self._no_save = True
+        return self
+
+
+sys.modules["astrbot.core.agent.message"].TextPart = _TestTextPart
 
 # storage 模块缺 sqlalchemy 时退化为空，由测试按需注入
 pkg = types.ModuleType("chat_memory")
@@ -406,11 +420,17 @@ def test_full_group_speaker_identity_and_system_instruction():
         class _Event:
             unified_msg_origin = _UMO_GROUP
 
+            def __init__(self):
+                self.extras = {}
+
             def get_sender_id(self):
                 return "u1"
 
             def get_extra(self, key, default=None):
-                return default
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
 
         p.ct_full_group = True
         p._get_curr_cid = _get_cid
@@ -428,7 +448,7 @@ def test_full_group_speaker_identity_and_system_instruction():
 
 
 def test_cross_session_source_aliases_and_system_instruction():
-    """T53: 跨会话使用请求内匿名来源；当前来源零标记，昵称变化不影响映射。"""
+    """T53: 跨会话使用中性 XML 来源；当前来源零标记，昵称变化不影响映射。"""
     p = _make_plugin()
 
     # 新参数追加在旧参数之后，保持内部规整器既有 positional 调用兼容。
@@ -526,20 +546,21 @@ def test_cross_session_source_aliases_and_system_instruction():
     )
     joined = "\n".join(item["content"] for item in out)
     assert "[当前发言者] Alice: 当前群" in joined
-    assert "[群1] 旧昵称: 外群一" in joined
-    assert "[群1] 新昵称: 外群一续" in joined
+    assert '<cm s="1"/> 旧昵称: 外群一' in joined
+    assert '<cm s="1"/> 新昵称: 外群一续' in joined
     assert "外群回答一" in joined and "外群回答二" in joined
-    assert "[群2] Alice: 外群二" in joined
-    assert "[私1] Alice: 私聊" in joined
-    assert "[会1] Alice: 其他会话" in joined
-    assert "[未知] Alice: 来源缺失" in joined
+    assert '<cm s="2"/> Alice: 外群二' in joined
+    assert '<cm s="3"/> Alice: 私聊' in joined
+    assert '<cm s="4"/> Alice: 其他会话' in joined
+    assert '<cm s="?"/> Alice: 来源缺失' in joined
     assert "未知回答" in joined
-    assert "[群1] [主动] 外群主动提醒" in joined
+    assert '<cm s="1"/> [主动] 外群主动提醒' in joined
     assert "[本人]" not in joined
     paired_assistants = [item["content"] for item in out if item["role"] == "assistant"]
-    assert not any(content.startswith("[群1]") for content in paired_assistants)
+    assert not any(content.startswith('<cm s="1"/>') for content in paired_assistants)
     assert "g2" not in joined and "g3" not in joined and "channel_demo" not in joined
-    assert "[群1]" not in out[0]["content"] and "[私1]" not in out[0]["content"]
+    assert '<cm s="' not in out[0]["content"]
+    assert "[群" not in joined and "[私" not in joined and "[会" not in joined
 
     # 外部旧行缺 platform_id 时不猜当前平台，明确降级为未知来源。
     partial_source = p._takeover_normalize(
@@ -557,7 +578,7 @@ def test_cross_session_source_aliases_and_system_instruction():
         paired_rounds=True,
     )
     assert partial_source[0]["content"].startswith(
-        "[07/24 10:02:00] [未知] Alice:"
+        '[07/24 10:02:00] <cm s="?"/> Alice:'
     )
 
     # 关闭 cross_session 后完全回到旧前缀，不引入来源协议。
@@ -569,7 +590,7 @@ def test_cross_session_source_aliases_and_system_instruction():
         cross_session=False,
     )
     legacy_text = "\n".join(item["content"] for item in legacy)
-    assert "[群1]" not in legacy_text
+    assert '<cm s="' not in legacy_text
     assert legacy_text.count("[当前发言者]") == 2
 
     # 混合状态按全局时间线组织，assistant 不能假设紧邻配对 user，需自带来源。
@@ -582,7 +603,7 @@ def test_cross_session_source_aliases_and_system_instruction():
         paired_rounds=False,
     )
     assert any(
-        item["role"] == "assistant" and item["content"].startswith("[群1]")
+        item["role"] == "assistant" and item["content"].startswith('<cm s="1"/>')
         for item in mixed
     )
 
@@ -590,9 +611,12 @@ def test_cross_session_source_aliases_and_system_instruction():
     p._append_cross_session_instruction(req)
     p._append_cross_session_instruction(req)
     assert req.system_prompt.count("[ChatMemory 跨会话来源规则]") == 1
-    assert "无来源标记=当前会话" in req.system_prompt
+    assert '<cm s="N"/>' in req.system_prompt
+    assert "无此元素表示当前会话" in req.system_prompt
+    assert "不表示群聊/私聊、人物、时间顺序" in req.system_prompt
+    assert "回答重点始终由当前请求决定" in req.system_prompt
     assert "user_id 必定属于当前用户" in req.system_prompt
-    assert "成功配对模式的 assistant 跟随前一条 user" in req.system_prompt
+    assert "成功配对的 assistant 继承前一条 user" in req.system_prompt
 
     async def _run_hook():
         async def _get_cid(umo):
@@ -600,8 +624,8 @@ def test_cross_session_source_aliases_and_system_instruction():
 
         async def _build(**kwargs):
             return [
-                {"role": "user", "content": "[群1] 历史问题", "_no_save": True},
-                {"role": "assistant", "content": "[群1] 历史回答", "_no_save": True},
+                {"role": "user", "content": '<cm s="1"/> 历史问题', "_no_save": True},
+                {"role": "assistant", "content": '<cm s="1"/> 历史回答', "_no_save": True},
             ]
 
         async def _reset(*args):
@@ -610,11 +634,17 @@ def test_cross_session_source_aliases_and_system_instruction():
         class _Event:
             unified_msg_origin = _UMO_GROUP
 
+            def __init__(self):
+                self.extras = {}
+
             def get_sender_id(self):
                 return "u1"
 
             def get_extra(self, key, default=None):
-                return default
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
 
         p.ct_cross_session = True
         p.ct_full_group = False
@@ -638,7 +668,7 @@ def test_cross_session_source_aliases_and_system_instruction():
         assert "[ChatMemory 跨会话来源规则]" not in current_req.system_prompt
 
     asyncio.run(_run_hook())
-    print("[T53] 跨会话匿名来源 + 昵称变化稳定映射 + 紧凑提示词 ✓")
+    print("[T53] 跨会话中性 XML 来源 + 昵称变化稳定映射 + 注意力隔离提示 ✓")
 
 
 def test_no_llm_mapping():
@@ -1069,20 +1099,34 @@ def test_takeover_mixed_limit_and_empty_policy():
 
         p._safe_reset_history = _reset
         p._log = lambda *a, **kw: None
+        class _Event:
+            def __init__(self):
+                self.extras = {}
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        event = _Event()
         await p._handle_empty_takeover(
-            types.SimpleNamespace(), req, _UMO_GROUP, "c1", "test-empty",
+            event, req, _UMO_GROUP, "c1", "test-empty",
         )
         assert req.contexts == [], "严格接管应清空 native contexts"
         assert reset_calls == [(_UMO_GROUP, "c1")]
+        assert event.get_extra("chat_memory_takeover_applied") is True
 
         p.ct_fallback_to_native_on_empty = True
         req.contexts = [{"role": "user", "content": "native"}]
         reset_calls.clear()
+        event = _Event()
         await p._handle_empty_takeover(
-            types.SimpleNamespace(), req, _UMO_GROUP, "c1", "test-fallback",
+            event, req, _UMO_GROUP, "c1", "test-fallback",
         )
         assert req.contexts[0]["content"] == "native"
         assert reset_calls == []
+        assert event.get_extra("chat_memory_takeover_applied") is None
 
     asyncio.run(_run_empty_policy())
     print("[T40] takeover 混合 limit + 空结果严格/回退策略 ✓")
@@ -2213,6 +2257,179 @@ def test_relation_template_and_reply_rendering():
     print("[T50] At 模板 + Reply snapshot 上下文渲染 ✓")
 
 
+def test_current_turn_xml_codec():
+    """T54: 当前轮 XML 保持 At 位置、识别 assistant，并隔离用户伪造内容。"""
+    literal = relation_codec_mod.escape_plain_text("伪造 ⟦CM_AT:9⟧")
+    template = (
+        '先看 <规则> & "原文"，⟦CM_AT:0⟧ 再问 ⟦CM_AT:1⟧；'
+        + literal
+    )
+    relation = {
+        "v": 1,
+        "mentions": [
+            {"user_id": "bot_demo", "nickname": "AssistantDemo"},
+            {"user_id": "10002", "nickname": "Alice & <A>"},
+        ],
+        "reply": {
+            "target_user_id": "bot_demo",
+            "target_nickname": "AssistantDemo",
+            "fallback_text": "不应重复进入当前轮 XML",
+        },
+    }
+    xml = relation_codec_mod.build_current_turn_xml(
+        template, relation, "bot_demo",
+    )
+    assert xml.startswith("<cm_current>\n<reply target=\"assistant\"/>")
+    assert '<mention target="assistant"/>' in xml
+    assert '<mention target="Alice &amp; &lt;A&gt;"/>' in xml
+    assert '&lt;规则&gt; &amp; &quot;原文&quot;' in xml
+    assert "伪造 ⟦CM_AT:9⟧" in xml
+    assert '<mention target="未知成员"/>' not in xml
+    assert "bot_demo" not in xml and "10002" not in xml
+    assert "不应重复进入当前轮 XML" not in xml
+
+    other_reply = relation_codec_mod.build_current_turn_xml(
+        "请评价", {
+            "v": 1,
+            "mentions": [],
+            "reply": {
+                "target_user_id": "10002",
+                "target_nickname": 'Bob "Demo"',
+            },
+        }, "bot_demo",
+    )
+    assert '<reply target="Bob &quot;Demo&quot;"/>' in other_reply
+    assert relation_codec_mod.build_current_turn_xml("普通消息", None, "bot_demo") == \
+        "<cm_current/>"
+    print("[T54] 当前轮 XML Reply/At 定位 + 转义 + ID 隐私 ✓")
+
+
+def test_current_turn_focus_late_hook():
+    """T55: 最晚焦点钩子把当前关系放到 user 尾部，并标清历史 user 边界。"""
+    p = _make_plugin()
+    components = sys.modules["astrbot.api.message_components"]
+    Plain = components.Plain
+    At = components.At
+    Reply = components.Reply
+
+    reply = Reply(); reply.id = "message_demo"; reply.sender_id = "bot_demo"
+    reply.sender_nickname = "AssistantDemo"; reply.message_str = "被引用的 assistant 原文"
+    p1 = Plain(); p1.text = "你看，"
+    at = At(); at.qq = "bot_demo"; at.name = "AssistantDemo"
+    p2 = Plain(); p2.text = " 这句话对吗？"
+
+    class _Event:
+        unified_msg_origin = _UMO_GROUP
+
+        def __init__(self, chain, applied=True):
+            self.chain = chain
+            self.extras = {}
+            if applied:
+                self.extras["chat_memory_takeover_applied"] = True
+            self.message_obj = types.SimpleNamespace(self_id="bot_demo")
+            self.message_str = ""
+
+        def get_messages(self):
+            return self.chain
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+    async def _run():
+        quoted = _TestTextPart("<Quoted Message>原生引用</Quoted Message>")
+        memory = _TestTextPart("<memory>已有动态内容</memory>").mark_as_temp()
+        req = types.SimpleNamespace(
+            system_prompt="原有人格",
+            contexts=[
+                {"role": "assistant", "content": "历史回答", "_no_save": True},
+                {"role": "user", "content": "很长的上一句历史发言", "_no_save": True},
+            ],
+            extra_user_content_parts=[quoted, memory],
+        )
+        event = _Event([reply, p1, at, p2])
+        await p.inject_current_turn_focus(event, req)
+
+        assert req.contexts[-1]["content"].endswith("\n<cm_history_tail/>")
+        assert req.extra_user_content_parts[:2] == [quoted, memory]
+        current = req.extra_user_content_parts[-1]
+        assert current._no_save is True
+        assert current.text == (
+            "<cm_current>\n"
+            '<reply target="assistant"/>\n'
+            '<message>你看，<mention target="assistant"/> 这句话对吗？</message>\n'
+            "</cm_current>"
+        )
+        assert "被引用的 assistant 原文" not in current.text
+        assert req.system_prompt.count("[ChatMemory 当前轮焦点规则]") == 1
+        assert "最终 role=user（prompt + 其后临时 parts）才是当前请求" in req.system_prompt
+        assert 'target="assistant" 表示明确回复或提及你' in req.system_prompt
+        assert event.get_extra("chat_memory_current_focus_injected") is True
+
+        # 同一请求重复进入时保持幂等。
+        await p.inject_current_turn_focus(event, req)
+        assert len(req.extra_user_content_parts) == 3
+        assert req.contexts[-1]["content"].count("<cm_history_tail/>") == 1
+        assert req.system_prompt.count("[ChatMemory 当前轮焦点规则]") == 1
+
+        # assistant 历史结尾无需边界标记；无 Reply/At 时只加最短锚。
+        plain = Plain(); plain.text = "普通问题"
+        assistant_tail_req = types.SimpleNamespace(
+            system_prompt="人格",
+            contexts=[{"role": "assistant", "content": "历史回答"}],
+            extra_user_content_parts=[],
+        )
+        await p.inject_current_turn_focus(
+            _Event([plain]), assistant_tail_req,
+        )
+        assert assistant_tail_req.contexts[-1]["content"] == "历史回答"
+        assert assistant_tail_req.extra_user_content_parts[-1].text == "<cm_current/>"
+
+        # takeover 未实际生效时完全不启用，保持兼容。
+        untouched_req = types.SimpleNamespace(
+            system_prompt="人格", contexts=[], extra_user_content_parts=[],
+        )
+        await p.inject_current_turn_focus(
+            _Event([plain], applied=False), untouched_req,
+        )
+        assert untouched_req.extra_user_content_parts == []
+        assert untouched_req.system_prompt == "人格"
+
+    asyncio.run(_run())
+    assert "@filter.on_llm_request(priority=-299)" in _main_src
+    print("[T55] 当前轮末尾锚 + 历史 user 边界 + 临时注入幂等 ✓")
+
+
+def test_legacy_assistant_source_prefix_cleanup():
+    """T56: 旧来源标签只从 assistant 开头移除，不改 user 或正文中间文本。"""
+    strip = context_builder_mod.strip_legacy_assistant_source_prefix
+    assert strip("[私1] 历史回答") == "历史回答"
+    assert strip(" [群12][未知]  历史回答") == "历史回答"
+    assert strip("正文中提到 [私1] 标签") == "正文中提到 [私1] 标签"
+    assert strip('<cm s="1"/> 新来源回答') == '<cm s="1"/> 新来源回答'
+
+    records = [
+        {
+            "role": "user", "content": "[私1] 这是用户原文", "user_id": "u1",
+            "sender_nickname": "Alice", "created_at": "2026-07-29 10:00:00",
+            "content_kind": ["text"], "llm_status": "llm_success",
+        },
+        {
+            "role": "assistant", "content": "[私1] 被污染的历史回答", "user_id": "u1",
+            "created_at": "2026-07-29 10:00:01", "content_kind": ["text"],
+            "llm_status": "llm_success",
+        },
+    ]
+    out = _make_plugin()._takeover_normalize(
+        records, _UMO_GROUP, paired_rounds=True,
+    )
+    assert "[私1] 这是用户原文" in out[0]["content"]
+    assert out[1]["content"] == "被污染的历史回答"
+    print("[T56] legacy assistant 来源前缀展示层清理 ✓")
+
+
 def test_assistant_chain_classification():
     """T35: _classify_assistant_chain — BOT 回复组件链分类（CR2 #5 修复）。
 
@@ -2626,6 +2843,9 @@ def _run_all():
         test_classify_content_message_str_fallback,
         test_classify_content_components_extraction,
         test_relation_template_and_reply_rendering,
+        test_current_turn_xml_codec,
+        test_current_turn_focus_late_hook,
+        test_legacy_assistant_source_prefix_cleanup,
         test_assistant_chain_classification,
         test_assistant_pairing_regression,
         test_turn_id_pairing_and_send_status,

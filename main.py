@@ -31,6 +31,7 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import Plain
+from astrbot.core.agent.message import TextPart
 
 from .storage import DBManager
 from .message_classifier import (
@@ -42,7 +43,10 @@ from .message_classifier import (
 )
 from .context_builder import (
     CROSS_SESSION_CONTEXT_INSTRUCTION,
+    CROSS_SESSION_SOURCE_MARKER_PREFIX,
+    CURRENT_TURN_FOCUS_INSTRUCTION,
     FULL_GROUP_CONTEXT_INSTRUCTION,
+    HISTORY_TAIL_MARKER,
     TakeoverContextBuilder,
     extract_time_str as _extract_time_str_impl,
     is_pure_media as _is_pure_media_impl,
@@ -58,7 +62,15 @@ from .models import (
     SEND_ATTEMPTED as _SEND_ATTEMPTED,
     SEND_PREPARED as _SEND_PREPARED,
 )
-from .relation_codec import dump_relation_data, truncate_content_template
+from .relation_codec import (
+    build_current_turn_xml,
+    dump_relation_data,
+    truncate_content_template,
+)
+
+
+_TAKEOVER_APPLIED_EXTRA = "chat_memory_takeover_applied"
+_CURRENT_FOCUS_INJECTED_EXTRA = "chat_memory_current_focus_injected"
 
 class ChatMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -512,7 +524,7 @@ class ChatMemoryPlugin(Star):
     async def take_over_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """接管 req.contexts，注入 CM 数据 + 清空 native history。
 
-        priority=-100 确保最后执行（AstrBot 高值先执行），覆盖其他插件对 contexts 的修改。
+        priority=-100 晚于常规钩子执行；最终当前轮焦点由 priority=-299 的独立钩子补齐。
         与 mark_llm_triggered(默认 0) 顺序：先标记 llm_pending，后接管（CM 已落库再读取）。
         """
         if not self.ct_enable:
@@ -557,6 +569,7 @@ class ChatMemoryPlugin(Star):
         ):
             self._append_cross_session_instruction(req)
         req.contexts = contexts
+        event.set_extra(_TAKEOVER_APPLIED_EXTRA, True)
 
         if self.ct_clear_native_history:
             await self._safe_reset_history(umo, cid)
@@ -566,6 +579,52 @@ class ChatMemoryPlugin(Star):
             f"(cross_session={self.ct_cross_session}, full_group={self.ct_full_group}, "
             f"cid={cid[:8]})"
         )
+
+    @filter.on_llm_request(priority=-299)
+    async def inject_current_turn_focus(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """在其他上下文插件之后追加本轮结构锚，并与历史尾部 user 切开。"""
+        if not event.get_extra(_TAKEOVER_APPLIED_EXTRA, False):
+            return
+        if event.get_extra(_CURRENT_FOCUS_INJECTED_EXTRA, False):
+            return
+
+        try:
+            template, relation_data = self._build_relation_seed(event)
+            current_part = TextPart(
+                text=build_current_turn_xml(
+                    template,
+                    relation_data,
+                    self._get_self_id(event),
+                )
+            ).mark_as_temp()
+            parts = getattr(req, "extra_user_content_parts", None)
+            if parts is None:
+                parts = []
+                req.extra_user_content_parts = parts
+
+            contexts = getattr(req, "contexts", None)
+            if isinstance(contexts, list) and contexts:
+                tail = contexts[-1]
+                if isinstance(tail, dict) and tail.get("role") == "user":
+                    content = tail.get("content")
+                    if isinstance(content, str):
+                        tail["content"] = (
+                            f"{content}\n{HISTORY_TAIL_MARKER}"
+                            if content
+                            else HISTORY_TAIL_MARKER
+                        )
+
+            parts.append(current_part)
+            self._append_current_turn_focus_instruction(req)
+            event.set_extra(_CURRENT_FOCUS_INJECTED_EXTRA, True)
+        except Exception as exc:
+            logger.warning(
+                f"{self._log_prefix(event)} 当前轮焦点注入失败: {type(exc).__name__}: {exc}"
+            )
 
     async def _handle_empty_takeover(
         self,
@@ -585,6 +644,7 @@ class ChatMemoryPlugin(Star):
             return
 
         req.contexts = []
+        event.set_extra(_TAKEOVER_APPLIED_EXTRA, True)
         if self.ct_clear_native_history:
             await self._safe_reset_history(umo, cid)
         self._log(f"{self._log_prefix(event)} 严格接管 contexts=0：{reason}")
@@ -718,11 +778,23 @@ class ChatMemoryPlugin(Star):
         )
 
     @staticmethod
+    def _append_current_turn_focus_instruction(req: ProviderRequest) -> None:
+        """追加固定当前轮焦点规则，且同一请求只加一次。"""
+        existing = (getattr(req, "system_prompt", "") or "").strip()
+        if CURRENT_TURN_FOCUS_INSTRUCTION in existing:
+            return
+        req.system_prompt = (
+            f"{existing}\n\n{CURRENT_TURN_FOCUS_INSTRUCTION}"
+            if existing
+            else CURRENT_TURN_FOCUS_INSTRUCTION
+        )
+
+    @staticmethod
     def _has_cross_session_labels(contexts: list[dict]) -> bool:
         """仅在规整结果实际含其他/未知来源时启用跨会话提示词。"""
-        markers = ("[群", "[私", "[会", "[未知]")
         return any(
-            any(marker in str(context.get("content") or "") for marker in markers)
+            CROSS_SESSION_SOURCE_MARKER_PREFIX
+            in str(context.get("content") or "")
             for context in contexts
         )
 
@@ -1003,8 +1075,8 @@ class ChatMemoryPlugin(Star):
         - ``[]``：接管已启用，但会话、用户范围或规整后的记录为空；
         - ``list[dict]``：已按当前接管配置完成查询、前缀增强与边界裁剪。开启
           ``cross_session`` 且结果含其他来源时，其他来源的 user 会带请求内匿名的
-          ``[群1]`` / ``[私1]`` / ``[会1]`` 标记；paired assistant 继承前一条 user
-          的来源，当前会话不加来源标记。
+          ``<cm s="N"/>`` XML 元数据；paired assistant 继承前一条 user 的来源，
+          当前会话不加来源元数据。
 
         本方法不清理 AstrBot native history、不修改请求对象，也不写数据库。调用方未提供
         ``conversation_id`` 时会读取 ``umo`` 的当前 conversation。空 ``user_id`` 仅在
