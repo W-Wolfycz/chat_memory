@@ -42,14 +42,14 @@ from .message_classifier import (
     extract_text as _extract_text_impl,
 )
 from .context_builder import (
+    CM_GENERAL_RULES,
     CROSS_SESSION_CONTEXT_INSTRUCTION,
     CROSS_SESSION_SOURCE_MARKER_PREFIX,
-    CURRENT_TURN_FOCUS_INSTRUCTION,
     FULL_GROUP_CONTEXT_INSTRUCTION,
-    HISTORY_TAIL_MARKER,
     TakeoverContextBuilder,
     extract_time_str as _extract_time_str_impl,
     is_pure_media as _is_pure_media_impl,
+    strip_cm_xml_tags as _strip_cm_xml_tags_impl,
     strip_reasoning_prefix as _strip_reasoning_prefix_impl,
 )
 from .models import (
@@ -212,6 +212,10 @@ class ChatMemoryPlugin(Star):
     @staticmethod
     def _strip_reasoning_prefix(text: str) -> str:
         return _strip_reasoning_prefix_impl(text)
+
+    @staticmethod
+    def _strip_cm_xml_tags(text: str) -> str:
+        return _strip_cm_xml_tags_impl(text)
 
     def _log(self, msg: str):
         if self.debug_to_info:
@@ -560,6 +564,8 @@ class ChatMemoryPlugin(Star):
             await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
             return
 
+        # 通用规则无条件注入（cm_ 标签禁令 + cm_time 说明），位于模式指令之前。
+        self._append_general_rules(req)
         if self.ct_full_group and self._is_group_umo(umo):
             self._append_full_group_instruction(req)
         if (
@@ -599,6 +605,7 @@ class ChatMemoryPlugin(Star):
                     template,
                     relation_data,
                     self._get_self_id(event),
+                    speaker_nickname=self._get_sender_nickname(event),
                 )
             ).mark_as_temp()
             parts = getattr(req, "extra_user_content_parts", None)
@@ -606,20 +613,7 @@ class ChatMemoryPlugin(Star):
                 parts = []
                 req.extra_user_content_parts = parts
 
-            contexts = getattr(req, "contexts", None)
-            if isinstance(contexts, list) and contexts:
-                tail = contexts[-1]
-                if isinstance(tail, dict) and tail.get("role") == "user":
-                    content = tail.get("content")
-                    if isinstance(content, str):
-                        tail["content"] = (
-                            f"{content}\n{HISTORY_TAIL_MARKER}"
-                            if content
-                            else HISTORY_TAIL_MARKER
-                        )
-
             parts.append(current_part)
-            self._append_current_turn_focus_instruction(req)
             event.set_extra(_CURRENT_FOCUS_INJECTED_EXTRA, True)
         except Exception as exc:
             logger.warning(
@@ -644,6 +638,8 @@ class ChatMemoryPlugin(Star):
             return
 
         req.contexts = []
+        # 即使历史为空也注入通用规则，避免模型收到未解释的 cm_ 标签。
+        self._append_general_rules(req)
         event.set_extra(_TAKEOVER_APPLIED_EXTRA, True)
         if self.ct_clear_native_history:
             await self._safe_reset_history(umo, cid)
@@ -754,6 +750,18 @@ class ChatMemoryPlugin(Star):
         )
 
     @staticmethod
+    def _append_general_rules(req: ProviderRequest) -> None:
+        """通用规则（cm_ 结构化标签禁令）无条件追加，且同一请求只加一次。"""
+        existing = (getattr(req, "system_prompt", "") or "").strip()
+        if CM_GENERAL_RULES in existing:
+            return
+        req.system_prompt = (
+            f"{existing}\n\n{CM_GENERAL_RULES}"
+            if existing
+            else CM_GENERAL_RULES
+        )
+
+    @staticmethod
     def _append_full_group_instruction(req: ProviderRequest) -> None:
         """把 full-group 转录解释规则追加到 system prompt，且同一请求只加一次。"""
         existing = (getattr(req, "system_prompt", "") or "").strip()
@@ -775,18 +783,6 @@ class ChatMemoryPlugin(Star):
             f"{existing}\n\n{CROSS_SESSION_CONTEXT_INSTRUCTION}"
             if existing
             else CROSS_SESSION_CONTEXT_INSTRUCTION
-        )
-
-    @staticmethod
-    def _append_current_turn_focus_instruction(req: ProviderRequest) -> None:
-        """追加固定当前轮焦点规则，且同一请求只加一次。"""
-        existing = (getattr(req, "system_prompt", "") or "").strip()
-        if CURRENT_TURN_FOCUS_INSTRUCTION in existing:
-            return
-        req.system_prompt = (
-            f"{existing}\n\n{CURRENT_TURN_FOCUS_INSTRUCTION}"
-            if existing
-            else CURRENT_TURN_FOCUS_INSTRUCTION
         )
 
     @staticmethod
@@ -815,6 +811,29 @@ class ChatMemoryPlugin(Star):
             return False
         return parts[1] == "GroupMessage"
 
+    @staticmethod
+    def _record_umo(record: dict, fallback_umo: str = "") -> str:
+        """从消息审计字段还原 Reply 目标所在的原始 UMO。
+
+        Reply 只能引用同一会话内的消息。跨会话 takeover 展示历史 Reply 时，
+        必须按被引用记录自身的来源查询目标，不能拿当前请求所在的 UMO 代替。
+        当前会话旧记录若缺少部分审计字段，可安全回退到当前 UMO。外部来源
+        字段不完整时也只会尝试当前 UMO；内部 turn_id 查不到即自然降级，
+        不使用昵称、时间或正文猜测来源。
+        """
+        fallback_parts = str(fallback_umo or "").split(":", 2)
+        platform_id = str(record.get("platform_id") or "").strip()
+        message_type = str(record.get("message_type") or "").strip()
+        session_id = str(
+            record.get("session_id") or record.get("group_id") or ""
+        ).strip()
+        if len(fallback_parts) == 3 and session_id == fallback_parts[2]:
+            platform_id = platform_id or fallback_parts[0]
+            message_type = message_type or fallback_parts[1]
+        if not (platform_id and message_type and session_id):
+            return ""
+        return f"{platform_id}:{message_type}:{session_id}"
+
     async def _safe_reset_history(self, umo: str, cid: str):
         try:
             await self.context.conversation_manager.update_conversation(
@@ -825,9 +844,9 @@ class ChatMemoryPlugin(Star):
 
     # ── 捕获 BOT 回复 + 检测 reset/new ──────────────────
 
-    @filter.on_decorating_result(priority=10)
+    @filter.on_decorating_result(priority=10000)
     async def capture_bot(self, event: AstrMessageEvent):
-        """BOT 回复捕获：插入 prepared assistant，按 extras 判定状态与 turn 配对。"""
+        """尽早捕获 BOT 回复；LLM 文本清除泄漏的 cm_ 标签后再落库。"""
         umo = getattr(event, "unified_msg_origin", "")
         if not umo:
             return
@@ -848,8 +867,14 @@ class ChatMemoryPlugin(Star):
         if not result or not result.chain:
             return
 
+        is_llm_result = bool(result.is_llm_result())
         asst_kind, bot_text = self._classify_assistant_chain(result.chain)
         bot_text = self._strip_reasoning_prefix(bot_text)
+        if is_llm_result:
+            clean_bot_text = self._strip_cm_xml_tags(bot_text)
+            if clean_bot_text != bot_text:
+                self._log(f"{self._log_prefix(event)} assistant 入库前已裁剪 cm_ XML 标签")
+            bot_text = clean_bot_text
         if not asst_kind:
             # 完全空 chain（无 Plain 也无任何媒体组件）才跳过；纯图 / 纯语音仍入库
             return
@@ -888,7 +913,7 @@ class ChatMemoryPlugin(Star):
             logger.warning(
                 f"{self._log_prefix(event)} assistant 标 orphan（user 漏存：DB 写入失败）"
             )
-        elif llm_triggered and result.is_llm_result():
+        elif llm_triggered and is_llm_result:
             asst_status = _LLM_SUCCESS
             pair_id = user_msg_id if not no_mid else None
         else:
@@ -1075,7 +1100,7 @@ class ChatMemoryPlugin(Star):
         - ``[]``：接管已启用，但会话、用户范围或规整后的记录为空；
         - ``list[dict]``：已按当前接管配置完成查询、前缀增强与边界裁剪。开启
           ``cross_session`` 且结果含其他来源时，其他来源的 user 会带请求内匿名的
-          ``<cm s="N"/>`` XML 元数据；paired assistant 继承前一条 user 的来源，
+          ``<cm_source n="N"/>`` XML 元数据；paired assistant 继承前一条 user 的来源，
           当前会话不加来源元数据。
 
         本方法不清理 AstrBot native history、不修改请求对象，也不写数据库。调用方未提供
@@ -1109,17 +1134,27 @@ class ChatMemoryPlugin(Star):
         if not records:
             return []
 
-        target_turn_ids: list[str] = []
+        target_ids_by_umo: dict[str, list[str]] = {}
         for record in records:
             relation = record.get("relation_data")
             reply = relation.get("reply") if isinstance(relation, dict) else None
             if isinstance(reply, dict) and reply.get("resolution") == "turn":
-                target_turn_ids.append(str(reply.get("target_turn_id") or ""))
-        target_map = (
-            await self.db.query_turn_targets(umo, target_turn_ids)
-            if target_turn_ids
-            else {}
-        )
+                target_turn_id = str(reply.get("target_turn_id") or "").strip()
+                target_umo = self._record_umo(record, fallback_umo=umo) or umo
+                if target_turn_id:
+                    target_ids_by_umo.setdefault(target_umo, []).append(target_turn_id)
+
+        target_map: dict[tuple[str, str], dict] = {}
+        for source_umo, target_ids in target_ids_by_umo.items():
+            try:
+                target_map.update(
+                    await self.db.query_turn_targets(source_umo, target_ids)
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"{self._log_prefix()} Reply 目标批量查询失败："
+                    f"{type(exc).__name__}"
+                )
 
         mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
         return self._takeover_normalize(

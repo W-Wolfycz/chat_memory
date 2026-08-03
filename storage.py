@@ -704,19 +704,20 @@ class DBManager:
         umo: str,
         turn_ids: list[str],
     ) -> dict[tuple[str, str], dict]:
-        """批量读取引用目标，key 为 ``(turn_id, role)``。"""
+        """在当前 UMO 内批量读取引用目标，key 为 ``(turn_id, role)``。"""
         await self.init_db()
         clean_ids = sorted({str(value) for value in turn_ids if value})
-        if not clean_ids:
+        if not umo or not clean_ids:
             return {}
         async with self.async_session() as session:
             result = await session.execute(
                 text(
                     _SELECT_COLS
-                    + " FROM chat_memory_records WHERE turn_id IN :turn_ids "
+                    + " FROM chat_memory_records WHERE umo = :umo "
+                    "AND turn_id IN :turn_ids "
                     "ORDER BY created_at ASC, id ASC"
                 ).bindparams(bindparam("turn_ids", expanding=True)),
-                {"turn_ids": clean_ids},
+                {"umo": umo, "turn_ids": clean_ids},
             )
             targets: dict[tuple[str, str], dict] = {}
             for row in result.fetchall():

@@ -63,19 +63,32 @@ def mention_label(mention: Any) -> str:
 
 
 def render_content_template(template: str, relation_data: Any) -> str:
+    """渲染 At 模板：正文部分做 XML 转义，At token 换成 <cm_mention> 结构标签。
+
+    只转义用户可控正文，避免把生成的 <cm_mention> 二次转义成文本。
+    """
     data = parse_relation_data(relation_data)
     if not data:
         return template or ""
     mentions = data.get("mentions", [])
-
-    def replace(match: re.Match) -> str:
+    value = template or ""
+    parts: list[str] = []
+    cursor = 0
+    for match in AT_TOKEN_RE.finditer(value):
+        plain = value[cursor:match.start()].replace(
+            AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL
+        )
+        parts.append(xml_escape(plain, quote=True))
         index = int(match.group(1))
         if index >= len(mentions):
-            return "[提及:未知成员]"
-        return f"[提及:{mention_label(mentions[index])}]"
-
-    rendered = AT_TOKEN_RE.sub(replace, template or "")
-    return rendered.replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+            parts.append('<cm_mention target="未知成员"/>')
+        else:
+            label = mention_label(mentions[index])
+            parts.append(f'<cm_mention target="{xml_escape(label, quote=True)}"/>')
+        cursor = match.end()
+    tail = value[cursor:].replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+    parts.append(xml_escape(tail, quote=True))
+    return "".join(parts)
 
 
 def _current_mention_xml(mention: Any, self_id: str) -> str:
@@ -89,7 +102,7 @@ def _current_mention_xml(mention: Any, self_id: str) -> str:
             target = mention_label(mention)
     else:
         target = "未知成员"
-    return f'<mention target="{xml_escape(target, quote=True)}"/>'
+    return f'<cm_mention target="{xml_escape(target, quote=True)}"/>'
 
 
 def _current_message_xml(template: str, mentions: list[Any], self_id: str) -> str:
@@ -120,18 +133,28 @@ def build_current_turn_xml(
     template: str,
     relation_data: Any,
     self_id: str,
+    speaker_nickname: str = "",
 ) -> str:
-    """构建本轮 Reply/At 焦点锚；只输出昵称或 assistant，不暴露账号 ID。"""
+    """构建本轮焦点锚：当前发言者身份 + Reply/At；只输出昵称或 assistant，不暴露账号 ID。"""
+    speaker_nickname = str(speaker_nickname or "").strip()
+    speaker_line = (
+        f'<cm_speaker current="1">{xml_escape(speaker_nickname, quote=True)}</cm_speaker>'
+        if speaker_nickname
+        else ""
+    )
+
     data = parse_relation_data(relation_data)
     if not data:
-        return "<cm_current/>"
+        return speaker_line or "<cm_current/>"
 
     mentions = data.get("mentions") or []
     reply = data.get("reply")
     if not mentions and not isinstance(reply, dict):
-        return "<cm_current/>"
+        return speaker_line or "<cm_current/>"
 
     lines = ["<cm_current>"]
+    if speaker_line:
+        lines.append(speaker_line)
     if isinstance(reply, dict):
         target_user_id = str(reply.get("target_user_id") or "").strip()
         if reply.get("target_role") == "assistant" or (
@@ -140,7 +163,7 @@ def build_current_turn_xml(
             target = "assistant"
         else:
             target = str(reply.get("target_nickname") or "").strip() or "未知成员"
-        lines.append(f'<reply target="{xml_escape(target, quote=True)}"/>')
+        lines.append(f'<cm_reply target="{xml_escape(target, quote=True)}"/>')
 
     message = _current_message_xml(template, mentions, str(self_id or "").strip())
     if message:

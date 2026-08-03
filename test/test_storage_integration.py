@@ -86,13 +86,11 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             conversation_id=cid,
         )
         assert [item["role"] for item in contexts] == ["user", "assistant"]
-        assert contexts[0]["content"].endswith("10001: 公开 API 问题")
+        assert "公开 API 问题" in contexts[0]["content"]
         assert contexts[0]["_no_save"] is True
-        assert contexts[1] == {
-            "role": "assistant",
-            "content": "公开 API 回答",
-            "_no_save": True,
-        }
+        assert contexts[1]["role"] == "assistant"
+        assert "公开 API 回答" in contexts[1]["content"]
+        assert contexts[1].get("_no_save") is True
         assert await plugin.build_takeover_contexts(
             umo=umo,
             user_id="",
@@ -156,10 +154,9 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             conversation_id="conversation_group",
         )
         assert [item["role"] for item in group_contexts] == ["user", "assistant"]
-        assert group_contexts[0]["content"].endswith(
-            "[发言者] 10002: 当前群问题"
-        )
-        assert group_contexts[1]["content"] == "当前群回答"
+        assert "当前群问题" in group_contexts[0]["content"]
+        assert "<cm_nickname>10002</cm_nickname>" in group_contexts[0]["content"]
+        assert "当前群回答" in group_contexts[1]["content"]
         await plugin.terminate()
 
 
