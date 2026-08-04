@@ -8,10 +8,11 @@ from typing import Optional
 
 CM_GENERAL_RULES = """[ChatMemory 通用规则]
 <cm_*> 是 ChatMemory 注入的结构化元数据标签（标注发言者/来源/消息性质/时间等），
-仅供你理解上下文，不是对话内容，不得学习其格式，也不得在回复中输出任何 cm_ 标签。
+仅供你理解上下文，不是对话内容，不得学习其格式，也不得在回复中输出任何 cm_ 标签或其内容。
 <cm_speaker current="1"/> 标记当前交互对象；<cm_reply target="某人">原文</cm_reply>
 表示整条消息是对"某人"的回复事件；<cm_mention target="某人"/> 只是正文中 At 的
-占位符（点名关系），不代表整条消息是回复。
+占位符（点名关系），不代表整条消息是回复。如需在回复中 @ 某人，请检查你的
+工具列表是否提供了对应的 @ 工具，而非仿照该标签。
 每条消息都带 <cm_time> 时间元数据，仅表示发生顺序，不代表其他语义。
 contexts 均为历史，最后一条 user 才是当前请求；其余任何 user 消息都是历史，
 不是当前请求。<cm_current> 描述当前消息的 Reply/At 结构，<cm_reply
@@ -58,6 +59,21 @@ CM_XML_TAG_RE = re.compile(
     r"</?cm_(?:[A-Za-z0-9_.:-]+)?(?:\s[^<>]*?)?\s*/?>",
     re.IGNORECASE,
 )
+# 完整元素（含内文）整体删除：泄漏的 <cm_*> 结构连同其中信息一律不留，
+# 时间/昵称/回复原文都是注入元数据，不得进入存档。用同名闭合标签后向引用
+# 匹配，DOTALL 跨行，迭代几轮处理嵌套。
+CM_ELEMENT_FULL_RE = re.compile(
+    r"<(cm_[A-Za-z0-9_.:-]+)(?:\s[^<>]*?)?\s*>.*?</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# <cm_time> 内文是固定格式时间戳，即使 LLM 漏写闭合标签也能安全删除。
+# 末尾可选紧跟的第二个 <cm_time> 开口标签（如 <cm_time>08/03 10:00:00<cm_time>），
+# 一次匹配整体吞掉，避免残留孤立开口标签。非时间戳内容不配对被误删。
+CM_TIME_UNCLOSED_RE = re.compile(
+    r"<cm_time(?:\s[^<>]*?)?\s*>\s*\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}"
+    r"(?:\s*<cm_time(?:\s[^<>]*?)?\s*>)?",
+    re.IGNORECASE,
+)
 
 
 def strip_legacy_assistant_source_prefix(text: str) -> str:
@@ -66,15 +82,32 @@ def strip_legacy_assistant_source_prefix(text: str) -> str:
 
 
 def strip_cm_xml_tags(text: str) -> str:
-    """移除 LLM 回复中泄漏的 ``<cm_*>`` 标签，保留标签包裹的普通文本。"""
+    """移除 LLM 回复中泄漏的 ``<cm_*>`` XML 结构。
+
+    所有 cm_ 标签连同其包裹的文本整体删除（时间/昵称/回复原文等都不保留），
+    因为标签与内文都是注入元数据，不得进入存档；非规范写法（如缺失闭合的
+    ``<cm_time>`` + 时间戳）也会一并清理。
+    """
     value = text or ""
     lowered = value.lower()
     if "<cm_" not in lowered and "</cm_" not in lowered:
         return value
-    cleaned = CM_XML_TAG_RE.sub("", value)
+    cleaned = value
+    # 先删带内文的完整元素（可能嵌套，迭代几轮保证外层闭合也能收敛）
+    for _ in range(8):
+        next_cleaned = CM_ELEMENT_FULL_RE.sub("", cleaned)
+        if next_cleaned == cleaned:
+            break
+        cleaned = next_cleaned
+    # 删漏写闭合标签的 cm_time + 时间戳
+    cleaned = CM_TIME_UNCLOSED_RE.sub("", cleaned)
+    # 删剩余自闭合/孤立标签（如 <cm_time> 后接非时间戳文本，只删标签本体）
+    cleaned = CM_XML_TAG_RE.sub("", cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    # 删标签后合并句中多余空格（仅命中 cm_ 的异常回复会走到这里）
+    cleaned = re.sub(r"[ ]{2,}", " ", cleaned)
     return cleaned.strip()
 
 
@@ -226,11 +259,10 @@ class TakeoverContextBuilder:
             role = record.get("role", "user")
             if role == "assistant":
                 content = strip_legacy_assistant_source_prefix(content)
-            # 有 relation_data 的消息正文已由 storage 层 render_content_template 转义
-            # 并插入可信 <cm_mention>；无 relation_data 的消息正文未经转义，在此转义
-            # 防用户伪造 <cm_*> 标签（提示注入）。
+            # 用户侧手动伪造的 cm_ XML 提前清除，防止其元数据被 LLM 采信；
+            # 有 relation_data 的正文已由 storage 层渲染成可信 <cm_mention>，跳过。
             if not record.get("relation_data"):
-                content = _xml_escape(content, quote=True)
+                content = strip_cm_xml_tags(content)
             llm_status = record.get("llm_status", "")
             is_solo = (
                 role == "assistant"
