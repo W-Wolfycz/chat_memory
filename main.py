@@ -217,6 +217,20 @@ class ChatMemoryPlugin(Star):
     def _strip_cm_xml_tags(text: str) -> str:
         return _strip_cm_xml_tags_impl(text)
 
+    def _clean_sent_chain(self, chain) -> bool:
+        """清洗发送链中泄漏的 <cm_*> 结构（逐 Plain 组件），返回是否有改动。
+
+        就地修改 ``chain``，落库文本随后从清洗后的链提取，两侧共用一次清洗。
+        """
+        changed = False
+        for comp in chain:
+            if isinstance(comp, Plain) and comp.text:
+                cleaned = self._strip_cm_xml_tags(comp.text)
+                if cleaned != comp.text:
+                    comp.text = cleaned
+                    changed = True
+        return changed
+
     def _log(self, msg: str):
         if self.debug_to_info:
             logger.info(msg)
@@ -868,13 +882,13 @@ class ChatMemoryPlugin(Star):
             return
 
         is_llm_result = bool(result.is_llm_result())
+        if is_llm_result:
+            # 只清洗一次：直接改写发送用的组件链，落库与发送共用清理后的数据，
+            # 用户看到的与存档的一致，都不会带泄漏的 <cm_*> 结构。
+            if self._clean_sent_chain(result.chain):
+                self._log(f"{self._log_prefix(event)} assistant 已裁剪 cm_ XML 标签")
         asst_kind, bot_text = self._classify_assistant_chain(result.chain)
         bot_text = self._strip_reasoning_prefix(bot_text)
-        if is_llm_result:
-            clean_bot_text = self._strip_cm_xml_tags(bot_text)
-            if clean_bot_text != bot_text:
-                self._log(f"{self._log_prefix(event)} assistant 入库前已裁剪 cm_ XML 标签")
-            bot_text = clean_bot_text
         if not asst_kind:
             # 完全空 chain（无 Plain 也无任何媒体组件）才跳过；纯图 / 纯语音仍入库
             return
