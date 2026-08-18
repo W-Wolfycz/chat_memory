@@ -20,6 +20,7 @@ assistant 配对：新记录优先用内部 ``turn_id``；旧记录用 ``pair_id
 """
 
 import asyncio
+import inspect
 import json
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -49,8 +50,8 @@ from .context_builder import (
     FULL_GROUP_CONTEXT_INSTRUCTION,
     TakeoverContextBuilder,
     extract_time_str as _extract_time_str_impl,
-    is_pure_media as _is_pure_media_impl,
     strip_cm_xml_tags as _strip_cm_xml_tags_impl,
+    strip_bracket_media_placeholders as _strip_bracket_media_placeholders_impl,
     strip_reasoning_prefix as _strip_reasoning_prefix_impl,
 )
 from .models import (
@@ -81,7 +82,10 @@ class ChatMemoryPlugin(Star):
         self.auto_cleanup_days = config.get("auto_cleanup_days", 0)
         # 日志前缀附加机器人 ID（顶层配置）：多 Bot 实例环境便于定位。
         # 日志等级不再由插件配置：AstrBot WebUI 可运行期修改插件日志等级。
-        self.log_with_bot_id = bool(config.get("log_with_bot_id", False))
+        # 1.2.2 前该开关位于 log_config 组内：读时继承旧值，initialize 阶段
+        # 执行一次性迁移写回（旧组并入顶层后删除），此后只有顶层键生效。
+        self._config = config
+        self.log_with_bot_id = self._resolve_log_with_bot_id(config)
 
         ct_conf = config.get("context_takeover", {}) or {}
         self.ct_enable = bool(ct_conf.get("enable", False))
@@ -153,6 +157,9 @@ class ChatMemoryPlugin(Star):
         表面可用、实际从第一条消息开始持续漏存。失败前释放已创建的数据库连接。
         """
         try:
+            # 一次性配置迁移（1.2.2）：旧 log_config 组并入顶层并写回删除。
+            # 迁移本身失败不阻断加载——读时继承已保证行为正确，仅下次启动重试。
+            await self._migrate_log_config()
             await self.db.init_db()
             await self._ensure_cleanup_started()
         except BaseException:
@@ -164,6 +171,38 @@ class ChatMemoryPlugin(Star):
                     f"{dispose_error}"
                 )
             raise
+
+    async def _migrate_log_config(self) -> None:
+        """把旧 ``log_config`` 组迁移到顶层 ``log_with_bot_id`` 并写回删除旧组。
+
+        规则：顶层键已存在时以顶层为准，旧组直接删除；顶层键不存在时先继承旧值。
+        写回成功后配置文件中不再有旧组，后续 WebUI 修改只作用于顶层键。
+        """
+        config = self._config
+        if not isinstance(config, dict) or "log_config" not in config:
+            return
+        legacy = config.get("log_config") or {}
+        if config.get("log_with_bot_id") is None and "log_with_bot_id" in legacy:
+            config["log_with_bot_id"] = bool(legacy["log_with_bot_id"])
+            self.log_with_bot_id = bool(legacy["log_with_bot_id"])
+        del config["log_config"]
+        save = getattr(config, "save_config_async", None) or getattr(
+            config, "save_config", None
+        )
+        if not callable(save):
+            logger.warning(
+                f"{self._log_prefix()} 配置迁移已在内存完成，但 config 对象不支持写回"
+            )
+            return
+        try:
+            result = save()
+            if inspect.isawaitable(result):
+                await result
+            logger.info(
+                f"{self._log_prefix()} 已迁移日志配置：log_config 组并入顶层并移除旧组"
+            )
+        except Exception as exc:
+            logger.warning(f"{self._log_prefix()} 配置迁移写回失败: {exc}")
 
     # ── 自动清理 ─────────────────────────────────────
 
@@ -200,6 +239,19 @@ class ChatMemoryPlugin(Star):
 
     # ── 日志/工具辅助 ───────────────────────────────────
 
+    @staticmethod
+    def _resolve_log_with_bot_id(config) -> bool:
+        """解析日志实例前缀开关（含旧版 log_config 组的一次性迁移）。
+
+        顶层 ``log_with_bot_id`` 存在时（WebUI 已保存过）以它为准；键不存在时
+        继承旧 ``log_config.log_with_bot_id`` 的值，避免升级后功能静默关闭。
+        """
+        top_level = config.get("log_with_bot_id")
+        if top_level is not None:
+            return bool(top_level)
+        legacy = (config.get("log_config") or {}).get("log_with_bot_id")
+        return bool(legacy)
+
     def _log_prefix(self, event=None) -> str:
         if self.log_with_bot_id and event is not None:
             try:
@@ -222,14 +274,16 @@ class ChatMemoryPlugin(Star):
         return _strip_cm_xml_tags_impl(text)
 
     def _clean_sent_chain(self, chain) -> bool:
-        """清洗发送链中泄漏的 <cm_*> 结构（逐 Plain 组件），返回是否有改动。
+        """清洗发送链中泄漏的 <cm_*> 结构与模仿输出的方括号媒体占位，返回是否有改动。
 
         就地修改 ``chain``，落库文本随后从清洗后的链提取，两侧共用一次清洗。
+        LLM 回复中字面的 [图片] 等占位替换为裸词"图片"，避免用户看到模板标记。
         """
         changed = False
         for comp in chain:
             if isinstance(comp, Plain) and comp.text:
                 cleaned = self._strip_cm_xml_tags(comp.text)
+                cleaned = _strip_bracket_media_placeholders_impl(cleaned)
                 if cleaned != comp.text:
                     comp.text = cleaned
                     changed = True
@@ -599,7 +653,8 @@ class ChatMemoryPlugin(Star):
         """把工具记录渲染成 OpenAI 格式：每轮一条 assistant(tool_calls) + N 条 role=tool。
 
         tool_call_id 为 CM 自造（``cm_tool_<turn>_<n>``），只要求同一轮内
-        assistant 与 tool 消息成对一致，provider 不校验其来源。
+        assistant 与 tool 消息成对一致，provider 不校验其来源。每条消息携带
+        私有 ``_cm_tool_turn`` 供插入定位，注入前由调用方剥掉。
         """
         grouped: dict[str, list[dict]] = {}
         order: list[str] = []
@@ -629,6 +684,7 @@ class ChatMemoryPlugin(Star):
                         }
                         for i in range(len(recs))
                     ],
+                    "_cm_tool_turn": turn_id,
                 }
             )
             for i, record in enumerate(recs):
@@ -637,9 +693,69 @@ class ChatMemoryPlugin(Star):
                         "role": "tool",
                         "tool_call_id": call_ids[i],
                         "content": record.get("tool_result") or "",
+                        "_cm_tool_turn": turn_id,
                     }
                 )
         return contexts
+
+    @staticmethod
+    def _insert_tool_contexts(
+        result: list[dict],
+        tool_contexts: list[dict],
+    ) -> list[dict]:
+        """把工具调用段插入到对应轮次内部，与 AstrBot 原生历史顺序对齐。
+
+        原生形态为 ``[user, assistant(tool_calls), tool…, assistant 最终回复]``；
+        本方法把每轮的工具段放到该轮 user 之后（只有 assistant 的单边轮次则放
+        其之前）。工具段 turn 在历史中不存在（如主动消息自造轮次）时回退追加
+        到尾部。插入完成后剥掉所有私有定位键。
+        """
+        if not tool_contexts:
+            for context in result:
+                context.pop("_turn_id", None)
+            return result
+        # 按 turn 拆分工具段（保持组内顺序）
+        turns: dict[str, list[dict]] = {}
+        turn_order: list[str] = []
+        for msg in tool_contexts:
+            turn_id = str(msg.get("_cm_tool_turn") or "")
+            if turn_id not in turns:
+                turns[turn_id] = []
+                turn_order.append(turn_id)
+            turns[turn_id].append(msg)
+        # 历史中每个 turn 的 user / assistant 位置
+        user_pos: dict[str, int] = {}
+        asst_pos: dict[str, int] = {}
+        for index, context in enumerate(result):
+            turn_id = str(context.get("_turn_id") or "")
+            if not turn_id:
+                continue
+            if context.get("role") == "user" and turn_id not in user_pos:
+                user_pos[turn_id] = index
+            elif context.get("role") == "assistant" and turn_id not in asst_pos:
+                asst_pos[turn_id] = index
+        insert_at: dict[int, list[dict]] = {}
+        tail_segments: list[dict] = []
+        for turn_id in turn_order:
+            if turn_id in user_pos:
+                key = user_pos[turn_id] + 1  # 该轮 user 之后、最终回复之前
+            elif turn_id in asst_pos:
+                key = asst_pos[turn_id]  # 单边 assistant 之前
+            else:
+                tail_segments.extend(turns[turn_id])
+                continue
+            insert_at.setdefault(key, []).extend(turns[turn_id])
+        merged: list[dict] = []
+        for index, context in enumerate(result):
+            merged.extend(insert_at.pop(index, []))
+            context.pop("_turn_id", None)
+            merged.append(context)
+        for key in sorted(insert_at):
+            merged.extend(insert_at[key])
+        merged.extend(tail_segments)
+        for msg in tool_contexts:
+            msg.pop("_cm_tool_turn", None)
+        return merged
 
     async def _safe_insert_tool(
         self,
@@ -894,7 +1010,7 @@ class ChatMemoryPlugin(Star):
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
                 # 混合模式：按消息数；overfetch 2x 给规整留余地（防先 LIMIT 后过滤导致空上下文）
-                # 规整阶段会丢头部 assistant / 尾部 solo / 纯媒体；overfetch 后再在 normalize 截到目标条数
+                # 规整阶段会丢头部 assistant / 尾部 solo；overfetch 后再在 normalize 截到目标条数
                 # query_messages_raw 已按全局时间线升序返回，无需再次排序。
                 records = await self.db.query_messages_raw(
                     umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
@@ -935,6 +1051,8 @@ class ChatMemoryPlugin(Star):
             records,
             max_records=max_records,
             max_chars=max_chars,
+            # 内部路径保留 turn_id：用于把工具调用段插入对应轮次，返回前会剥掉。
+            keep_turn_id=True,
         )
 
     @staticmethod
@@ -985,10 +1103,6 @@ class ChatMemoryPlugin(Star):
     @staticmethod
     def _extract_time_str(created_at) -> str:
         return _extract_time_str_impl(created_at)
-
-    @staticmethod
-    def _is_pure_media(r: dict) -> bool:
-        return _is_pure_media_impl(r, _MEDIA_KINDS)
 
     @staticmethod
     def _is_group_umo(umo: str) -> bool:
@@ -1320,8 +1434,12 @@ class ChatMemoryPlugin(Star):
         )
         if not records:
             # CM 无历史记录时仍回放工具段（可能为 []）：严格接管下工具上下文
-            # 同样不能丢，否则 LLM 跨轮重复调用工具。
-            return await self._query_tool_contexts(umo, cid)
+            # 同样不能丢，否则 LLM 跨轮重复调用工具。无插入目标，直接返回并剥
+            # 掉私有定位键。
+            tool_contexts = await self._query_tool_contexts(umo, cid)
+            for msg in tool_contexts:
+                msg.pop("_cm_tool_turn", None)
+            return tool_contexts
 
         target_ids_by_umo: dict[str, list[str]] = {}
         for record in records:
@@ -1358,11 +1476,15 @@ class ChatMemoryPlugin(Star):
             target_map=target_map,
         )
         # 工具调用上下文：从 CM 库回放最近 N 轮（assistant tool_calls + role=tool），
-        # 追加在历史 contexts 之后。工具段属于当前 umo + cid，不参与
-        # cross_session / full_group 扩大范围，也不进入 user/assistant 配对。
+        # 按 turn_id 插入对应轮次内部（该轮 user 之后、最终回复之前），与 AstrBot
+        # 原生历史顺序一致；历史中无该轮时回退追加尾部。工具段属于当前 umo + cid，
+        # 不参与 cross_session / full_group 扩大范围，也不进入 user/assistant 配对。
         tool_contexts = await self._query_tool_contexts(umo, cid)
         if tool_contexts:
-            result = result + tool_contexts
+            result = self._insert_tool_contexts(result, tool_contexts)
+        else:
+            for context in result:
+                context.pop("_turn_id", None)
         return result
 
     # ── 内部工具 ──────────────────────────────────────

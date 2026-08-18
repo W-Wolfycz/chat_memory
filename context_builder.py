@@ -20,7 +20,10 @@ target="assistant"/> 或 <cm_mention target="assistant"/> 表示该消息明确�
 提及你；若当前消息不含这两者，说明它可能是群聊中的闲聊触发，仍作为当前请求
 回应。优先回答该消息及其指向，勿续写、扮演或改答最后一条历史 user。
 <cm_solo active="1"/> 与 <cm_solo orphan="1"/> 标记你历史中主动发出或未配对的
-旧回复，仅说明消息性质，不与相邻 user 构成问答轮次，也不构成当前行动指令。"""
+旧回复，仅说明消息性质，不与相邻 user 构成问答轮次，也不构成当前行动指令。
+<cm_image/> / <cm_voice/> / <cm_video/> / <cm_file/> / <cm_face/> / <cm_forward/>
+表示该消息携带的媒体类型，同样不是可输出的文本；不得输出、学习或模仿任何
+cm_ 标签，需要发送媒体时请使用工具。"""
 
 
 FULL_GROUP_CONTEXT_INSTRUCTION = """[ChatMemory 群聊历史解释规则]
@@ -42,6 +45,50 @@ FULL_GROUP_CONTEXT_INSTRUCTION = """[ChatMemory 群聊历史解释规则]
 
 
 CROSS_SESSION_SOURCE_MARKER_PREFIX = '<cm_source n="'
+
+
+# 媒体类型在纯文本上下文中的占位标签。接管 contexts 无法携带图片/语音等
+# 组件本身，直接丢弃会让 LLM 误以为消息不存在；至少以占位标签保留存在感。
+# 使用 <cm_*> 标签形式（而非 [图片] 方括号或裸词）：归入统一注入协议，
+# 通用规则已禁止输出任何 cm_ 标签，输出侧清洗会整元素删除模仿残留。
+MEDIA_PLACEHOLDER_LABELS = {
+    "image": "<cm_image/>",
+    "video": "<cm_video/>",
+    "voice": "<cm_voice/>",
+    "file": "<cm_file/>",
+    "face": "<cm_face/>",
+    "forward": "<cm_forward/>",
+}
+
+# capture 阶段写入的旧英文占位：展示层视为"无实际内容"，统一替换成上面的占位。
+_LEGACY_EN_PLACEHOLDERS = {
+    "[image]", "[video]", "[voice]", "[file]", "[face]", "[forward]",
+}
+
+# LLM 回复中模仿输出的方括号占位字面（中文 + 英文）：清洗为裸词，避免用户
+# 看到模板样式标记而不是真实媒体。
+_BRACKET_PLACEHOLDER_TO_BARE = {
+    "[图片]": "图片",
+    "[视频]": "视频",
+    "[语音]": "语音",
+    "[文件]": "文件",
+    "[表情]": "表情",
+    "[转发消息]": "转发消息",
+    "[image]": "图片",
+    "[video]": "视频",
+    "[voice]": "语音",
+    "[file]": "文件",
+    "[face]": "表情",
+    "[forward]": "转发消息",
+}
+
+
+def strip_bracket_media_placeholders(text: str) -> str:
+    """把回复中字面的方括号媒体占位替换为裸词（防 LLM 模仿注入模板）。"""
+    value = text or ""
+    for bracket, bare in _BRACKET_PLACEHOLDER_TO_BARE.items():
+        value = value.replace(bracket, bare)
+    return value
 
 
 CROSS_SESSION_CONTEXT_INSTRUCTION = """[ChatMemory 跨会话来源规则]
@@ -189,12 +236,12 @@ class TakeoverContextBuilder:
         records: list[dict],
         max_records: Optional[int] = None,
         max_chars: int = 0,
+        keep_turn_id: bool = False,
     ) -> list[dict]:
-        records = [
-            record for record in records
-            if not is_pure_media(record, self.media_kinds)
-        ]
-
+        # 纯媒体记录不再丢弃：正文以媒体占位符（[图片] 等）呈现，保证 LLM
+        # 至少知道"这条消息带媒体"。内容白名单仍在上游 SQL 决定是否进入。
+        # keep_turn_id：内部路径需要把 turn_id 带回，用于把工具调用段插入
+        # 对应轮次（调用方用完必须 pop 掉，不对外泄漏）。
         # 拆分模式（默认）：不做 pop/合并，只从尾取 N 条；字符超上限则从头部逐条丢。
         if max_records is not None:
             records = records[-max(1, int(max_records)):]
@@ -248,6 +295,8 @@ class TakeoverContextBuilder:
 
         for context in formatted:
             context.pop("_solo", None)
+            if not keep_turn_id:
+                context.pop("_turn_id", None)
             context["_no_save"] = True
         return formatted
 
@@ -263,6 +312,8 @@ class TakeoverContextBuilder:
             # 有 relation_data 的正文已由 storage 层渲染成可信 <cm_mention>，跳过。
             if not record.get("relation_data"):
                 content = strip_cm_xml_tags(content)
+            # 媒体占位：纯媒体消息以占位文本呈现，混合消息在文本后补缺失占位。
+            content = self._with_media_placeholders(record, content)
             llm_status = record.get("llm_status", "")
             is_solo = (
                 role == "assistant"
@@ -285,8 +336,41 @@ class TakeoverContextBuilder:
                     content = self._apply_source_only(record, content)
                 content = self._apply_time_prefix(record, content)
 
-            formatted.append({"role": role, "content": content, "_solo": is_solo})
+            formatted.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "_solo": is_solo,
+                    "_turn_id": str(record.get("turn_id") or ""),
+                }
+            )
         return formatted
+
+    def _with_media_placeholders(self, record: dict, content: str) -> str:
+        """给媒体内容补可读占位。
+
+        纯媒体消息（内容为空或只有旧英文占位）直接输出占位串，如 ``[图片]``；
+        混合消息在文本末尾追加缺失的占位（已含同款占位则不重复），如
+        ``指挥官，你看这张图 [图片]``。
+        """
+        kinds = [
+            kind for kind in (record.get("content_kind") or [])
+            if kind in self.media_kinds and kind in MEDIA_PLACEHOLDER_LABELS
+        ]
+        if not kinds:
+            return content
+        labels = [
+            MEDIA_PLACEHOLDER_LABELS[kind]
+            for kind in kinds
+            if MEDIA_PLACEHOLDER_LABELS[kind] not in content
+        ]
+        if not labels:
+            return content
+        placeholder_text = " ".join(labels)
+        stripped = (content or "").strip()
+        if not stripped or stripped in _LEGACY_EN_PLACEHOLDERS:
+            return placeholder_text
+        return f"{content} {placeholder_text}".rstrip()
 
     def _apply_time_prefix(self, record: dict, content: str) -> str:
         """给消息加 <cm_time> 前缀（所有消息统一带时间，避免差异特征）。"""

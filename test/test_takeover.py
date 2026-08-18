@@ -268,6 +268,9 @@ def test_strip_cm_xml_tags():
     assert f('<cm_time>08/03 10:00:00') == ""  # 漏闭合
     assert f('<cm_nickname>Bob</cm_nickname> 说：你好') == "说：你好"
     assert f('<cm_reply target="Alice">引用原文</cm_reply> 好的') == "好的"
+    # 媒体占位标签同样整元素删除（防 LLM 模仿输出 cm_ 媒体标签）
+    assert f("好的 <cm_image/> 请查收") == "好的 请查收"
+    assert f("<cm_image>xxx</cm_image>正文") == "正文"
     assert f('<code>&lt;cm_source/&gt;</code>') == '<code>&lt;cm_source/&gt;</code>'
     assert f("普通回复") == "普通回复"
     print("[T30] strip_cm_xml_tags ✓")
@@ -409,17 +412,57 @@ def test_head_tail_normalize():
 
 
 def test_media_filter_mixed():
-    """纯媒体过滤；图文混合保留文本。"""
+    """纯媒体以 cm 媒体标签保留；图文混合在文本后补标签。"""
     p = _make_plugin()
     records = [
-        _rec(content="", kinds=["image"]),          # 纯图 → 丢
+        _rec(content="", kinds=["image"]),          # 纯图 → <cm_image/>
         _rec(content="带图文字", kinds=["image", "text"], nickname="Bob",
-             created_at="2026-07-09 10:00:03"),    # 图文 → 保留
+             created_at="2026-07-09 10:00:03"),    # 图文 → 文本 + <cm_image/>
     ]
     out = p._takeover_normalize(records, _UMO_GROUP)
-    assert len(out) == 1
-    assert "带图文字" in out[0]["content"]
+    assert len(out) == 2
+    assert out[0]["content"].endswith("<cm_image/>")
+    assert "带图文字 <cm_image/>" in out[1]["content"]
     print("[T10] media_filter_mixed ✓")
+
+
+def test_media_placeholders_solo_and_variants():
+    """占位细节：solo 纯图、多 kind、旧英文占位替换、已含标签不重复。"""
+    p = _make_plugin()
+    records = [
+        # 主动纯图(imago):solo 前缀 + cm 媒体标签
+        _rec(role="assistant", content="[image]", status="proactive",
+             kinds=["image"], created_at="2026-08-18 04:04:02"),
+        # 纯媒体多 kind
+        _rec(content="", kinds=["image", "voice"], created_at="2026-08-18 04:05:00"),
+        # 文本已含同款标签:不重复
+        _rec(content="看图 <cm_image/>", kinds=["text", "image"],
+             created_at="2026-08-18 04:06:00"),
+        # 无媒体 kind:原样
+        _rec(content="普通文本", kinds=["text"], created_at="2026-08-18 04:07:00"),
+    ]
+    out = p._takeover_normalize(records, _UMO_GROUP)
+    joined = "\n".join(c["content"] for c in out)
+    assert '<cm_solo active="1"/> <cm_image/>' in joined
+    assert "<cm_image/> <cm_voice/>" in joined
+    assert "看图 <cm_image/>" in joined
+    assert "看图 <cm_image/> <cm_image/>" not in joined
+    assert "普通文本" in joined
+    assert "普通文本 <cm_" not in joined
+    print("[T41] media_placeholders_solo_and_variants ✓")
+
+
+def test_strip_bracket_media_placeholders():
+    """LLM 回复中模仿的方括号占位字面清洗为裸词。"""
+    f = context_builder_mod.strip_bracket_media_placeholders
+    assert f("好的 [图片]") == "好的 图片"
+    assert f("发你 [语音] 和 [文件]") == "发你 语音 和 文件"
+    assert f("[image] [video]") == "图片 视频"
+    assert f("转发 [forward]") == "转发 转发消息"
+    assert f("普通回复，含 [自定义] 标签") == "普通回复，含 [自定义] 标签"
+    assert f("") == ""
+    assert f(None) == ""
+    print("[T43] strip_bracket_media_placeholders ✓")
 
 
 def test_character_budget_keeps_latest_user():
@@ -945,19 +988,37 @@ def test_capture_tool_writes_db():
 
 
 def test_takeover_replays_tool_contexts():
-    """接管/公开 API：CM 历史后追加工具段；CM 无历史时仅工具段也返回。"""
+    """接管/公开 API：工具段插入对应轮次内部；CM 无历史时仅工具段也返回。"""
     p = _make_plugin()
     p.ct_keep_tool_turns = 2
-    p.db = _FakeDB(rounds=[[_rec()]])
+    p.db = _FakeDB(rounds=[[
+        _rec(turn_id="turn_a"),
+        _rec(role="assistant", content="好的,正在绘制", turn_id="turn_a"),
+    ]])
     p.db.tool_records = [
         {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
          "tool_args": "{}", "tool_result": "任务 x 已创建"},
     ]
     out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert out[-2]["role"] == "assistant" and out[-2]["tool_calls"]
-    assert out[-1]["role"] == "tool" and "任务 x 已创建" in out[-1]["content"]
+    # [user, assistant(tool_calls), tool, assistant 最终回复] — 工具段在轮内
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
+    assert out[1]["tool_calls"][0]["id"] == "cm_tool_turn_a_0"
+    assert out[2]["tool_call_id"] == "cm_tool_turn_a_0"
+    assert "任务 x 已创建" in out[2]["content"]
+    assert "好的,正在绘制" in out[3]["content"]
     assert p.db.tool_query_kwargs == {"umo": _UMO_GROUP, "cid": "cid_demo",
                                       "turn_limit": 2}
+    # 输出不含私有定位键
+    assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in out)
+
+    # 工具段 turn 在历史中无匹配（如主动消息自造轮次）：回退追加尾部
+    p_tail = _make_plugin()
+    p_tail.db = _FakeDB(rounds=[[_rec(turn_id="turn_other"),
+                                 _rec(role="assistant", content="回复", turn_id="turn_other")]])
+    p_tail.db.tool_records = list(p.db.tool_records)
+    out_tail = asyncio.run(p_tail.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert [m["role"] for m in out_tail] == ["user", "assistant", "assistant", "tool"]
+    assert out_tail[-1]["role"] == "tool"
 
     # CM 无历史：只返回工具段（非空，严格接管不会清空它）
     p2 = _make_plugin()
@@ -965,12 +1026,108 @@ def test_takeover_replays_tool_contexts():
     p2.db.tool_records = list(p.db.tool_records)
     out2 = asyncio.run(p2.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
     assert [m["role"] for m in out2] == ["assistant", "tool"]
+    assert not any("_cm_tool_turn" in m for m in out2)
 
     # 两者都无：仍为 []
     p3 = _make_plugin()
     p3.db = _FakeDB(rounds=[])
     assert asyncio.run(p3.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo")) == []
     print("[T38] takeover_replays_tool_contexts ✓")
+
+
+def test_insert_tool_contexts_positions():
+    """_insert_tool_contexts：插到该轮 user 后；单边轮插 assistant 前；无匹配回退尾部。"""
+    p = _make_plugin()
+    f = p._insert_tool_contexts
+
+    def tool_seg(turn, name="draw"):
+        return [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": f"c_{turn}", "type": "function",
+                             "function": {"name": name, "arguments": "{}"}}],
+             "_cm_tool_turn": turn},
+            {"role": "tool", "tool_call_id": f"c_{turn}", "content": "ok",
+             "_cm_tool_turn": turn},
+        ]
+
+    history = [
+        {"role": "user", "content": "a", "_turn_id": "t1"},
+        {"role": "assistant", "content": "A", "_turn_id": "t1"},
+        {"role": "user", "content": "b", "_turn_id": "t2"},
+        {"role": "assistant", "content": "B", "_turn_id": "t2"},
+    ]
+    out = f(history, tool_seg("t2") + tool_seg("t1"))
+    assert [m["role"] for m in out] == [
+        "user", "assistant", "tool", "assistant",   # t1 段插在 user a 后
+        "user", "assistant", "tool", "assistant",   # t2 段插在 user b 后
+    ]
+    assert out[1]["tool_calls"][0]["id"] == "c_t1"
+    assert out[5]["tool_calls"][0]["id"] == "c_t2"
+    # 单边 assistant 轮：插在其前
+    out2 = f([{"role": "assistant", "content": "solo", "_turn_id": "t3"}],
+             tool_seg("t3"))
+    assert [m["role"] for m in out2] == ["assistant", "tool", "assistant"]
+    # 无匹配 turn：回退尾部
+    out3 = f([{"role": "user", "content": "x", "_turn_id": "t9"}],
+             tool_seg("tX"))
+    assert [m["role"] for m in out3] == ["user", "assistant", "tool"]
+    # 私有定位键全部剥除
+    for produced in (out, out2, out3):
+        assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in produced)
+    print("[T42] insert_tool_contexts_positions ✓")
+
+
+def test_log_with_bot_id_migration():
+    """log_with_bot_id 旧组迁移：顶层键优先，缺失时继承旧 log_config 值。"""
+    p = _make_plugin()
+    f = p._resolve_log_with_bot_id
+    # 顶层键显式设置（含 False）：旧组残留不影响
+    assert f({"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}) is True
+    assert f({"log_with_bot_id": False, "log_config": {"log_with_bot_id": True}}) is False
+    # 顶层键未写入：继承旧组值
+    assert f({"log_config": {"log_with_bot_id": True}}) is True
+    assert f({"log_config": {"log_with_bot_id": False}}) is False
+    # 都没有：默认关闭
+    assert f({}) is False
+    print("[T39] log_with_bot_id_migration ✓")
+
+
+def test_migrate_log_config_writes_back_and_drops_legacy():
+    """_migrate_log_config：并入顶层、删除旧组并写回；顶层已有值只删旧组。"""
+    p = _make_plugin()
+
+    class _FakeConfig(dict):
+        def __init__(self, data):
+            super().__init__(data)
+            self.saved = None
+
+        def save_config(self):
+            self.saved = dict(self)
+
+    # 顶层键未写入：继承旧值并删除旧组
+    cfg = _FakeConfig({"log_config": {"log_with_bot_id": True, "debug_to_info": True}})
+    p._config = cfg
+    asyncio.run(p._migrate_log_config())
+    assert cfg.get("log_with_bot_id") is True
+    assert "log_config" not in cfg
+    assert cfg.saved is not None
+    assert cfg.saved.get("log_with_bot_id") is True
+    assert "log_config" not in cfg.saved
+
+    # 顶层键已有（含 False）：不覆盖顶层，仅删除旧组
+    cfg2 = _FakeConfig({"log_with_bot_id": False,
+                        "log_config": {"log_with_bot_id": True}})
+    p._config = cfg2
+    asyncio.run(p._migrate_log_config())
+    assert cfg2.get("log_with_bot_id") is False
+    assert "log_config" not in cfg2
+
+    # 无旧组：no-op，不触发写回
+    cfg3 = _FakeConfig({"log_with_bot_id": True})
+    p._config = cfg3
+    asyncio.run(p._migrate_log_config())
+    assert cfg3.saved is None
+    print("[T40] migrate_log_config_writes_back_and_drops_legacy ✓")
 
 
 def test_instruction_idempotent():

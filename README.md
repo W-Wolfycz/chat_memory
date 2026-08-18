@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.2.2`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=4`。
+当前发布版本：`1.2.3`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=4`。
 
 ## 特性
 
@@ -217,7 +217,7 @@ contexts = await cm.build_takeover_contexts(
 
 默认采用**严格接管**：即使 CM 查询无数据或过滤后为空，也会显式把 `req.contexts` 替换为 CM 数据（空结果时仅保留原生工具段，见下），不会静默回退到 native history。若确实需要兼容回退，可开启 `fallback_to_native_on_empty`。
 
-**工具调用上下文保留**：LLM 的每次工具调用（`on_llm_tool_respond`）都会写入 CM 独立工具表；接管构建 contexts 时把最近 `keep_tool_turns`（默认 2）个轮次的工具记录回放成 OpenAI 格式（`assistant(tool_calls)` + `role=tool`）追加在历史尾部，让 LLM 跨轮继续看到上一轮的工具调用与工具返回（如"任务已创建，不要再次调用"），避免上下文缺口导致重复调用工具、重复扣费。工具段固定查当前会话，不参与 cross_session/full_group/persona 过滤；参数与返回文本跟随 `max_content_length` 截断（参数超限时替换为合法 JSON 占位）。接管关闭或 `fallback_to_native_on_empty` 开启时原生历史原样保留，AstrBot 自带工具记录不受影响。同轮工具循环内的多次 LLM 调用使用内存消息流，本轮工具结果天然可见。
+**工具调用上下文保留**：LLM 的每次工具调用（`on_llm_tool_respond`）都会写入 CM 独立工具表；接管构建 contexts 时把最近 `keep_tool_turns`（默认 2）个轮次的工具记录回放成 OpenAI 格式（`assistant(tool_calls)` + `role=tool`）、**插入对应轮次内部**（该轮 user 之后、最终回复之前，与 AstrBot 原生历史顺序一致；轮次无匹配时回退尾部），让 LLM 跨轮继续看到上一轮的工具调用与工具返回（如"任务已创建，不要再次调用"），避免上下文缺口导致重复调用工具、重复扣费。工具段固定查当前会话，不参与 cross_session/full_group/persona 过滤；参数与返回文本跟随 `max_content_length` 截断（参数超限时替换为合法 JSON 占位）。接管关闭或 `fallback_to_native_on_empty` 开启时原生历史原样保留，AstrBot 自带工具记录不受影响。同轮工具循环内的多次 LLM 调用使用内存消息流，本轮工具结果天然可见。
 
 CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚阶段 `priority=-1000` 追加，尽量位于其他记忆/上下文注入之后。AstrBot 仍按 priority 从大到小执行，第三方插件若注册更低值仍可继续修改请求。CM 新增的焦点 part 使用 `mark_as_temp()`，不写入 native history。
 
@@ -408,6 +408,8 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 - **默认 ANY + `["text"]`**：含文本即进（纯文 ✓ / 文+图 ✓ / 纯图 ✗ / poke 通知 ✗）
 - **ALL + `["text","image"]`**：精确限定为这两种 kind
 - **清空**：不过滤，全量进入
+
+**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_image/>` / `<cm_voice/>` / `<cm_video/>` / `<cm_file/>` / `<cm_face/>` / `<cm_forward/>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_image/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
 
 ### persona 隔离（filter_by_persona）
 

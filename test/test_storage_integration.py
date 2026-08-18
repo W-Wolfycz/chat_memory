@@ -161,6 +161,9 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
         assert "当前群回答" in group_contexts[1]["content"]
 
         # 工具调用上下文（方案 B）：落库 → 回放渲染成 OpenAI 格式 → 追加到接管结果。
+        # 复位 cross_session/full_group：主表记录未写 platform_id，跨会话查询会匹配不到。
+        plugin.ct_cross_session = False
+        plugin.ct_full_group = False
         await plugin.db.insert_tool_record(
             umo, cid, "turn_tool_demo", 1, "draw", '{"prompt": "猫"}',
             "任务 demo_task 已创建，不要再次调用",
@@ -185,7 +188,7 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
         assert rendered[1]["tool_call_id"] == "cm_tool_turn_too_0"
         assert "demo_task" in rendered[1]["content"]
 
-        # 接管结果末尾追加工具段（tool_records 已写入）
+        # 接管结果：turn_tool_demo 与主表轮次不同 → 回退追加尾部
         contexts = await plugin.build_takeover_contexts(
             umo=umo, user_id="10001", conversation_id=cid,
         )
@@ -194,9 +197,34 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
         assert contexts[-3]["role"] == "assistant"
         assert contexts[-3]["tool_calls"][0]["id"] == "cm_tool_turn_too_0"
 
+        # turn 匹配主表配对轮次时：工具段插入该轮 user 之后、最终回复之前
+        await plugin.db.insert_tool_record(
+            umo, cid, "turn_public_api", 1, "draw", "{}", "轮内任务已创建",
+        )
+        in_round = await plugin.build_takeover_contexts(
+            umo=umo, user_id="10001", conversation_id=cid,
+        )
+        assert [m["role"] for m in in_round] == [
+            "user", "assistant", "tool", "assistant", "assistant", "tool", "tool",
+        ]
+        assert in_round[1]["tool_calls"][0]["id"] == "cm_tool_turn_pub_0"
+        assert in_round[2]["content"] == "轮内任务已创建"
+        assert "公开 API 回答" in in_round[3]["content"]
+
         # /reset 联动：工具表与主表同 CID 记录一起清除
         await plugin.db.delete_by_conversation(umo, cid)
         assert await plugin.db.query_tool_records(umo, cid, turn_limit=2) == []
+
+        # 日志配置迁移：旧 log_config 组并入顶层并移除旧组（dict config 仅内存迁移）
+        migrate_cfg = {
+            "log_with_bot_id": None,
+            "log_config": {"log_with_bot_id": True, "debug_to_info": True},
+        }
+        plugin._config = migrate_cfg
+        await plugin._migrate_log_config()
+        assert migrate_cfg.get("log_with_bot_id") is True
+        assert "log_config" not in migrate_cfg
+        assert plugin.log_with_bot_id is True
 
         await plugin.terminate()
 
