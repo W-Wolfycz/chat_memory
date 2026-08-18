@@ -1,8 +1,16 @@
 # Changelog
 
-ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前为 `3`。
+ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前为 `4`。
 
 > 下方各版本记录的是该版本发布时的实际格式。旧条目中的 `[当前发言者]`、`<cm s="N"/>`、`<cm_history_tail/>` 等均为已经退役的历史协议，不代表当前版本仍会生成或接受这些标签；当前格式以最新版本条目和 README 为准。
+
+## 1.2.2 — 2026-08-17
+
+- **工具调用入库与接管回放**：新增 `on_llm_tool_respond` 捕获，工具调用写入独立表 `chat_memory_tool_records`（schema v4），接管时按 `keep_tool_turns`（默认 2）回放为 OpenAI 格式追加到 contexts——修复启用接管后 LLM 跨轮看不到工具调用与返回、重复调用绘图工具的问题。二进制结果不入库，参数超长替换为合法 JSON 占位；`/reset` 与自动清理联动。
+- **隐私**：昵称缺失时 `<cm_nickname>` / `<cm_reply target>` 不再回退 user_id（改用 `?` / `未知成员`），账号 ID 不进 LLM 上下文。
+- **热路径小优化**：tool loop 重复 llm_status 升级改为幂等早退；接管复用 capture_user 缓存的 persona；删除冗余排序；`/reset` 合并 COUNT+DELETE。
+- **日志配置**：删除 `log_config` 组与"日志提级"（改由 AstrBot WebUI 运行期调整插件日志等级，见知识库 `plugin-log-level.md`）；`log_with_bot_id` 保留为顶层配置项。
+- 测试：行为级 38 项 + 存储集成（含 v2→v4 迁移与工具表生命周期）。
 
 ## 1.2.1 — 2026-08-04
 

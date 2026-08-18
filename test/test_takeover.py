@@ -33,7 +33,21 @@ for m in ["astrbot.api", "astrbot.api.star", "astrbot.api.event",
           "astrbot.core", "astrbot.core.agent", "astrbot.core.agent.message"]:
     sys.modules[m] = types.ModuleType(m)
 
-sys.modules["astrbot.api"].logger = None
+class _MockLogger:
+    def debug(self, *a, **k):
+        pass
+
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass
+
+
+sys.modules["astrbot.api"].logger = _MockLogger()
 sys.modules["astrbot.api"].Star = object
 sys.modules["astrbot.api"].Context = object
 sys.modules["astrbot.api"].AstrBotConfig = dict
@@ -68,6 +82,11 @@ class _Filter:
         return d
 
     def on_decorating_result(self, *a, **k):
+        def d(f):
+            return f
+        return d
+
+    def on_llm_tool_respond(self, *a, **k):
         def d(f):
             return f
         return d
@@ -170,7 +189,8 @@ def _make_plugin():
     p.ct_fallback_to_native_on_empty = False
     p.ct_clear_native_history = True
     p.log_with_bot_id = False
-    p.debug_to_info = False
+    p.max_len = 0
+    p.ct_keep_tool_turns = 2
     return p
 
 
@@ -283,6 +303,18 @@ def test_user_prefix_basic():
     out2 = p._takeover_normalize([_rec(created_at="")], _UMO_GROUP)
     assert out2[0]["content"] == "<cm_nickname>Alice</cm_nickname> 你好"
     print("[T05] user_prefix_basic ✓")
+
+
+def test_nickname_fallback_hides_user_id():
+    """昵称缺失时不回退 user_id：cm_nickname 用中性的 ?，账号 ID 不进入上下文。"""
+    p = _make_plugin()
+    out = p._takeover_normalize(
+        [_rec(nickname="", user_id="10001")], _UMO_GROUP,
+    )
+    content = out[0]["content"]
+    assert "<cm_nickname>?</cm_nickname> 你好" in content
+    assert "10001" not in content
+    print("[T33] nickname_fallback_hides_user_id ✓")
 
 
 def test_full_group_speaker_xml():
@@ -421,11 +453,29 @@ def test_apply_relation_reply():
         "fallback_text": "快照原文"}})
     out2 = p._takeover_normalize([rec2], _UMO_GROUP)
     assert '<cm_reply target="虾仁粽子">快照原文</cm_reply>' in out2[0]["content"]
-    # 全空降级
+    # 全空降级：昵称与原文都缺失 → 不泄露账号，仅中性未知成员标记
     rec3 = _rec(content="y", relation={"v": 1, "mentions": [], "reply": {}})
     out3 = p._takeover_normalize([rec3], _UMO_GROUP)
-    assert "<cm_reply/>" in out3[0]["content"]
+    assert '<cm_reply target="未知成员"/>' in out3[0]["content"]
     print("[T12] apply_relation_reply ✓")
+
+
+def test_reply_target_hides_user_id():
+    """Reply 目标昵称缺失时不回退 user_id：账号 ID 不进入 LLM 上下文。"""
+    p = _make_plugin()
+    target = {"sender_nickname": "", "content": "被引用的原文", "user_id": "10001"}
+    rec = _rec(content="回复内容", user_id="u1",
+               relation={"v": 1, "mentions": [], "reply": {
+                   "resolution": "turn", "target_turn_id": "turn_1",
+                   "target_role": "user"}})
+    out = p._takeover_normalize(
+        [rec], _UMO_GROUP,
+        target_map={("turn_1", "user"): target},
+    )
+    content = out[0]["content"]
+    assert '<cm_reply target="未知成员">被引用的原文</cm_reply>' in content
+    assert "10001" not in content
+    print("[T32] reply_target_hides_user_id ✓")
 
 
 def test_cross_session_source_tags():
@@ -706,6 +756,223 @@ def test_row_to_dict_mapping():
 # ── 测试用例：main 指令与接管策略 ────────────────────
 
 
+class _EventStub:
+    """最小 event 桩：extras 与事件级属性，供 main 钩子方法测试。"""
+
+    def __init__(self, extras=None, umo=_UMO_GROUP, sender="u1"):
+        self._extras = dict(extras or {})
+        self.unified_msg_origin = umo
+        self._sender = sender
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_sender_id(self):
+        return self._sender
+
+
+def test_mark_llm_triggered_idempotent():
+    """同一事件多次 LLM 调用（tool loop）只升级一次 llm_status，避免重复 DB 写。"""
+    p = _make_plugin()
+    updates = []
+
+    async def fake_update(umo, cid, turn_id, status):
+        updates.append((turn_id, status))
+        return 1
+
+    p._safe_update_llm_status_by_turn = fake_update
+    event = _EventStub(extras={
+        "chat_memory_captured": True,
+        "chat_memory_cid": "cid_demo",
+        "chat_memory_turn_id": "turn_x",
+    })
+    req = types.SimpleNamespace()
+    for _ in range(3):
+        asyncio.run(p.mark_llm_triggered(event, req))
+    assert updates == [("turn_x", "llm_pending")]
+    assert event.get_extra("chat_memory_llm_triggered") is True
+    print("[T34] mark_llm_triggered_idempotent ✓")
+
+
+def test_takeover_reuses_cached_persona():
+    """filter_by_persona 复用 capture_user 缓存的 persona，不重复解析；缺失时兜底解析。"""
+    p = _make_plugin()
+    p.ct_filter_by_persona = True
+    p.ct_clear_native_history = True
+    resolved = []
+
+    async def fake_effective(umo, event, cid):
+        resolved.append(cid)
+        return "p_resolved"
+
+    p._get_effective_persona = fake_effective
+    seen = {}
+
+    async def fake_build(umo=None, user_id=None, conversation_id=None,
+                         persona_id="", exclude_turn_id=""):
+        seen["persona_id"] = persona_id
+        return [{"role": "user", "content": "x"}]
+
+    p.build_takeover_contexts = fake_build
+
+    async def fake_reset_history(umo, cid):
+        return None
+
+    p._safe_reset_history = fake_reset_history
+
+    async def fake_cid(umo):
+        return "cid_demo"
+
+    p._get_curr_cid = fake_cid
+
+    # 已缓存：不触发解析
+    event = _EventStub(extras={"chat_memory_persona_id": "p1",
+                               "chat_memory_turn_id": "turn_x"})
+    req = types.SimpleNamespace(system_prompt="", contexts=[], extra_user_content_parts=[])
+    asyncio.run(p.take_over_context(event, req))
+    assert resolved == []
+    assert seen.get("persona_id") == "p1"
+    assert req.contexts == [{"role": "user", "content": "x"}]
+    assert event.get_extra("chat_memory_takeover_applied") is True
+
+    # 未缓存：兜底解析一次
+    event2 = _EventStub(extras={"chat_memory_turn_id": "turn_y"})
+    req2 = types.SimpleNamespace(system_prompt="", contexts=[], extra_user_content_parts=[])
+    asyncio.run(p.take_over_context(event2, req2))
+    assert resolved == ["cid_demo"]
+    assert seen.get("persona_id") == "p_resolved"
+    print("[T35] takeover_reuses_cached_persona ✓")
+
+
+def test_build_tool_contexts_and_result_text():
+    """方案 B：工具记录渲染成 OpenAI 格式；结果提取只取文本、图片用占位符。"""
+    p = _make_plugin()
+    records = [
+        {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
+         "tool_args": '{"prompt": "猫"}', "tool_result": "任务 x 已创建，不要再次调用"},
+        {"turn_id": "turn_a", "call_index": 2, "tool_name": "query",
+         "tool_args": "{}", "tool_result": "运行中：任务 x"},
+        {"turn_id": "turn_b", "call_index": 1, "tool_name": "draw",
+         "tool_args": '{"prompt": "狗"}', "tool_result": "第二任务已创建"},
+    ]
+    out = p._build_tool_contexts(records)
+    assert [m["role"] for m in out] == ["assistant", "tool", "tool", "assistant", "tool"]
+    # 每轮一条 assistant(tool_calls)，N 条 role=tool，id 自造且成对
+    assert [c["id"] for c in out[0]["tool_calls"]] == ["cm_tool_turn_a_0", "cm_tool_turn_a_1"]
+    assert [c["function"]["name"] for c in out[0]["tool_calls"]] == ["draw", "query"]
+    assert out[1]["tool_call_id"] == "cm_tool_turn_a_0"
+    assert out[2]["tool_call_id"] == "cm_tool_turn_a_1"
+    assert out[2]["content"] == "运行中：任务 x"
+    assert out[3]["tool_calls"][0]["id"] == "cm_tool_turn_b_0"
+    assert out[4]["tool_call_id"] == "cm_tool_turn_b_0"
+    assert out[0]["content"] is None
+
+    # 结果提取：TextContent 文本、图片占位、structured、isError、None
+    class _Text:
+        text = "完成"
+    class _Image:
+        data = "base64secret"
+    class _ResText:
+        resource = types.SimpleNamespace(text="资源文本")
+    class _ResBlob:
+        resource = types.SimpleNamespace()
+    class _Res:
+        content = [_Text(), _Image(), _ResText(), _ResBlob()]
+        structuredContent = {"task": "x"}
+        isError = False
+    text = p._tool_result_to_text(_Res())
+    assert "完成" in text and "[image content]" in text and "资源文本" in text
+    assert "base64secret" not in text
+    assert '{"task": "x"}' in text
+    assert p._tool_result_to_text(None) == ""
+    _Res.isError = True
+    assert p._tool_result_to_text(_Res()).startswith("[error]")
+    _Res.isError = False
+
+    # 参数截断保 JSON 合法；0/未超限不截断
+    assert p._truncate_tool_args('{"a": 1}', 50) == '{"a": 1}'
+    assert p._truncate_tool_args('{"a": 1}', 3) == '{"_cm_truncated": true}'
+    assert p._truncate_tool_args("x" * 100, 0) == "x" * 100
+    print("[T36] build_tool_contexts_and_result_text ✓")
+
+
+def test_capture_tool_writes_db():
+    """on_llm_tool_respond：按轮次落库，(turn_id, call_index) 递增，文本截断。"""
+    p = _make_plugin()
+    p.db = _FakeDB()
+    p.max_len = 10
+
+    async def fake_cid(umo):
+        return "cid_demo"
+
+    p._get_curr_cid = fake_cid
+
+    class _Tool:
+        name = "draw"
+
+    class _Result:
+        content = [types.SimpleNamespace(text="任务 x 已创建，不要再次调用")]
+        structuredContent = None
+        isError = False
+
+    event = _EventStub(extras={"chat_memory_turn_id": "turn_x",
+                               "chat_memory_cid": "cid_demo"})
+    for _ in range(2):
+        asyncio.run(p.capture_tool(event, _Tool(), {"prompt": "猫"}, _Result()))
+    assert len(p.db.inserted_tools) == 2
+    row = p.db.inserted_tools[1]
+    assert row["turn_id"] == "turn_x"
+    assert row["call_index"] == 2
+    assert row["tool_name"] == "draw"
+    # max_len=10：args 超限被替换为合法 JSON 占位；result 按字符截断
+    assert row["tool_args"] == '{"_cm_truncated": true}'
+    assert row["tool_result"] == "任务 x 已创建，不要再次调用"[:10]
+
+    # 主动消息无 turn_id：自造并复用；无 cid 时跳过
+    event2 = _EventStub(extras={})
+
+    async def fake_cid_none(umo):
+        return ""
+
+    p._get_curr_cid = fake_cid_none
+    before = len(p.db.inserted_tools)
+    asyncio.run(p.capture_tool(event2, _Tool(), None, None))
+    assert len(p.db.inserted_tools) == before
+    print("[T37] capture_tool_writes_db ✓")
+
+
+def test_takeover_replays_tool_contexts():
+    """接管/公开 API：CM 历史后追加工具段；CM 无历史时仅工具段也返回。"""
+    p = _make_plugin()
+    p.ct_keep_tool_turns = 2
+    p.db = _FakeDB(rounds=[[_rec()]])
+    p.db.tool_records = [
+        {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
+         "tool_args": "{}", "tool_result": "任务 x 已创建"},
+    ]
+    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert out[-2]["role"] == "assistant" and out[-2]["tool_calls"]
+    assert out[-1]["role"] == "tool" and "任务 x 已创建" in out[-1]["content"]
+    assert p.db.tool_query_kwargs == {"umo": _UMO_GROUP, "cid": "cid_demo",
+                                      "turn_limit": 2}
+
+    # CM 无历史：只返回工具段（非空，严格接管不会清空它）
+    p2 = _make_plugin()
+    p2.db = _FakeDB(rounds=[])
+    p2.db.tool_records = list(p.db.tool_records)
+    out2 = asyncio.run(p2.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert [m["role"] for m in out2] == ["assistant", "tool"]
+
+    # 两者都无：仍为 []
+    p3 = _make_plugin()
+    p3.db = _FakeDB(rounds=[])
+    assert asyncio.run(p3.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo")) == []
+    print("[T38] takeover_replays_tool_contexts ✓")
+
+
 def test_instruction_idempotent():
     """3 条 system 指令幂等追加：重复调用只加一次。"""
     p = _make_plugin()
@@ -751,7 +1018,10 @@ class _FakeDB:
     def __init__(self, rounds=None, messages=None):
         self.rounds = rounds or []       # list[list[dict]]，pair 模式
         self.messages = messages or []   # list[dict]，mixed 模式
+        self.tool_records = []           # list[dict]，工具表回放
+        self.inserted_tools = []         # capture_tool 写入记录
         self.last_kwargs = {}
+        self.tool_query_kwargs = {}
 
     async def query_rounds_raw(self, *a, **k):
         self.last_kwargs = dict(k)
@@ -763,6 +1033,19 @@ class _FakeDB:
 
     async def query_turn_targets(self, *a, **k):
         return {}
+
+    async def query_tool_records(self, umo, cid, turn_limit=2):
+        self.tool_query_kwargs = {"umo": umo, "cid": cid,
+                                  "turn_limit": turn_limit}
+        return list(self.tool_records)
+
+    async def insert_tool_record(self, umo, cid, turn_id, call_index,
+                                 tool_name, tool_args, tool_result):
+        self.inserted_tools.append({
+            "umo": umo, "cid": cid, "turn_id": turn_id,
+            "call_index": call_index, "tool_name": tool_name,
+            "tool_args": tool_args, "tool_result": tool_result,
+        })
 
 
 def test_public_build_takeover_contexts_api():

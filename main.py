@@ -20,6 +20,7 @@ assistant 配对：新记录优先用内部 ``turn_id``；旧记录用 ``pair_id
 """
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Optional, Union
@@ -78,10 +79,9 @@ class ChatMemoryPlugin(Star):
 
         self.max_len = config.get("max_content_length", 0)
         self.auto_cleanup_days = config.get("auto_cleanup_days", 0)
-
-        log_conf = config.get("log_config", {})
-        self.log_with_bot_id = log_conf.get("log_with_bot_id", False)
-        self.debug_to_info = log_conf.get("debug_to_info", False)
+        # 日志前缀附加机器人 ID（顶层配置）：多 Bot 实例环境便于定位。
+        # 日志等级不再由插件配置：AstrBot WebUI 可运行期修改插件日志等级。
+        self.log_with_bot_id = bool(config.get("log_with_bot_id", False))
 
         ct_conf = config.get("context_takeover", {}) or {}
         self.ct_enable = bool(ct_conf.get("enable", False))
@@ -107,6 +107,10 @@ class ChatMemoryPlugin(Star):
         # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时跳过（兜底）
         # 与 cross_session=T 协同可获完整 persona 隔离体验（切 persona + /new + 切回仍可见旧数据）
         self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
+        # 工具调用上下文：接管时回放 CM 库中最近 N 个轮次的工具调用记录
+        # （assistant tool_calls + role=tool），保证 LLM 跨轮看到工具返回，
+        # 不重复调用工具（重复建任务、重复扣费）。最小 1，无上限钳制。
+        self.ct_keep_tool_turns = max(1, int(ct_conf.get("keep_tool_turns", 2)))
 
         # 读取 AstrBot 全局时区配置（IANA 名称如 "Asia/Shanghai"），传给 DBManager
         # 做查询输出转换：存储统一 UTC naive，返回时转此 tz naive
@@ -186,7 +190,7 @@ class ChatMemoryPlugin(Star):
                             f"早于 {self.auto_cleanup_days} 天的记录"
                         )
                     else:
-                        self._log(f"{self._log_prefix()} 自动清理：本轮无可清理记录")
+                        logger.debug(f"{self._log_prefix()} 自动清理：本轮无可清理记录")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -230,12 +234,6 @@ class ChatMemoryPlugin(Star):
                     comp.text = cleaned
                     changed = True
         return changed
-
-    def _log(self, msg: str):
-        if self.debug_to_info:
-            logger.info(msg)
-        else:
-            logger.debug(msg)
 
     @staticmethod
     def _extract_text(event: AstrMessageEvent) -> str:
@@ -387,19 +385,19 @@ class ChatMemoryPlugin(Star):
         umo = getattr(event, "unified_msg_origin", "")
         user_id = event.get_sender_id() or ""
         if not umo or not user_id:
-            self._log(f"{self._log_prefix(event)} 跳过 user 捕获：umo 或 user_id 为空")
+            logger.debug(f"{self._log_prefix(event)} 跳过 user 捕获：umo 或 user_id 为空")
             return False
 
         try:
             if user_id == event.get_self_id():
-                self._log(f"{self._log_prefix(event)} 跳过 user 捕获：BOT 自身消息")
+                logger.debug(f"{self._log_prefix(event)} 跳过 user 捕获：BOT 自身消息")
                 return False
         except Exception:
             pass
 
         # cron 平台：跳过 user capture 且不标 attempted → capture_bot 走 proactive 分支
         if self._get_platform_name(event) == "cron":
-            self._log(f"{self._log_prefix(event)} cron 平台，跳过 user 捕获（assistant 将标 proactive）")
+            logger.debug(f"{self._log_prefix(event)} cron 平台，跳过 user 捕获（assistant 将标 proactive）")
             return False
 
         # 以下路径都是"真正尝试过 capture"：cid 未就绪、内容空、写库失败都属 orphan
@@ -408,7 +406,7 @@ class ChatMemoryPlugin(Star):
 
         cid = await self._get_curr_cid(umo)
         if not cid:
-            self._log(f"{self._log_prefix(event)} 跳过 user 捕获：cid 暂未创建（首条消息可能漏存）")
+            logger.debug(f"{self._log_prefix(event)} 跳过 user 捕获：cid 暂未创建（首条消息可能漏存）")
             return False
 
         kind, at_id, reply_id, forward_id = self._classify_content(event)
@@ -425,7 +423,7 @@ class ChatMemoryPlugin(Star):
 
         # empty 且无任何引用字段：什么都没存，跳过
         if not content and at_id is None and reply_id is None and forward_id is None:
-            self._log(f"{self._log_prefix(event)} 跳过 user 捕获：消息完全为空")
+            logger.debug(f"{self._log_prefix(event)} 跳过 user 捕获：消息完全为空")
             return False
 
         msg_id = self._get_message_id(event)
@@ -466,7 +464,7 @@ class ChatMemoryPlugin(Star):
         if reply_id: ref_repr.append(f"reply={reply_id[:8]}")
         if forward_id: ref_repr.append(f"fwd={forward_id[:8]}")
         ref_str = f"[{','.join(ref_repr)}]" if ref_repr else ""
-        self._log(
+        logger.debug(
             f"{self._log_prefix(event)} user[{msg_id[:8] or '-'}][{kind_repr}]{ref_str} -> "
             f"{user_id}@{cid[:8]}: {content[:60]}"
         )
@@ -515,8 +513,13 @@ class ChatMemoryPlugin(Star):
     @filter.on_llm_request()
     async def mark_llm_triggered(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM 调用时：兜底重试 user 捕获并按 ``turn_id`` 升级为 ``llm_pending``。"""
+        # 同一事件可能触发多次 LLM 调用（tool loop）：状态已升级过就早退，避免重复 DB 写。
+        # 捕获失败时不会设置该标记，后续 LLM 调用仍会重试兜底捕获。
+        if event.get_extra("chat_memory_llm_triggered"):
+            return
+
         if not event.get_extra("chat_memory_captured"):
-            self._log(f"{self._log_prefix(event)} LLM 触发，补捕获 user（首条消息兜底）")
+            logger.debug(f"{self._log_prefix(event)} LLM 触发，补捕获 user（首条消息兜底）")
             ok = await self._capture_user_internal(event)
             if not ok:
                 logger.warning(f"{self._log_prefix(event)} LLM 触发但 user 捕获失败，放弃 llm_status 更新")
@@ -534,7 +537,180 @@ class ChatMemoryPlugin(Star):
             logger.warning(f"{self._log_prefix(event)} user 已捕获但缺少 turn_id，跳过 llm_status 更新")
             return
         await self._safe_update_llm_status_by_turn(umo, cid, turn_id, _LLM_PENDING)
-        self._log(f"{self._log_prefix(event)} turn[{turn_id[:8]}] llm_status -> llm_pending")
+        logger.debug(f"{self._log_prefix(event)} turn[{turn_id[:8]}] llm_status -> llm_pending")
+
+    # ── 工具调用捕获（写入 CM 数据库）──────────────────
+
+    @staticmethod
+    def _tool_result_to_text(tool_result) -> str:
+        """把 CallToolResult 转成可存档的纯文本。
+
+        只取文本内容；图片/二进制资源用占位符（runner 消息流里 LLM 看到的
+        也是缓存路径文本而非 base64），不把敏感二进制原样入库。
+        """
+        if tool_result is None:
+            return ""
+        parts: list[str] = []
+        for item in getattr(tool_result, "content", None) or []:
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            resource = getattr(item, "resource", None)
+            if resource is not None:
+                resource_text = getattr(resource, "text", None)
+                if isinstance(resource_text, str):
+                    parts.append(resource_text)
+                else:
+                    parts.append("[resource content]")
+                continue
+            if hasattr(item, "data"):  # ImageContent 等二进制块
+                parts.append("[image content]")
+                continue
+            try:
+                parts.append(str(item))
+            except Exception:
+                parts.append("[unparsed content]")
+        structured = getattr(tool_result, "structuredContent", None)
+        if isinstance(structured, dict) and structured:
+            try:
+                parts.append(
+                    json.dumps(structured, ensure_ascii=False, default=str)
+                )
+            except Exception:
+                parts.append("[structured content]")
+        text = "\n\n".join(part for part in parts if part).strip()
+        if text and getattr(tool_result, "isError", False):
+            text = f"[error] {text}"
+        return text
+
+    @staticmethod
+    def _truncate_tool_args(args_json: str, max_chars: int) -> str:
+        """截断 tool 参数时必须保持合法 JSON（provider 会校验 arguments）。
+
+        超限直接替换为占位对象，避免把截断后的非法 JSON 回放给 LLM。
+        """
+        if max_chars <= 0 or len(args_json) <= max_chars:
+            return args_json
+        return '{"_cm_truncated": true}'
+
+    @staticmethod
+    def _build_tool_contexts(records: list[dict]) -> list[dict]:
+        """把工具记录渲染成 OpenAI 格式：每轮一条 assistant(tool_calls) + N 条 role=tool。
+
+        tool_call_id 为 CM 自造（``cm_tool_<turn>_<n>``），只要求同一轮内
+        assistant 与 tool 消息成对一致，provider 不校验其来源。
+        """
+        grouped: dict[str, list[dict]] = {}
+        order: list[str] = []
+        for record in records:
+            turn_id = str(record.get("turn_id") or "")
+            if turn_id not in grouped:
+                grouped[turn_id] = []
+                order.append(turn_id)
+            grouped[turn_id].append(record)
+
+        contexts: list[dict] = []
+        for turn_id in order:
+            recs = grouped[turn_id]
+            call_ids = [f"cm_tool_{turn_id[:8]}_{i}" for i in range(len(recs))]
+            contexts.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_ids[i],
+                            "type": "function",
+                            "function": {
+                                "name": recs[i].get("tool_name") or "",
+                                "arguments": recs[i].get("tool_args") or "{}",
+                            },
+                        }
+                        for i in range(len(recs))
+                    ],
+                }
+            )
+            for i, record in enumerate(recs):
+                contexts.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_ids[i],
+                        "content": record.get("tool_result") or "",
+                    }
+                )
+        return contexts
+
+    async def _safe_insert_tool(
+        self,
+        umo: str,
+        cid: str,
+        turn_id: str,
+        call_index: int,
+        tool_name: str,
+        tool_args: str,
+        tool_result: str,
+    ) -> bool:
+        try:
+            await self.db.insert_tool_record(
+                umo, cid, turn_id, call_index, tool_name, tool_args, tool_result
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} 工具调用写入失败: {e}")
+            return False
+
+    async def _query_tool_contexts(self, umo: str, cid: str) -> list[dict]:
+        """按当前接管配置回放 CM 库中最近 N 轮工具调用为 OpenAI 格式 contexts。"""
+        try:
+            records = await self.db.query_tool_records(
+                umo, cid, self.ct_keep_tool_turns
+            )
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} 工具上下文查询失败: {e}")
+            return []
+        return self._build_tool_contexts(records)
+
+    @filter.on_llm_tool_respond()
+    async def capture_tool(self, event: AstrMessageEvent, tool, tool_args, tool_result):
+        """LLM 工具调用完成后立即落库（独立工具表，不进 user/assistant 配对）。
+
+        turn_id 复用当前轮（主动消息无轮次时自造）；``(turn_id, call_index)``
+        幂等。参数与返回文本跟随 ``max_content_length`` 截断（0=不截断）。
+        """
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if not umo:
+            return
+        cid = event.get_extra("chat_memory_cid") or await self._get_curr_cid(umo)
+        if not cid:
+            return
+        tool_name = str(getattr(tool, "name", "") or "").strip()
+        if not tool_name:
+            return
+        turn_id = event.get_extra("chat_memory_turn_id") or uuid.uuid4().hex
+        event.set_extra("chat_memory_turn_id", turn_id)
+        call_index = int(event.get_extra("chat_memory_tool_seq") or 0) + 1
+        event.set_extra("chat_memory_tool_seq", call_index)
+        args_json = (
+            json.dumps(tool_args, ensure_ascii=False, default=str)
+            if tool_args is not None
+            else "{}"
+        )
+        result_text = self._tool_result_to_text(tool_result)
+        ok = await self._safe_insert_tool(
+            umo,
+            cid,
+            turn_id,
+            call_index,
+            tool_name,
+            self._truncate_tool_args(args_json, self.max_len),
+            self._truncate(result_text),
+        )
+        if ok:
+            logger.debug(
+                f"{self._log_prefix(event)} tool[{tool_name}][#{call_index}] -> "
+                f"{cid[:8]}: {result_text[:60]}"
+            )
 
     # ── 上下文接管 ───────────────────────────────────
 
@@ -554,13 +730,17 @@ class ChatMemoryPlugin(Star):
 
         cid = await self._get_curr_cid(umo)
         if not cid:
-            self._log(f"{self._log_prefix(event)} 接管跳过：cid 未就绪（首条消息）")
+            logger.debug(f"{self._log_prefix(event)} 接管跳过：cid 未就绪（首条消息）")
             return
 
         user_id = event.get_sender_id() or ""
         persona_id = ""
         if self.ct_filter_by_persona:
-            persona_id = await self._get_effective_persona(umo, event, cid)
+            # capture_user 已把生效 persona 缓存进 extras，复用即可；
+            # 只有未缓存（如 user 捕获被跳过）时才重新解析。
+            persona_id = event.get_extra("chat_memory_persona_id")
+            if persona_id is None:
+                persona_id = await self._get_effective_persona(umo, event, cid)
             if not persona_id:
                 logger.warning(
                     f"{self._log_prefix(event)} filter_by_persona=True 但当前生效 persona_id 为空，"
@@ -594,7 +774,7 @@ class ChatMemoryPlugin(Star):
         if self.ct_clear_native_history:
             await self._safe_reset_history(umo, cid)
 
-        self._log(
+        logger.debug(
             f"{self._log_prefix(event)} 接管 contexts={len(contexts)} "
             f"(cross_session={self.ct_cross_session}, full_group={self.ct_full_group}, "
             f"cid={cid[:8]})"
@@ -648,7 +828,7 @@ class ChatMemoryPlugin(Star):
         AstrBot 已装载的 native contexts。两种模式都遵循 ``clear_native_history`` 配置。
         """
         if self.ct_fallback_to_native_on_empty:
-            self._log(f"{self._log_prefix(event)} 接管回退 native：{reason}")
+            logger.debug(f"{self._log_prefix(event)} 接管回退 native：{reason}")
             return
 
         req.contexts = []
@@ -657,7 +837,7 @@ class ChatMemoryPlugin(Star):
         event.set_extra(_TAKEOVER_APPLIED_EXTRA, True)
         if self.ct_clear_native_history:
             await self._safe_reset_history(umo, cid)
-        self._log(f"{self._log_prefix(event)} 严格接管 contexts=0：{reason}")
+        logger.debug(f"{self._log_prefix(event)} 严格接管 contexts=0：{reason}")
 
     async def _takeover_query(
         self,
@@ -705,29 +885,23 @@ class ChatMemoryPlugin(Star):
         try:
             if is_pair_only:
                 # 配对模式：按 user 时间排序整轮，并保持 user/assistant 相邻。
+                # query_rounds_raw 已按 created_at ASC, id ASC 返回，无需再次排序。
                 rounds = await self.db.query_rounds_raw(
                     umo, target_cid, user_id, limit, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
                 )
-                rounds.sort(
-                    key=lambda rnd: (
-                        str(rnd[0].get("created_at") or "") if rnd else "",
-                        int(rnd[0].get("record_id") or 0) if rnd else 0,
-                    )
-                )
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
                 # 混合模式：按消息数；overfetch 2x 给规整留余地（防先 LIMIT 后过滤导致空上下文）
                 # 规整阶段会丢头部 assistant / 尾部 solo / 纯媒体；overfetch 后再在 normalize 截到目标条数
+                # query_messages_raw 已按全局时间线升序返回，无需再次排序。
                 records = await self.db.query_messages_raw(
                     umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
                     exclude_turn_id=exclude_turn_id or None,
                 )
-                # 混合模式没有严格轮次结构，按全局时间线排序。
-                records.sort(key=lambda r: r.get("created_at") or "")
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
             return []
@@ -886,7 +1060,7 @@ class ChatMemoryPlugin(Star):
             # 只清洗一次：直接改写发送用的组件链，落库与发送共用清理后的数据，
             # 用户看到的与存档的一致，都不会带泄漏的 <cm_*> 结构。
             if self._clean_sent_chain(result.chain):
-                self._log(f"{self._log_prefix(event)} assistant 已裁剪 cm_ XML 标签")
+                logger.debug(f"{self._log_prefix(event)} assistant 已裁剪 cm_ XML 标签")
         asst_kind, bot_text = self._classify_assistant_chain(result.chain)
         bot_text = self._strip_reasoning_prefix(bot_text)
         if not asst_kind:
@@ -935,7 +1109,7 @@ class ChatMemoryPlugin(Star):
             asst_status = _LLM_DEFAULT
             pair_id = user_msg_id if not no_mid else None
             if no_mid:
-                self._log(f"{self._log_prefix(event)} assistant 平台无 mid，使用 turn_id 配对")
+                logger.debug(f"{self._log_prefix(event)} assistant 平台无 mid，使用 turn_id 配对")
 
         content = self._truncate(bot_text) if bot_text else self._content_placeholder(asst_kind)
         # persona_id：优先从 extras（capture_user 已缓存）；兜底重查
@@ -960,7 +1134,7 @@ class ChatMemoryPlugin(Star):
             logger.warning(
                 f"{self._log_prefix(event)} assistant prepared 写入失败，turn={turn_id[:8]}"
             )
-        self._log(
+        logger.debug(
             f"{self._log_prefix(event)} bot[{asst_status or 'default'}] -> "
             f"{user_id}@{cid[:8]}: {content[:60]}..."
         )
@@ -1016,18 +1190,17 @@ class ChatMemoryPlugin(Star):
             return
 
         if command == "reset":
-            # 删除前 SELECT count + warning，保留可追溯审计痕迹。
-            count = await self.db.count_by_conversation(umo, cid)
-            if count > 0:
-                logger.warning(
-                    f"{self._log_prefix(event)} /reset 即将清除 CID={cid[:8]} 下 {count} 条存档（不可逆）"
+            # 直接删除并记录实际数量：一次 DELETE 完成，不再先 COUNT 预查。
+            deleted = await self.db.delete_by_conversation(umo, cid)
+            if deleted > 0:
+                logger.info(
+                    f"{self._log_prefix(event)} /reset 完成：清除 CID={cid[:8]} "
+                    f"下 {deleted} 条存档（不可逆）"
                 )
-                deleted = await self.db.delete_by_conversation(umo, cid)
-                logger.info(f"{self._log_prefix(event)} /reset 完成：实际清除 {deleted} 条")
             else:
-                self._log(f"{self._log_prefix(event)} /reset（CID={cid[:8]}），无存档记录可清除")
+                logger.debug(f"{self._log_prefix(event)} /reset（CID={cid[:8]}），无存档记录可清除")
         else:
-            self._log(f"{self._log_prefix(event)} /new（CID={cid[:8]}），新对话开始")
+            logger.debug(f"{self._log_prefix(event)} /new（CID={cid[:8]}），新对话开始")
 
     # ── 公开实例方法（供 context.get_registered_star 调用）───
 
@@ -1146,7 +1319,9 @@ class ChatMemoryPlugin(Star):
             force_current_session=not bool(user_id),
         )
         if not records:
-            return []
+            # CM 无历史记录时仍回放工具段（可能为 []）：严格接管下工具上下文
+            # 同样不能丢，否则 LLM 跨轮重复调用工具。
+            return await self._query_tool_contexts(umo, cid)
 
         target_ids_by_umo: dict[str, list[str]] = {}
         for record in records:
@@ -1171,7 +1346,7 @@ class ChatMemoryPlugin(Star):
                 )
 
         mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
-        return self._takeover_normalize(
+        result = self._takeover_normalize(
             records,
             umo,
             max_records=self.ct_limit_rounds if mixed_mode else None,
@@ -1182,6 +1357,13 @@ class ChatMemoryPlugin(Star):
             paired_rounds=not mixed_mode,
             target_map=target_map,
         )
+        # 工具调用上下文：从 CM 库回放最近 N 轮（assistant tool_calls + role=tool），
+        # 追加在历史 contexts 之后。工具段属于当前 umo + cid，不参与
+        # cross_session / full_group 扩大范围，也不进入 user/assistant 配对。
+        tool_contexts = await self._query_tool_contexts(umo, cid)
+        if tool_contexts:
+            result = result + tool_contexts
+        return result
 
     # ── 内部工具 ──────────────────────────────────────
 

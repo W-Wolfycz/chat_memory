@@ -58,7 +58,22 @@ CREATE TABLE IF NOT EXISTS chat_memory_records (
     relation_data   TEXT
 )"""
 
-_SCHEMA_VERSION = 3
+# 工具调用独立存档（schema v4）：不回放进主表的 user/assistant 配对，
+# 只在 takeover 时按轮次渲染成 OpenAI 格式（assistant tool_calls + role=tool）。
+_CREATE_TOOL_TABLE_SQL = """\
+CREATE TABLE IF NOT EXISTS chat_memory_tool_records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    umo             TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    turn_id         TEXT NOT NULL,
+    call_index      INTEGER NOT NULL,
+    tool_name       TEXT NOT NULL,
+    tool_args       TEXT NOT NULL DEFAULT '',
+    tool_result     TEXT NOT NULL DEFAULT '',
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+)"""
+
+_SCHEMA_VERSION = 4
 
 _INDEX_DEFINITIONS = {
     "ix_cm_umo_cid_user": (
@@ -97,6 +112,17 @@ _INDEX_DEFINITIONS = {
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_cm_turn_role "
         "ON chat_memory_records (turn_id, role) "
         "WHERE turn_id IS NOT NULL AND turn_id <> ''"
+    ),
+}
+
+_TOOL_INDEX_DEFINITIONS = {
+    "ux_cm_tool_turn_seq": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_cm_tool_turn_seq "
+        "ON chat_memory_tool_records (turn_id, call_index)"
+    ),
+    "ix_cm_tool_umo_cid_time": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_tool_umo_cid_time "
+        "ON chat_memory_tool_records (umo, conversation_id, created_at)"
     ),
 }
 
@@ -180,8 +206,17 @@ class DBManager:
                 await conn.execute(text(_CREATE_TABLE_SQL))
                 for idx_sql in _INDEX_DEFINITIONS.values():
                     await conn.execute(text(idx_sql))
+                # 工具调用表（schema v4 起）：独立存档，不进主表配对。
+                await conn.execute(text(_CREATE_TOOL_TABLE_SQL))
+                for idx_sql in _TOOL_INDEX_DEFINITIONS.values():
+                    await conn.execute(text(idx_sql))
                 # 防止备份表残留的同名索引再次让 IF NOT EXISTS 静默跳过。
-                for index_name in _INDEX_DEFINITIONS:
+                for index_name, table_name in [
+                    *((name, "chat_memory_records")
+                      for name in _INDEX_DEFINITIONS),
+                    *((name, "chat_memory_tool_records")
+                      for name in _TOOL_INDEX_DEFINITIONS),
+                ]:
                     index_result = await conn.execute(
                         text(
                             "SELECT tbl_name FROM sqlite_master "
@@ -189,9 +224,9 @@ class DBManager:
                         ),
                         {"name": index_name},
                     )
-                    if index_result.scalar() != "chat_memory_records":
+                    if index_result.scalar() != table_name:
                         raise RuntimeError(
-                            f"ChatMemory index {index_name} 未绑定到主表"
+                            f"ChatMemory index {index_name} 未绑定到 {table_name}"
                         )
                 await conn.execute(text(f"PRAGMA user_version = {_SCHEMA_VERSION}"))
             self._initialized = True
@@ -726,10 +761,96 @@ class DBManager:
                 targets.setdefault(key, record)
             return targets
 
+    async def insert_tool_record(
+        self,
+        umo: str,
+        conversation_id: str,
+        turn_id: str,
+        call_index: int,
+        tool_name: str,
+        tool_args: str,
+        tool_result: str,
+    ) -> None:
+        """写入一条工具调用记录；(turn_id, call_index) 幂等。"""
+        await self.init_db()
+        if not umo or not conversation_id or not turn_id or not tool_name:
+            raise ValueError("insert_tool_record requires umo/cid/turn_id/tool_name")
+        async with self.async_session() as session:
+            await session.execute(
+                text(
+                    "INSERT OR IGNORE INTO chat_memory_tool_records "
+                    "(umo, conversation_id, turn_id, call_index, tool_name, "
+                    "tool_args, tool_result, created_at) "
+                    "VALUES (:umo, :cid, :turn_id, :call_index, :tool_name, "
+                    ":tool_args, :tool_result, :now)"
+                ),
+                {
+                    "umo": umo,
+                    "cid": conversation_id,
+                    "turn_id": turn_id,
+                    "call_index": int(call_index),
+                    "tool_name": tool_name,
+                    "tool_args": tool_args or "",
+                    "tool_result": tool_result or "",
+                    "now": datetime.now(timezone.utc).replace(tzinfo=None),
+                },
+            )
+            await session.commit()
+
+    async def query_tool_records(
+        self,
+        umo: str,
+        conversation_id: str,
+        turn_limit: int = 2,
+    ) -> list[dict]:
+        """查询最近 ``turn_limit`` 个轮次的工具调用记录（按时间正序）。
+
+        只查当前 umo + cid：工具调用天然属于当前会话，不参与
+        cross_session / full_group 的扩大范围。
+        """
+        await self.init_db()
+        turn_limit = max(1, min(50, int(turn_limit)))
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT turn_id, call_index, tool_name, tool_args, "
+                    "tool_result, created_at "
+                    "FROM chat_memory_tool_records "
+                    "WHERE umo = :umo AND conversation_id = :cid "
+                    "AND turn_id IN ("
+                    "  SELECT turn_id FROM chat_memory_tool_records "
+                    "  WHERE umo = :umo AND conversation_id = :cid "
+                    "  GROUP BY turn_id "
+                    "  ORDER BY MIN(created_at) DESC, MIN(id) DESC "
+                    "  LIMIT :turn_limit"
+                    ") "
+                    "ORDER BY created_at ASC, id ASC"
+                ),
+                {"umo": umo, "cid": conversation_id, "turn_limit": turn_limit},
+            )
+            return [
+                {
+                    "turn_id": row[0],
+                    "call_index": int(row[1]),
+                    "tool_name": row[2],
+                    "tool_args": row[3] or "",
+                    "tool_result": row[4] or "",
+                    "created_at": row[5],
+                }
+                for row in result.fetchall()
+            ]
+
     async def delete_by_conversation(self, umo: str, conversation_id: str) -> int:
-        """清除某个 conversation_id 下的所有记录（用于 /reset）。"""
+        """清除某个 conversation_id 下的所有记录（用于 /reset）。工具表同步清理。"""
         await self.init_db()
         async with self.async_session() as session:
+            await session.execute(
+                text(
+                    "DELETE FROM chat_memory_tool_records "
+                    "WHERE umo = :umo AND conversation_id = :cid"
+                ),
+                {"umo": umo, "cid": conversation_id},
+            )
             result = await session.execute(
                 text(
                     "DELETE FROM chat_memory_records "
@@ -740,23 +861,14 @@ class DBManager:
             await session.commit()
             return result.rowcount
 
-    async def count_by_conversation(self, umo: str, conversation_id: str) -> int:
-        """统计某 conversation_id 下的记录数（用于 /reset 删除前审计痕迹）。"""
-        await self.init_db()
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT COUNT(*) FROM chat_memory_records "
-                    "WHERE umo = :umo AND conversation_id = :cid"
-                ),
-                {"umo": umo, "cid": conversation_id},
-            )
-            return result.scalar() or 0
-
     async def delete_old(self, before: datetime) -> int:
-        """删除 created_at 早于 ``before`` 的所有记录（用于 auto_cleanup_days）。"""
+        """删除 created_at 早于 ``before`` 的所有记录（用于 auto_cleanup_days）。工具表同步清理。"""
         await self.init_db()
         async with self.async_session() as session:
+            await session.execute(
+                text("DELETE FROM chat_memory_tool_records WHERE created_at < :before"),
+                {"before": before},
+            )
             result = await session.execute(
                 text("DELETE FROM chat_memory_records WHERE created_at < :before"),
                 {"before": before},

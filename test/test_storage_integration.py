@@ -155,8 +155,49 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
         )
         assert [item["role"] for item in group_contexts] == ["user", "assistant"]
         assert "当前群问题" in group_contexts[0]["content"]
-        assert "<cm_nickname>10002</cm_nickname>" in group_contexts[0]["content"]
+        # 记录未提供昵称：不回退 user_id（账号 ID 不进入 LLM 上下文），用中性 ?
+        assert "<cm_nickname>?</cm_nickname>" in group_contexts[0]["content"]
+        assert "10002" not in group_contexts[0]["content"]
         assert "当前群回答" in group_contexts[1]["content"]
+
+        # 工具调用上下文（方案 B）：落库 → 回放渲染成 OpenAI 格式 → 追加到接管结果。
+        await plugin.db.insert_tool_record(
+            umo, cid, "turn_tool_demo", 1, "draw", '{"prompt": "猫"}',
+            "任务 demo_task 已创建，不要再次调用",
+        )
+        await plugin.db.insert_tool_record(
+            umo, cid, "turn_tool_demo", 2, "query", "{}", "运行中：任务 demo_task",
+        )
+        # 幂等：重复 (turn_id, call_index) 不产生新行
+        await plugin.db.insert_tool_record(
+            umo, cid, "turn_tool_demo", 1, "draw", '{"prompt": "猫"}',
+            "任务 demo_task 已创建，不要再次调用",
+        )
+        records = await plugin.db.query_tool_records(umo, cid, turn_limit=2)
+        assert [(r["call_index"], r["tool_name"]) for r in records] == [
+            (1, "draw"), (2, "query"),
+        ]
+        rendered = plugin._build_tool_contexts(records)
+        assert [m["role"] for m in rendered] == ["assistant", "tool", "tool"]
+        assert [c["id"] for c in rendered[0]["tool_calls"]] == [
+            "cm_tool_turn_too_0", "cm_tool_turn_too_1",
+        ]
+        assert rendered[1]["tool_call_id"] == "cm_tool_turn_too_0"
+        assert "demo_task" in rendered[1]["content"]
+
+        # 接管结果末尾追加工具段（tool_records 已写入）
+        contexts = await plugin.build_takeover_contexts(
+            umo=umo, user_id="10001", conversation_id=cid,
+        )
+        assert contexts[-1]["role"] == "tool"
+        assert "运行中：任务 demo_task" in contexts[-1]["content"]
+        assert contexts[-3]["role"] == "assistant"
+        assert contexts[-3]["tool_calls"][0]["id"] == "cm_tool_turn_too_0"
+
+        # /reset 联动：工具表与主表同 CID 记录一起清除
+        await plugin.db.delete_by_conversation(umo, cid)
+        assert await plugin.db.query_tool_records(umo, cid, turn_limit=2) == []
+
         await plugin.terminate()
 
 
@@ -204,9 +245,15 @@ async def _run() -> None:
             assert legacy_rows[0]["relation_data"] is None
             await legacy_db.engine.dispose()
             with closing(sqlite3.connect(legacy_path)) as conn:
-                assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+                assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
                 assert "relation_data" in {
                     row[1] for row in conn.execute("PRAGMA table_info(chat_memory_records)")
+                }
+                # v2 → v4 迁移应同时建立工具表
+                assert "chat_memory_tool_records" in {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
                 }
 
             db = DBManager(tmp_root / "storage", tz=ZoneInfo("UTC"))
@@ -396,7 +443,7 @@ async def _run() -> None:
                 await db.engine.dispose()
                 with closing(sqlite3.connect(db.db_path)) as conn:
                     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-                    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+                    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
                     assert conn.execute(
                         "SELECT COUNT(*) FROM chat_memory_records"
                     ).fetchone()[0] == 11

@@ -11,24 +11,11 @@
     "default": 0,
     "hint": "自动删除超过此天数的记录。0 表示不清理。"
   },
-  "log_config": {
-    "description": "日志配置",
-    "type": "object",
-    "hint": "控制日志前缀格式与调试级别。",
-    "items": {
-      "log_with_bot_id": {
-        "description": "日志区分机器人实例",
-        "type": "bool",
-        "default": false,
-        "hint": "启用后日志前缀附加机器人 ID，多 Bot 实例环境下便于定位。"
-      },
-      "debug_to_info": {
-        "description": "调试日志提级",
-        "type": "bool",
-        "default": false,
-        "hint": "启用后 debug 日志以 info 级别输出。"
-      }
-    }
+  "log_with_bot_id": {
+    "description": "日志区分机器人实例",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后日志前缀附加机器人实例 ID，多 Bot 环境便于定位。日志等级请到 WebUI 插件详情页调整（运行期生效，无需重启）。"
   },
   "context_takeover": {
     "description": "上下文接管",
@@ -102,6 +89,12 @@
         "type": "bool",
         "default": false,
         "hint": "只使用当前 persona 的记录；空 persona 只匹配未标记 persona 的旧记录。跨 /new 查询需同时开启跨会话目标。"
+      },
+      "keep_tool_turns": {
+        "description": "工具上下文保留轮数",
+        "type": "int",
+        "default": 2,
+        "hint": "接管时回放 CM 库中最近 N 个轮次的 LLM 工具调用（assistant tool_calls + role=tool），让 LLM 跨轮看到工具返回，避免重复调用工具。最小为 1。"
       }
     }
   }

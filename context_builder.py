@@ -311,14 +311,15 @@ class TakeoverContextBuilder:
             )
             target = self.target_map.get(key)
             if target:
-                target_name = str(
-                    target.get("sender_nickname") or target.get("user_id") or ""
-                ).strip()
+                target_name = str(target.get("sender_nickname") or "").strip()
                 target_text = str(target.get("content") or "").strip()
         else:
             target_name = str(reply.get("target_nickname") or "").strip()
             target_text = str(reply.get("fallback_text") or "").strip()
 
+        # 昵称缺失时不回退 user_id：账号 ID 不得进入 LLM 上下文（README 隐私承诺）。
+        if not target_name:
+            target_name = "未知成员"
         target_name = _xml_escape(target_name, quote=True)
         target_text = _xml_escape(target_text, quote=True)
 
@@ -359,7 +360,8 @@ class TakeoverContextBuilder:
                 speaker_tag = "<cm_speaker/>"
             if speaker_tag:
                 parts.append(speaker_tag)
-        sender = record.get("sender_nickname") or record.get("user_id") or "?"
+        # 昵称缺失时不回退 user_id：账号 ID 不得进入 LLM 上下文（README 隐私承诺）。
+        sender = str(record.get("sender_nickname") or "").strip() or "?"
         parts.append(f'<cm_nickname>{_xml_escape(str(sender), quote=True)}</cm_nickname>')
         prefix = " ".join(parts)
         return f"{prefix} {content}" if content else prefix

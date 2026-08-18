@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.2.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=3`。
+当前发布版本：`1.2.2`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=4`。
 
 ## 特性
 
@@ -39,9 +39,10 @@
 |---|---|---|---|
 | `max_content_length` | int | 0 | 单条记录最大字符数。**0 = 不限制** |
 | `auto_cleanup_days` | int | 0 | 自动清理天数，**0 = 不清理**；>0 启动周期任务（24h 一次） |
-| `log_config.log_with_bot_id` | bool | false | 日志前缀附加机器人 ID |
-| `log_config.debug_to_info` | bool | false | debug 日志提级为 info |
+| `log_with_bot_id` | bool | false | 日志前缀附加机器人实例 ID，多 Bot 环境便于定位 |
 | `context_takeover` | object | — | 上下文接管配置，详见 [上下文接管](#上下文接管) |
+
+> **日志等级**：插件不再提供"日志提级"配置——AstrBot >= 4.26.8 已内置运行期修改插件日志等级的能力（WebUI 插件详情页选择等级，写入 `config/plugin_log_levels.json` 即时生效，无需重启），需要 debug 日志时在那里把 `chat_memory` 调到 DEBUG 即可。
 
 ## 数据存储
 
@@ -78,6 +79,25 @@ CREATE TABLE chat_memory_records (
 );
 ```
 
+工具调用独立存档（schema v4 起，`chat_memory_tool_records`）：
+
+```sql
+CREATE TABLE chat_memory_tool_records (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    umo             TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    turn_id         TEXT NOT NULL,
+    call_index      INTEGER NOT NULL,               -- 同轮内第几次工具调用
+    tool_name       TEXT NOT NULL,
+    tool_args       TEXT NOT NULL DEFAULT '',       -- JSON 字符串
+    tool_result     TEXT NOT NULL DEFAULT '',       -- 纯文本（图片等二进制用占位符）
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (turn_id, call_index)
+);
+```
+
+工具记录不进 user/assistant 配对与查询 API，只在接管时按轮次回放成 OpenAI 格式。
+
 > **platform_id vs platform_name**：自 AstrBot v4.0 起 umo 第一段是实例 ID（多 aiocqhttp 实例时每个不同），`platform_name` 才是类型。
 >
 > **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（**UTC naive 存储**，与 schema default `CURRENT_TIMESTAMP` 对齐；**查询返回时按 AstrBot `timezone` 配置转成配置时区 naive 字符串**）。
@@ -88,7 +108,7 @@ CREATE TABLE chat_memory_records (
 
 ### 升级与备份
 
-- 已有 schema v2 数据库可直接启动 1.2.0；首次迁移仅增加 nullable `relation_data`。已有 schema v3 数据库不会重写；1.2.0 的结构化标签与当前轮焦点锚都只改变请求时展示，不修改表结构或既有记录。
+- 已有 schema v2 数据库可直接启动 1.2.0；首次迁移仅增加 nullable `relation_data`。1.2.2 起 schema v4 新增独立工具表 `chat_memory_tool_records`，v3 及更早版本升级只建新表、不改主表结构，既有记录零迁移。结构化标签与当前轮焦点锚都只改变请求时展示，不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -195,7 +215,9 @@ contexts = await cm.build_takeover_contexts(
 
 让 ChatMemory 成为唯一上下文源：每轮 LLM 请求时用 CM 数据覆盖 `req.contexts`，并清空 native `conversation.history` 防累积。
 
-默认采用**严格接管**：即使 CM 查询无数据或过滤后为空，也会显式把 `req.contexts` 置空，不会静默回退到 native history。若确实需要兼容回退，可开启 `fallback_to_native_on_empty`。
+默认采用**严格接管**：即使 CM 查询无数据或过滤后为空，也会显式把 `req.contexts` 替换为 CM 数据（空结果时仅保留原生工具段，见下），不会静默回退到 native history。若确实需要兼容回退，可开启 `fallback_to_native_on_empty`。
+
+**工具调用上下文保留**：LLM 的每次工具调用（`on_llm_tool_respond`）都会写入 CM 独立工具表；接管构建 contexts 时把最近 `keep_tool_turns`（默认 2）个轮次的工具记录回放成 OpenAI 格式（`assistant(tool_calls)` + `role=tool`）追加在历史尾部，让 LLM 跨轮继续看到上一轮的工具调用与工具返回（如"任务已创建，不要再次调用"），避免上下文缺口导致重复调用工具、重复扣费。工具段固定查当前会话，不参与 cross_session/full_group/persona 过滤；参数与返回文本跟随 `max_content_length` 截断（参数超限时替换为合法 JSON 占位）。接管关闭或 `fallback_to_native_on_empty` 开启时原生历史原样保留，AstrBot 自带工具记录不受影响。同轮工具循环内的多次 LLM 调用使用内存消息流，本轮工具结果天然可见。
 
 CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚阶段 `priority=-1000` 追加，尽量位于其他记忆/上下文注入之后。AstrBot 仍按 priority 从大到小执行，第三方插件若注册更低值仍可继续修改请求。CM 新增的焦点 part 使用 `mark_as_temp()`，不写入 native history。
 
@@ -255,7 +277,7 @@ CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚�
 <cm_time>MM/DD HH:MM:SS</cm_time> <cm_nickname>SenderName</cm_nickname> content
 ```
 
-`full_group` 在群聊中生效时，仅当前用户的发言前带 `<cm_speaker current="1"/>` 标记，无标记的均属其他成员；每条消息保持独立边界、不做合并，允许连续 user（由通用规则提示"最后一条 user 才是当前请求"）。群聊身份标记：
+`full_group` 在群聊中生效时，仅当前用户的发言前带 `<cm_speaker current="1"/>` 标记，无标记的均属其他成员；每条消息保持独立边界、不做合并，允许连续 user（由通用规则提示"最后一条 user 才是当前请求"）。发送者或 Reply 目标昵称缺失时使用中性 `?` / `未知成员`，不回退为账号 ID。群聊身份标记：
 
 ```text
 <cm_time>MM/DD HH:MM:SS</cm_time> <cm_speaker current="1"/> <cm_nickname>SenderName</cm_nickname> content
@@ -368,6 +390,8 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 | `include_all_match` | bool | false | ALL 模式开关（默认 ANY） |
 | `clear_native_history` | bool | true | 每轮清空 native history |
 | `fallback_to_native_on_empty` | bool | false | CM 空结果时是否保留 AstrBot 原生 contexts；默认 false=严格接管 |
+| `filter_by_persona` | bool | false | 按 persona 隔离 takeover 查询 |
+| `keep_tool_turns` | int | 2 | 接管时回放最近 N 轮的工具调用记录；最小 1 |
 
 ### 内容白名单（include_content_kinds）
 
