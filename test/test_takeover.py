@@ -1011,22 +1011,21 @@ def test_takeover_replays_tool_contexts():
     # 输出不含私有定位键
     assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in out)
 
-    # 工具段 turn 在历史中无匹配（如主动消息自造轮次）：回退追加尾部
+    # 工具段 turn 在历史中无匹配（如轮次已滑出窗口/主动消息自造轮次）：直接丢弃
     p_tail = _make_plugin()
     p_tail.db = _FakeDB(rounds=[[_rec(turn_id="turn_other"),
                                  _rec(role="assistant", content="回复", turn_id="turn_other")]])
     p_tail.db.tool_records = list(p.db.tool_records)
     out_tail = asyncio.run(p_tail.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert [m["role"] for m in out_tail] == ["user", "assistant", "assistant", "tool"]
-    assert out_tail[-1]["role"] == "tool"
+    assert [m["role"] for m in out_tail] == ["user", "assistant"]
+    assert not any("cm_tool" in str(m) for m in out_tail)
 
-    # CM 无历史：只返回工具段（非空，严格接管不会清空它）
+    # CM 无历史：无轮次可跟随，工具段同样不回放
     p2 = _make_plugin()
     p2.db = _FakeDB(rounds=[])
     p2.db.tool_records = list(p.db.tool_records)
     out2 = asyncio.run(p2.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert [m["role"] for m in out2] == ["assistant", "tool"]
-    assert not any("_cm_tool_turn" in m for m in out2)
+    assert out2 == []
 
     # 两者都无：仍为 []
     p3 = _make_plugin()
@@ -1067,14 +1066,28 @@ def test_insert_tool_contexts_positions():
     out2 = f([{"role": "assistant", "content": "solo", "_turn_id": "t3"}],
              tool_seg("t3"))
     assert [m["role"] for m in out2] == ["assistant", "tool", "assistant"]
-    # 无匹配 turn：回退尾部
+    # 无匹配 turn：段直接丢弃（不存在的轮次不配拥有工具上下文）
     out3 = f([{"role": "user", "content": "x", "_turn_id": "t9"}],
              tool_seg("tX"))
-    assert [m["role"] for m in out3] == ["user", "assistant", "tool"]
+    assert [m["role"] for m in out3] == ["user"]
     # 私有定位键全部剥除
     for produced in (out, out2, out3):
         assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in produced)
     print("[T42] insert_tool_contexts_positions ✓")
+
+
+def test_keep_tool_turns_zero_disables_replay():
+    """keep_tool_turns=0：不回放工具段，也不查工具表。"""
+    p = _make_plugin()
+    p.ct_keep_tool_turns = 0
+    p.db = _FakeDB(rounds=[[_rec(turn_id="turn_a"),
+                            _rec(role="assistant", content="回复", turn_id="turn_a")]])
+    p.db.tool_records = [{"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
+                          "tool_args": "{}", "tool_result": "x"}]
+    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert not p.db.tool_query_kwargs  # 未查询工具表
+    print("[T44] keep_tool_turns_zero_disables_replay ✓")
 
 
 def test_log_with_bot_id_migration():

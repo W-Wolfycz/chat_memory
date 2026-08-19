@@ -806,10 +806,13 @@ class DBManager:
         """查询最近 ``turn_limit`` 个轮次的工具调用记录（按时间正序）。
 
         只查当前 umo + cid：工具调用天然属于当前会话，不参与
-        cross_session / full_group 的扩大范围。
+        cross_session / full_group 的扩大范围。``turn_limit=0`` 返回空
+        （调用方用于关闭工具回放）。
         """
         await self.init_db()
-        turn_limit = max(1, min(50, int(turn_limit)))
+        turn_limit = min(50, max(0, int(turn_limit)))
+        if turn_limit <= 0:
+            return []
         async with self.async_session() as session:
             result = await session.execute(
                 text(

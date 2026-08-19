@@ -94,7 +94,7 @@
         "description": "工具上下文保留轮数",
         "type": "int",
         "default": 2,
-        "hint": "接管时回放 CM 库中最近 N 个轮次的 LLM 工具调用（assistant tool_calls + role=tool），让 LLM 跨轮看到工具返回，避免重复调用工具。最小为 1。"
+        "hint": "接管时回放 CM 库中最近 N 个轮次的 LLM 工具调用（assistant tool_calls + role=tool），让 LLM 跨轮看到工具返回，避免重复调用工具。0 = 不回放工具调用。"
       }
     }
   }

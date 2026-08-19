@@ -113,8 +113,8 @@ class ChatMemoryPlugin(Star):
         self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
         # 工具调用上下文：接管时回放 CM 库中最近 N 个轮次的工具调用记录
         # （assistant tool_calls + role=tool），保证 LLM 跨轮看到工具返回，
-        # 不重复调用工具（重复建任务、重复扣费）。最小 1，无上限钳制。
-        self.ct_keep_tool_turns = max(1, int(ct_conf.get("keep_tool_turns", 2)))
+        # 不重复调用工具（重复建任务、重复扣费）。0 = 不回放；负值按 0。
+        self.ct_keep_tool_turns = max(0, int(ct_conf.get("keep_tool_turns", 2)))
 
         # 读取 AstrBot 全局时区配置（IANA 名称如 "Asia/Shanghai"），传给 DBManager
         # 做查询输出转换：存储统一 UTC naive，返回时转此 tz naive
@@ -707,8 +707,10 @@ class ChatMemoryPlugin(Star):
 
         原生形态为 ``[user, assistant(tool_calls), tool…, assistant 最终回复]``；
         本方法把每轮的工具段放到该轮 user 之后（只有 assistant 的单边轮次则放
-        其之前）。工具段 turn 在历史中不存在（如主动消息自造轮次）时回退追加
-        到尾部。插入完成后剥掉所有私有定位键。
+        其之前）。工具段必须跟随实际调用轮：turn 不在当前历史 contexts 中的段
+        **直接丢弃**（如配置 300 轮、工具调用发生在 400 轮之前），不贴尾部、
+        不按时间猜测——不存在的轮次不配拥有工具上下文。插入完成后剥掉所有
+        私有定位键。
         """
         if not tool_contexts:
             for context in result:
@@ -735,14 +737,13 @@ class ChatMemoryPlugin(Star):
             elif context.get("role") == "assistant" and turn_id not in asst_pos:
                 asst_pos[turn_id] = index
         insert_at: dict[int, list[dict]] = {}
-        tail_segments: list[dict] = []
         for turn_id in turn_order:
             if turn_id in user_pos:
                 key = user_pos[turn_id] + 1  # 该轮 user 之后、最终回复之前
             elif turn_id in asst_pos:
                 key = asst_pos[turn_id]  # 单边 assistant 之前
             else:
-                tail_segments.extend(turns[turn_id])
+                # 轮次不在当前上下文中：丢弃该段，绝不贴到别处。
                 continue
             insert_at.setdefault(key, []).extend(turns[turn_id])
         merged: list[dict] = []
@@ -752,7 +753,6 @@ class ChatMemoryPlugin(Star):
             merged.append(context)
         for key in sorted(insert_at):
             merged.extend(insert_at[key])
-        merged.extend(tail_segments)
         for msg in tool_contexts:
             msg.pop("_cm_tool_turn", None)
         return merged
@@ -777,7 +777,12 @@ class ChatMemoryPlugin(Star):
             return False
 
     async def _query_tool_contexts(self, umo: str, cid: str) -> list[dict]:
-        """按当前接管配置回放 CM 库中最近 N 轮工具调用为 OpenAI 格式 contexts。"""
+        """按当前接管配置回放 CM 库中最近 N 轮工具调用为 OpenAI 格式 contexts。
+
+        ``keep_tool_turns=0`` 时直接关闭回放（用户可显式填 0）。
+        """
+        if self.ct_keep_tool_turns <= 0:
+            return []
         try:
             records = await self.db.query_tool_records(
                 umo, cid, self.ct_keep_tool_turns
@@ -1433,13 +1438,9 @@ class ChatMemoryPlugin(Star):
             force_current_session=not bool(user_id),
         )
         if not records:
-            # CM 无历史记录时仍回放工具段（可能为 []）：严格接管下工具上下文
-            # 同样不能丢，否则 LLM 跨轮重复调用工具。无插入目标，直接返回并剥
-            # 掉私有定位键。
-            tool_contexts = await self._query_tool_contexts(umo, cid)
-            for msg in tool_contexts:
-                msg.pop("_cm_tool_turn", None)
-            return tool_contexts
+            # 工具段必须跟随实际调用轮：CM 无历史即没有轮次可跟随，
+            # 即使工具表有记录也不回放（不存在的轮次不配拥有工具上下文）。
+            return []
 
         target_ids_by_umo: dict[str, list[str]] = {}
         for record in records:

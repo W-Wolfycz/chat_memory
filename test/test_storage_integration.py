@@ -176,6 +176,8 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             umo, cid, "turn_tool_demo", 1, "draw", '{"prompt": "猫"}',
             "任务 demo_task 已创建，不要再次调用",
         )
+        assert await plugin.db.query_tool_records(umo, cid, turn_limit=0) == []
+
         records = await plugin.db.query_tool_records(umo, cid, turn_limit=2)
         assert [(r["call_index"], r["tool_name"]) for r in records] == [
             (1, "draw"), (2, "query"),
@@ -188,14 +190,12 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
         assert rendered[1]["tool_call_id"] == "cm_tool_turn_too_0"
         assert "demo_task" in rendered[1]["content"]
 
-        # 接管结果：turn_tool_demo 与主表轮次不同 → 回退追加尾部
+        # 接管结果：turn_tool_demo 轮次不在主表历史中 → 工具段直接丢弃
         contexts = await plugin.build_takeover_contexts(
             umo=umo, user_id="10001", conversation_id=cid,
         )
-        assert contexts[-1]["role"] == "tool"
-        assert "运行中：任务 demo_task" in contexts[-1]["content"]
-        assert contexts[-3]["role"] == "assistant"
-        assert contexts[-3]["tool_calls"][0]["id"] == "cm_tool_turn_too_0"
+        assert [m["role"] for m in contexts] == ["user", "assistant"]
+        assert not any("cm_tool" in str(m) for m in contexts)
 
         # turn 匹配主表配对轮次时：工具段插入该轮 user 之后、最终回复之前
         await plugin.db.insert_tool_record(
@@ -205,7 +205,7 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
             umo=umo, user_id="10001", conversation_id=cid,
         )
         assert [m["role"] for m in in_round] == [
-            "user", "assistant", "tool", "assistant", "assistant", "tool", "tool",
+            "user", "assistant", "tool", "assistant",
         ]
         assert in_round[1]["tool_calls"][0]["id"] == "cm_tool_turn_pub_0"
         assert in_round[2]["content"] == "轮内任务已创建"
