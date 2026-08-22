@@ -4,7 +4,7 @@ Schema 说明：
 - ``llm_status``：LLM 配对状态（单值）。'' = 默认（未走 LLM），
   其他取值：'llm_pending' / 'llm_success' / 'proactive' / 'orphan'。
 - ``content_kind``：消息内容形态（JSON 数组字符串，如 '["text","image"]'）。
-  支持值：'text' / 'image' / 'video' / 'voice' / 'file' / 'face' / 'forward'
+  支持值：'text' / 'image' / 'video' / 'voice' / 'file' / 'emoji' / 'forward' / 'poke'
   / 'system_event'。空数组 '[]' 表示 empty（如纯 @ 无文本）。
 - ``at_id`` / ``reply_id`` / ``forward_id``：上下文引用 ID，仅在对应组件出现时存。
 - ``turn_id``：内部轮次 ID，新记录不依赖平台 message_id 即可配对。
@@ -73,7 +73,39 @@ CREATE TABLE IF NOT EXISTS chat_memory_tool_records (
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )"""
 
-_SCHEMA_VERSION = 4
+# 媒体归档（schema v5）：user 侧媒体落盘后登记，CM_UI 据此回看。
+# 只在归档成功时插行；失败不落行。文件路径不落库：由 file_name + created_at
+# 推导（media/<YYYYMM>/<media_id>.<ext>），文件名随机化、无隐私标识。
+_CREATE_MEDIA_ARCHIVE_TABLE_SQL = """\
+CREATE TABLE IF NOT EXISTS chat_memory_media_archive (
+    media_id        TEXT PRIMARY KEY,
+    umo             TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    turn_id         TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    file_name       TEXT NOT NULL,
+    ext             TEXT NOT NULL,
+    mime_type       TEXT,
+    size_bytes      INTEGER NOT NULL,
+    created_at      DATETIME NOT NULL
+)"""
+
+_MEDIA_ARCHIVE_INDEX_DEFINITIONS = {
+    "ix_cm_media_created": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_media_created "
+        "ON chat_memory_media_archive (created_at)"
+    ),
+    "ix_cm_media_cid_time": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_media_cid_time "
+        "ON chat_memory_media_archive (conversation_id, created_at)"
+    ),
+    "ix_cm_media_turn": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_media_turn "
+        "ON chat_memory_media_archive (turn_id)"
+    ),
+}
+
+_SCHEMA_VERSION = 5
 
 _INDEX_DEFINITIONS = {
     "ix_cm_umo_cid_user": (
@@ -210,12 +242,18 @@ class DBManager:
                 await conn.execute(text(_CREATE_TOOL_TABLE_SQL))
                 for idx_sql in _TOOL_INDEX_DEFINITIONS.values():
                     await conn.execute(text(idx_sql))
+                # 媒体归档表（schema v5 起）：CREATE IF NOT EXISTS 幂等，无数据迁移。
+                await conn.execute(text(_CREATE_MEDIA_ARCHIVE_TABLE_SQL))
+                for idx_sql in _MEDIA_ARCHIVE_INDEX_DEFINITIONS.values():
+                    await conn.execute(text(idx_sql))
                 # 防止备份表残留的同名索引再次让 IF NOT EXISTS 静默跳过。
                 for index_name, table_name in [
                     *((name, "chat_memory_records")
                       for name in _INDEX_DEFINITIONS),
                     *((name, "chat_memory_tool_records")
                       for name in _TOOL_INDEX_DEFINITIONS),
+                    *((name, "chat_memory_media_archive")
+                      for name in _MEDIA_ARCHIVE_INDEX_DEFINITIONS),
                 ]:
                     index_result = await conn.execute(
                         text(
@@ -228,6 +266,22 @@ class DBManager:
                         raise RuntimeError(
                             f"ChatMemory index {index_name} 未绑定到 {table_name}"
                         )
+                # 1.2.5 起 kind 值 face 更名为 emoji：一次性数据迁移（幂等，按行更新）。
+                # content_kind 是 JSON 数组字符串，'"face"' 精确替换不会误伤正文。
+                face_rows = await conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM chat_memory_records "
+                        "WHERE content_kind LIKE '%\"face\"%'"
+                    )
+                )
+                if int(face_rows.scalar() or 0) > 0:
+                    await conn.execute(
+                        text(
+                            "UPDATE chat_memory_records "
+                            "SET content_kind = REPLACE(content_kind, '\"face\"', '\"emoji\"') "
+                            "WHERE content_kind LIKE '%\"face\"%'"
+                        )
+                    )
                 await conn.execute(text(f"PRAGMA user_version = {_SCHEMA_VERSION}"))
             self._initialized = True
 
@@ -843,13 +897,37 @@ class DBManager:
                 for row in result.fetchall()
             ]
 
-    async def delete_by_conversation(self, umo: str, conversation_id: str) -> int:
-        """清除某个 conversation_id 下的所有记录（用于 /reset）。工具表同步清理。"""
+    async def delete_by_conversation(
+        self, umo: str, conversation_id: str
+    ) -> tuple[int, list[dict]]:
+        """清除某个 conversation_id 下的所有记录（用于 /reset）。工具表与媒体归档同步清理。
+
+        返回 ``(删除的记录数, 被删归档行列表)``；归档行含 file_name/created_at，
+        由调用方负责删除对应媒体文件。
+        """
         await self.init_db()
         async with self.async_session() as session:
             await session.execute(
                 text(
                     "DELETE FROM chat_memory_tool_records "
+                    "WHERE umo = :umo AND conversation_id = :cid"
+                ),
+                {"umo": umo, "cid": conversation_id},
+            )
+            media_result = await session.execute(
+                text(
+                    "SELECT file_name, created_at FROM chat_memory_media_archive "
+                    "WHERE umo = :umo AND conversation_id = :cid"
+                ),
+                {"umo": umo, "cid": conversation_id},
+            )
+            media_rows = [
+                {"file_name": row[0], "created_at": row[1]}
+                for row in media_result.fetchall()
+            ]
+            await session.execute(
+                text(
+                    "DELETE FROM chat_memory_media_archive "
                     "WHERE umo = :umo AND conversation_id = :cid"
                 ),
                 {"umo": umo, "cid": conversation_id},
@@ -862,19 +940,168 @@ class DBManager:
                 {"umo": umo, "cid": conversation_id},
             )
             await session.commit()
-            return result.rowcount
+            return result.rowcount, media_rows
 
-    async def delete_old(self, before: datetime) -> int:
-        """删除 created_at 早于 ``before`` 的所有记录（用于 auto_cleanup_days）。工具表同步清理。"""
+    async def delete_old(self, before: datetime) -> tuple[int, list[dict]]:
+        """删除 created_at 早于 ``before`` 的所有记录（用于 auto_cleanup_days）。
+
+        工具表与媒体归档同步清理；返回 ``(删除的记录数, 被删归档行列表)``。
+        """
         await self.init_db()
         async with self.async_session() as session:
             await session.execute(
                 text("DELETE FROM chat_memory_tool_records WHERE created_at < :before"),
                 {"before": before},
             )
+            media_result = await session.execute(
+                text(
+                    "SELECT file_name, created_at FROM chat_memory_media_archive "
+                    "WHERE created_at < :before"
+                ),
+                {"before": before},
+            )
+            media_rows = [
+                {"file_name": row[0], "created_at": row[1]}
+                for row in media_result.fetchall()
+            ]
+            await session.execute(
+                text(
+                    "DELETE FROM chat_memory_media_archive "
+                    "WHERE created_at < :before"
+                ),
+                {"before": before},
+            )
             result = await session.execute(
                 text("DELETE FROM chat_memory_records WHERE created_at < :before"),
                 {"before": before},
+            )
+            await session.commit()
+            return result.rowcount, media_rows
+
+    # ── 媒体归档表操作（schema v5）────────────────────
+
+    async def insert_media_archive(
+        self,
+        media_id: str,
+        umo: str,
+        conversation_id: str,
+        turn_id: str,
+        kind: str,
+        file_name: str,
+        ext: str,
+        mime_type: Optional[str],
+        size_bytes: int,
+        created_at: Optional[datetime] = None,
+    ) -> bool:
+        """登记一条已落盘媒体。created_at 缺省为当前 UTC naive（与主表一致）。"""
+        await self.init_db()
+        if created_at is None:
+            created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        async with self.async_session() as session:
+            await session.execute(
+                text(
+                    "INSERT OR IGNORE INTO chat_memory_media_archive "
+                    "(media_id, umo, conversation_id, turn_id, kind, file_name, "
+                    "ext, mime_type, size_bytes, created_at) "
+                    "VALUES (:media_id, :umo, :cid, :turn_id, :kind, :file_name, "
+                    ":ext, :mime_type, :size_bytes, :created_at)"
+                ),
+                {
+                    "media_id": media_id,
+                    "umo": umo,
+                    "cid": conversation_id,
+                    "turn_id": turn_id,
+                    "kind": kind,
+                    "file_name": file_name,
+                    "ext": ext,
+                    "mime_type": mime_type,
+                    "size_bytes": int(size_bytes),
+                    "created_at": created_at,
+                },
+            )
+            await session.commit()
+        return True
+
+    async def query_media_archive_by_ids(
+        self, media_ids: list[str]
+    ) -> dict[str, dict]:
+        """按 media_id 批量查询归档行（CM_UI 渲染用）。"""
+        await self.init_db()
+        ids = [str(item) for item in (media_ids or []) if item]
+        if not ids:
+            return {}
+        async with self.async_session() as session:
+            placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
+            result = await session.execute(
+                text(
+                    "SELECT media_id, kind, file_name, ext, mime_type, "
+                    "size_bytes, created_at FROM chat_memory_media_archive "
+                    f"WHERE media_id IN ({placeholders})"
+                ),
+                {f"id_{i}": ids[i] for i in range(len(ids))},
+            )
+            return {
+                row[0]: {
+                    "media_id": row[0],
+                    "kind": row[1],
+                    "file_name": row[2],
+                    "ext": row[3],
+                    "mime_type": row[4],
+                    "size_bytes": row[5],
+                    "created_at": row[6],
+                }
+                for row in result.fetchall()
+            }
+
+    async def query_media_archive_for_cleanup(
+        self, limit: int = 1000
+    ) -> list[dict]:
+        """按 created_at 升序取归档行（清理用：保留期/总量上限从旧到新删除）。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT media_id, file_name, created_at, size_bytes "
+                    "FROM chat_memory_media_archive ORDER BY created_at ASC "
+                    "LIMIT :limit"
+                ),
+                {"limit": max(1, int(limit))},
+            )
+            return [
+                {
+                    "media_id": row[0],
+                    "file_name": row[1],
+                    "created_at": row[2],
+                    "size_bytes": row[3],
+                }
+                for row in result.fetchall()
+            ]
+
+    async def media_archive_total_size(self) -> int:
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT COALESCE(SUM(size_bytes), 0) "
+                    "FROM chat_memory_media_archive"
+                )
+            )
+            return int(result.scalar() or 0)
+
+    async def delete_media_archive_by_ids(self, media_ids: list[str]) -> int:
+        """按 media_id 删除归档行（清理总量/保留期时使用）。返回删除行数。"""
+        await self.init_db()
+        ids = [str(item) for item in (media_ids or []) if item]
+        if not ids:
+            return 0
+        async with self.async_session() as session:
+            placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
+            result = await session.execute(
+                text(
+                    "DELETE FROM chat_memory_media_archive "
+                    f"WHERE media_id IN ({placeholders})"
+                ),
+                {f"id_{i}": ids[i] for i in range(len(ids))},
             )
             await session.commit()
             return result.rowcount

@@ -21,8 +21,8 @@ target="assistant"/> 或 <cm_mention target="assistant"/> 表示该消息明确�
 回应。优先回答该消息及其指向，勿续写、扮演或改答最后一条历史 user。
 <cm_solo active="1"/> 与 <cm_solo orphan="1"/> 标记你历史中主动发出或未配对的
 旧回复，仅说明消息性质，不与相邻 user 构成问答轮次，也不构成当前行动指令。
-<cm_image/> / <cm_voice/> / <cm_video/> / <cm_file/> / <cm_face/> / <cm_forward/>
-表示该消息携带的媒体类型，同样不是可输出的文本；不得输出、学习或模仿任何
+<cm_image/> / <cm_voice/> / <cm_video/> / <cm_file/> / <cm_emoji/> / <cm_forward/>
+表示该消息携带的媒体类型，<cm_poke/> 表示戳一戳等动作，同样不是可输出的文本；不得输出、学习或模仿任何
 cm_ 标签，需要发送媒体时请使用工具。"""
 
 
@@ -56,13 +56,15 @@ MEDIA_PLACEHOLDER_LABELS = {
     "video": "<cm_video/>",
     "voice": "<cm_voice/>",
     "file": "<cm_file/>",
-    "face": "<cm_face/>",
+    "emoji": "<cm_emoji/>",
+    "poke": "<cm_poke/>",
     "forward": "<cm_forward/>",
 }
 
 # capture 阶段写入的旧英文占位：展示层视为"无实际内容"，统一替换成上面的占位。
 _LEGACY_EN_PLACEHOLDERS = {
-    "[image]", "[video]", "[voice]", "[file]", "[face]", "[forward]",
+    "[image]", "[video]", "[voice]", "[file]", "[face]", "[emoji]",
+    "[forward]", "[poke]",
 }
 
 # LLM 回复中模仿输出的方括号占位字面（中文 + 英文）：清洗为裸词，避免用户
@@ -355,7 +357,7 @@ class TakeoverContextBuilder:
         """
         kinds = [
             kind for kind in (record.get("content_kind") or [])
-            if kind in self.media_kinds and kind in MEDIA_PLACEHOLDER_LABELS
+            if kind in MEDIA_PLACEHOLDER_LABELS
         ]
         if not kinds:
             return content

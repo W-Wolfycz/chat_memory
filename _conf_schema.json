@@ -62,7 +62,7 @@
       "include_content_kinds": {
         "description": "内容白名单",
         "type": "list",
-        "options": ["text", "image", "video", "voice", "file", "face", "forward", "system_event"],
+        "options": ["text", "image", "video", "voice", "file", "emoji", "forward", "system_event", "poke"],
         "default": ["text"],
         "hint": "只注入选中的内容类型；清空表示不过滤。混合消息由“全部命中”控制。"
       },
@@ -95,6 +95,37 @@
         "type": "int",
         "default": 2,
         "hint": "接管时回放 CM 库中最近 N 个轮次的 LLM 工具调用（assistant tool_calls + role=tool），让 LLM 跨轮看到工具返回，避免重复调用工具。0 = 不回放工具调用。"
+      }
+    }
+  },
+  "media_archive": {
+    "description": "媒体归档",
+    "type": "object",
+    "hint": "把 user 侧媒体（图片/语音/视频/文件）落盘到插件数据目录，供 ChatMemory UI 回看。异步下载不阻塞消息处理；失败不影响存档。",
+    "items": {
+      "enabled": {
+        "description": "启用媒体归档",
+        "type": "bool",
+        "default": true,
+        "hint": "总开关。关闭时只存媒体元信息（文件名等），不落盘。"
+      },
+      "include_video": {
+        "description": "归档视频",
+        "type": "bool",
+        "default": false,
+        "hint": "视频体积大、下载久，默认关闭；开启后单文件上限 200MB。"
+      },
+      "retention_days": {
+        "description": "保留天数",
+        "type": "int",
+        "default": 30,
+        "hint": "超过此天数的媒体文件与归档记录将被清理。最小 1 天。"
+      },
+      "max_total_mb": {
+        "description": "总量上限（MB）",
+        "type": "int",
+        "default": 2048,
+        "hint": "媒体总量超过该上限时从最旧开始删除。最小 64MB。"
       }
     }
   }

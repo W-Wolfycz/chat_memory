@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.2.4`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=4`。
+当前发布版本：`1.3.0`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=5`。
 
 ## 特性
 
@@ -23,7 +23,7 @@
 | | `llm_success` | LLM 路径且 assistant 成功回复 |
 | | `proactive` | 主动消息（assistant 单边，含 cron） |
 | | `orphan` | user 漏存（DB 写入失败） |
-| `content_kind` | `text` / `image` / `video` / `voice` / `file` / `face` / `forward` / `system_event` | JSON 数组，可多值 |
+| `content_kind` | `text` / `image` / `video` / `voice` / `file` / `emoji` / `forward` / `system_event` / `poke` | JSON 数组，可多值 |
 | | `[]` 空数组 | empty（如纯 @BOT 无文字、纯 Reply 无文字） |
 
 `at` / `reply` 不入 `content_kind`。`reply_id` 保留平台引用 ID；`at_id` 已弃用但在
@@ -41,6 +41,7 @@
 | `auto_cleanup_days` | int | 0 | 自动清理天数，**0 = 不清理**；>0 启动周期任务（24h 一次） |
 | `log_with_bot_id` | bool | false | 日志前缀附加机器人实例 ID，多 Bot 环境便于定位 |
 | `context_takeover` | object | — | 上下文接管配置，详见 [上下文接管](#上下文接管) |
+| `media_archive` | object | — | 媒体归档：`enabled`(true) / `include_video`(false) / `retention_days`(30) / `max_total_mb`(2048)。关闭时只存元信息不落盘 |
 
 > **日志等级**：插件不再提供"日志提级"配置——AstrBot >= 4.26.8 已内置运行期修改插件日志等级的能力（WebUI 插件详情页选择等级，写入 `config/plugin_log_levels.json` 即时生效，无需重启），需要 debug 日志时在那里把 `chat_memory` 调到 DEBUG 即可。
 
@@ -98,17 +99,36 @@ CREATE TABLE chat_memory_tool_records (
 
 工具记录不进 user/assistant 配对与查询 API，只在接管时按轮次回放成 OpenAI 格式。
 
+媒体归档（schema v5 起，`chat_memory_media_archive`）：
+
+```sql
+CREATE TABLE chat_memory_media_archive (
+    media_id        TEXT PRIMARY KEY,              -- relation_data.media 条目中的 id（32 位随机 hex）
+    umo             TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    turn_id         TEXT NOT NULL,
+    kind            TEXT NOT NULL,                 -- image / video / voice / file
+    file_name       TEXT NOT NULL,                 -- <media_id>.<ext>，路径不落库
+    ext             TEXT NOT NULL,
+    mime_type       TEXT,
+    size_bytes      INTEGER NOT NULL,
+    created_at      DATETIME NOT NULL              -- UTC naive，与主表一致
+);
+```
+
+user 侧媒体落盘到 `data/plugin_data/chat_memory/media/<YYYYMM>/<media_id>.<ext>`：本地源（已存在的 path/file://）在捕获时同步拷贝（毫秒级），远程 URL 交给后台 worker 下载（2 并发、短超时、失败静默）；**管线零阻塞，归档尽力而为**，失败不影响记录存档。只在落盘成功时写归档行；emoji/poke/forward 只有元信息不落盘。清理按 `media_archive` 配置（保留天数 + 总量上限），`/reset` 与自动清理级联删除归档行与文件。
+
 > **platform_id vs platform_name**：自 AstrBot v4.0 起 umo 第一段是实例 ID（多 aiocqhttp 实例时每个不同），`platform_name` 才是类型。
 >
 > **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（**UTC naive 存储**，与 schema default `CURRENT_TIMESTAMP` 对齐；**查询返回时按 AstrBot `timezone` 配置转成配置时区 naive 字符串**）。
 >
-> **测试版数据库升级**：启动时使用 `PRAGMA user_version` + 实际列检查。已有 `llm_status` 的数据库会增量补 `persona_id` / `turn_id` / `send_status` / `relation_data`；更早、缺少 `llm_status` 的表不会猜测字段语义，而是先 RENAME 为 `chat_memory_records_backup_<ts>` 再建立当前主表。迁移后会校验索引绑定，并将数据库 schema version 写为 3。
+> **测试版数据库升级**：启动时使用 `PRAGMA user_version` + 实际列检查。已有 `llm_status` 的数据库会增量补 `persona_id` / `turn_id` / `send_status` / `relation_data`；更早、缺少 `llm_status` 的表不会猜测字段语义，而是先 RENAME 为 `chat_memory_records_backup_<ts>` 再建立当前主表。迁移后会校验索引绑定，并将数据库 schema version 写为 5（1.3.0 起另建媒体归档表）。
 
 > **turn_id 与发送状态**：1.0.0 的实时写入和状态升级统一使用内部 `turn_id`；历史记录查询仍保留 `message_id` / `pair_id` 回退，确保现有数据库中的旧轮次可读。`send_status=prepared` 表示 assistant 已写入、准备发送；`send_attempted` 仅表示 AstrBot 发送流程结束/已尝试，不等价于平台送达回执。
 
 ### 升级与备份
 
-- 已有 schema v2 数据库可直接启动 1.2.0；首次迁移仅增加 nullable `relation_data`。1.2.2 起 schema v4 新增独立工具表 `chat_memory_tool_records`，v3 及更早版本升级只建新表、不改主表结构，既有记录零迁移。结构化标签与当前轮焦点锚都只改变请求时展示，不修改表结构或既有记录。
+- 已有 schema v2 数据库可直接启动 1.2.0；首次迁移仅增加 nullable `relation_data`。1.2.2 起 schema v4 新增独立工具表 `chat_memory_tool_records`，1.3.0 起 schema v5 新增媒体归档表 `chat_memory_media_archive`；升级只建新表、不改主表结构，既有记录零迁移。结构化标签与当前轮焦点锚都只改变请求时展示，不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -159,6 +179,7 @@ cm = _resolve_chat_memory(context)
 ### 群聊 At / Reply 关系
 
 - At 按 MessageChain 原始位置写成 `⟦CM_AT:0⟧` 等带索引模板；`relation_data.mentions` 按出现顺序保存参数，重复 At 不去重，AtAll 使用 `{"all": true}`。
+- 统一规则：凡与文字同时出现的媒体/动作组件，一律按原始位置写成类型化 token（`⟦CM_IMAGE:n⟧` / `⟦CM_VIDEO:n⟧` / `⟦CM_FILE:n⟧` / `⟦CM_POKE:n⟧` 等，n 为 `relation_data.media` 数组下标），`media` 附带元信息（表情 `id`、戳一戳目标）；查询返回的 `content` 渲染为 `<cm_image/>` 等占位标签，保持正文中的原始位置。纯媒体/纯动作消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存英文占位（`[image]` 等），元信息仍在 `media` 数组。
 - 普通成员 Reply 只用同一平台实例、同一 UMO 下唯一的 `reply_id → user.message_id` 精确解析为 `target_turn_id`；零命中或多命中都不猜测。
 - 引用 Bot/assistant 时不做时间或内容启发式匹配，直接保存 AstrBot Reply 组件提供的昵称与最多 300 字符文本快照；其他无法精确解析的 Reply 同样降级为快照。
 - 跨会话历史中的 Reply 仍按该消息原本所在的 UMO 查询 `target_turn_id`，不会拿当前请求所在群替代，也不会跨群猜测引用关系。
@@ -409,7 +430,7 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 - **ALL + `["text","image"]`**：精确限定为这两种 kind
 - **清空**：不过滤，全量进入
 
-**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_image/>` / `<cm_voice/>` / `<cm_video/>` / `<cm_file/>` / `<cm_face/>` / `<cm_forward/>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_image/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
+**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_image/>` / `<cm_voice/>` / `<cm_video/>` / `<cm_file/>` / `<cm_emoji/>` / `<cm_forward/>`，戳一戳为 `<cm_poke/>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_image/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
 
 ### persona 隔离（filter_by_persona）
 
@@ -430,6 +451,10 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 - cid **不会自动**随 persona 切换——同一 cid 下可能累积多个 persona 的数据，按 `persona_id` 列区分
 - 旧测试版数据库启动时自动 `ALTER TABLE ADD COLUMN persona_id TEXT` 补列，旧行 `persona_id` 为 NULL
 - 入库时 `persona_id` 取自 `_get_effective_persona`（走 `persona_manager.resolve_selected_persona`，与 LLM 实际生效 persona 同源）
+
+## 存档语义
+
+CM 存档的是 **LLM 实际产出的内容**：`capture_bot` 在 `on_decorating_result` 装饰链**最先**执行（priority=10000），捕获最接近 LLM 原始输出的回复。用户最终看到的展示形式（分段、引用组件、At、表情装饰等由后续装饰链追加）允许与存档存在差异——存档的服务对象是 LLM 上下文与查询，不是发送快照。装饰链若改写回复的**语义内容**（而非包装形式），属于装饰插件的越界行为，CM 不负责修正。
 
 ## 已知限制
 

@@ -18,9 +18,12 @@ import ast
 import asyncio
 import enum
 import json
+import os
+import re
 import sqlite3
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -54,7 +57,7 @@ sys.modules["astrbot.api"].AstrBotConfig = dict
 sys.modules["astrbot.api"].ProviderRequest = object
 
 for name in ["Plain", "Image", "Video", "Record", "File", "Face",
-             "At", "AtAll", "Reply", "Forward"]:
+             "Poke", "At", "AtAll", "Reply", "Forward", "Unknown"]:
     setattr(sys.modules["astrbot.api.message_components"], name, type(name, (), {}))
 
 sys.modules["astrbot.api.star"].Star = object
@@ -143,6 +146,12 @@ sys.modules["chat_memory.relation_codec"] = relation_codec_mod
 exec(compile((PLUGIN_DIR / "relation_codec.py").read_text(), "relation_codec.py", "exec"),
      relation_codec_mod.__dict__)
 setattr(pkg, "relation_codec", relation_codec_mod)
+
+media_archive_mod = types.ModuleType("chat_memory.media_archive")
+sys.modules["chat_memory.media_archive"] = media_archive_mod
+exec(compile((PLUGIN_DIR / "media_archive.py").read_text(), "media_archive.py", "exec"),
+     media_archive_mod.__dict__)
+setattr(pkg, "media_archive", media_archive_mod)
 
 classifier_mod = types.ModuleType("chat_memory.message_classifier")
 sys.modules["chat_memory.message_classifier"] = classifier_mod
@@ -435,6 +444,8 @@ def test_media_placeholders_solo_and_variants():
              kinds=["image"], created_at="2026-08-18 04:04:02"),
         # 纯媒体多 kind
         _rec(content="", kinds=["image", "voice"], created_at="2026-08-18 04:05:00"),
+        # 戳一戳:纯动作消息,旧占位替换为 <cm_poke/>
+        _rec(content="[poke]", kinds=["poke"], created_at="2026-08-18 04:05:30"),
         # 文本已含同款标签:不重复
         _rec(content="看图 <cm_image/>", kinds=["text", "image"],
              created_at="2026-08-18 04:06:00"),
@@ -445,6 +456,7 @@ def test_media_placeholders_solo_and_variants():
     joined = "\n".join(c["content"] for c in out)
     assert '<cm_solo active="1"/> <cm_image/>' in joined
     assert "<cm_image/> <cm_voice/>" in joined
+    assert "<cm_poke/>" in joined
     assert "看图 <cm_image/>" in joined
     assert "看图 <cm_image/> <cm_image/>" not in joined
     assert "普通文本" in joined
@@ -1088,6 +1100,280 @@ def test_keep_tool_turns_zero_disables_replay():
     assert [m["role"] for m in out] == ["user", "assistant"]
     assert not p.db.tool_query_kwargs  # 未查询工具表
     print("[T44] keep_tool_turns_zero_disables_replay ✓")
+
+
+def test_media_position_tokens_and_ids():
+    """统一规则：与文字同现的媒体/动作全类型走位置 token；纯媒体清空 token。"""
+    Plain, Image, Video, File, Face, Poke = (
+        sys.modules["astrbot.api.message_components"].Plain,
+        sys.modules["astrbot.api.message_components"].Image,
+        sys.modules["astrbot.api.message_components"].Video,
+        sys.modules["astrbot.api.message_components"].File,
+        sys.modules["astrbot.api.message_components"].Face,
+        sys.modules["astrbot.api.message_components"].Poke,
+    )
+
+    def plain(t):
+        c = Plain(); c.text = t; return c
+
+    img = Image()
+    video = Video()
+    file_ = File()
+    face = Face(); face.id = 123
+    poke = Poke(); poke.target_id = lambda: "456"
+
+    class _Ev:
+        def __init__(self):
+            self.message_str = ""
+
+        def get_messages(self):
+            return [plain("看 "), img, plain(" 和 "), face]
+
+    template, relation = classifier_mod.build_relation_seed(_Ev())
+    assert "⟦CM_IMAGE:0⟧" in template and "⟦CM_EMOJI:1⟧" in template
+    media = relation["media"]
+    assert [m["kind"] for m in media] == ["image", "emoji"]
+    assert media[1]["id"] == "123"
+    rendered = relation_codec_mod.render_content_template(template, relation)
+    assert rendered == "看 <cm_image/> 和 <cm_emoji/>"
+    assert rendered.index("<cm_image/>") < rendered.index("<cm_emoji/>")
+
+    # 全类型统一：视频/文件/戳一戳与文字同现时同样走 token
+    class _EvMixed:
+        def __init__(self):
+            self.message_str = ""
+
+        def get_messages(self):
+            return [plain("先"), video, plain(" 再"), file_, plain(" 然后"), poke]
+
+    template2, relation2 = classifier_mod.build_relation_seed(_EvMixed())
+    assert "⟦CM_VIDEO:0⟧" in template2 and "⟦CM_FILE:1⟧" in template2
+    assert "⟦CM_POKE:2⟧" in template2
+    assert [m["kind"] for m in relation2["media"]] == ["video", "file", "poke"]
+    assert relation2["media"][2]["id"] == "456"
+    rendered2 = relation_codec_mod.render_content_template(template2, relation2)
+    assert rendered2 == "先<cm_video/> 再<cm_file/> 然后<cm_poke/>"
+
+    # 纯媒体/纯动作：token 清空（正文走占位符），media 数组保留元信息
+    class _EvPure:
+        def __init__(self):
+            self.message_str = ""
+
+        def get_messages(self):
+            return [img, face]
+
+    template3, relation3 = classifier_mod.build_relation_seed(_EvPure())
+    assert template3 == ""
+    assert [m["kind"] for m in relation3["media"]] == ["image", "emoji"]
+    rendered3 = relation_codec_mod.render_content_template(template3, relation3)
+    assert rendered3 == "<cm_image/> <cm_emoji/>"
+
+    class _EvPoke:
+        def __init__(self):
+            self.message_str = ""
+
+        def get_messages(self):
+            return [poke]
+
+    template4, relation4 = classifier_mod.build_relation_seed(_EvPoke())
+    assert template4 == ""
+    assert relation4["media"][0]["id"] == "456"
+    print("[T45] media_position_tokens_and_ids ✓")
+
+
+def test_system_event_summary_and_notice_kind():
+    """notice/request 空消息归类 system_event 并生成可读摘要(不写成 text)。"""
+    c = classifier_mod
+
+    class _Obj:
+        pass
+
+    class _Ev:
+        def __init__(self, raw=None, mtype="GroupMessage"):
+            self._raw = raw
+            self.message_str = ""
+            self.message_obj = None
+            if raw is not None:
+                self.message_obj = _Obj()
+                self.message_obj.raw_message = raw
+            self._mtype = mtype
+
+        def get_messages(self):
+            return []
+
+        def get_message_type(self):
+            return types.SimpleNamespace(value=self._mtype)
+
+    ev = _Ev(raw={"post_type": "notice", "notice_type": "group_recall"})
+    assert c.system_event_summary(ev) == "[撤回消息]"
+    assert c.classify_content(ev)[0] == ["system_event"]
+    ev2 = _Ev(raw={"post_type": "request", "request_type": "friend"})
+    assert c.system_event_summary(ev2) == "[请求事件]"
+    assert c.classify_content(ev2)[0] == ["system_event"]
+    ev3 = _Ev()
+    assert c.system_event_summary(ev3) == ""
+    print("[T46] system_event_summary_and_notice_kind ✓")
+
+
+def test_unknown_text_and_assistant_poke():
+    """Unknown 组件文本提取；assistant 链识别戳一戳。"""
+    c = classifier_mod
+    Plain, Poke, Unknown = (
+        sys.modules["astrbot.api.message_components"].Plain,
+        sys.modules["astrbot.api.message_components"].Poke,
+        sys.modules["astrbot.api.message_components"].Unknown,
+    )
+    unk = Unknown(); unk.text = "平台未知段文本"
+
+    class _Ev:
+        message_str = ""
+
+        def get_messages(self):
+            return [unk]
+
+        def get_message_type(self):
+            return types.SimpleNamespace(value="GroupMessage")
+
+    assert c.classify_content(_Ev())[0] == ["text"]
+    poke = Poke()
+    kind2, text2 = c.classify_assistant_chain([poke])
+    assert kind2 == ["poke"] and text2 == ""
+    print("[T47] unknown_text_and_assistant_poke ✓")
+
+
+def test_media_metadata_and_source_refs():
+    """媒体条目带归档 id/文件名/戳一戳类型；来源引用按组件字段解析（无 IO）。"""
+    mc = sys.modules["astrbot.api.message_components"]
+    Plain, Image, Video, Record, File, Forward = (
+        mc.Plain, mc.Image, mc.Video, mc.Record, mc.File, mc.Forward,
+    )
+    classifier_mod = sys.modules["chat_memory.message_classifier"]
+    import tempfile
+
+    def plain(t):
+        c = Plain(); c.text = t; return c
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local_img = os.path.join(tmp, "pic.png")
+        open(local_img, "wb").write(b"\x89PNG\r\n\x1a\n")
+
+        img_local = Image(); img_local.path = local_img; img_local.url = ""
+        img_remote = Image(); img_remote.path = ""; img_remote.url = "https://example.com/a.png"
+        video = Video(); video.path = ""; video.url = "http://127.0.0.1:6099/x.mp4"
+        file_local = File(); file_local.name = "C:\\dir\\课程表.pdf"
+        file_local.file_ = local_img; file_local.url = ""
+        fwd = Forward(); fwd.id = "fwd_1"
+
+        class _Ev:
+            message_str = ""
+
+            def get_messages(self):
+                return [plain("看"), img_local, plain(" "), img_remote,
+                        video, file_local, fwd]
+
+        template, mentions, media, refs, reply = (
+            classifier_mod.extract_user_template(_Ev())
+        )
+        assert [m["kind"] for m in media] == ["image", "image", "video", "file", "forward"]
+        # 归档类条目带随机 hex id；文件带 sanitize 后 basename
+        for m in media[:4]:
+            assert re.fullmatch(r"[0-9a-f]{32}", m["id"])
+        assert media[3]["name"] == "课程表.pdf"
+        assert media[4]["id"] == "fwd_1"
+        # 来源引用与 media 同序对齐
+        assert refs[0] == {"local": local_img}
+        assert refs[1] == {"url": "https://example.com/a.png"}
+        assert refs[2] == {"url": "http://127.0.0.1:6099/x.mp4"}
+        assert refs[3] == {"local": local_img}
+        assert refs[4] is None
+        # 位置 token 与渲染不受新增元信息影响
+        assert "⟦CM_IMAGE:0⟧" in template and "⟦CM_FILE:3⟧" in template
+        relation = classifier_mod.build_relation_seed(_Ev())[1]
+        assert relation["media"][3]["name"] == "课程表.pdf"
+
+    # poke type：组件 _type 缺失时回落 "126"
+    poke = mc.Poke(); poke.target_id = lambda: "456"
+    poke._type = "666"
+    _t2, _m2, media2, _r2, _s2 = classifier_mod.extract_user_template(
+        types.SimpleNamespace(message_str="", get_messages=lambda: [poke])
+    )
+    assert media2[0] == {"kind": "poke", "id": "456", "type": "666"}
+    poke2 = mc.Poke(); poke2.target_id = lambda: "456"
+    poke2._type = ""
+    _t3, _m3, media3, _r3, _s3 = classifier_mod.extract_user_template(
+        types.SimpleNamespace(message_str="", get_messages=lambda: [poke2])
+    )
+    assert media3[0]["type"] == "126"
+    print("[T48] media_metadata_and_source_refs ✓")
+
+
+def test_media_archive_local_and_cleanup():
+    """MediaArchiver：本地接管落盘登记、级联删除文件、关闭时拒绝。"""
+    import tempfile
+
+    from chat_memory.media_archive import MediaArchiver
+
+    class _AsyncInsert:
+        def __init__(self):
+            self.last = None
+
+        async def __call__(self, **kw):
+            self.last = kw
+            return True
+
+    class _AsyncNone:
+        async def __call__(self, *a, **k):
+            return None
+
+    class _AsyncEmpty:
+        async def __call__(self, *a, **k):
+            return [] if k.get("limit") else {}
+
+    class _AsyncZero:
+        async def __call__(self, *a, **k):
+            return 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "voice.amr")
+        open(src, "wb").write(b"#!AMR\n\x00\x00\x00\x1c" + b"\x00" * 64)
+
+        insert = _AsyncInsert()
+        db = types.SimpleNamespace(
+            insert_media_archive=insert,
+            query_media_archive_by_ids=_AsyncEmpty(),
+            query_media_archive_for_cleanup=_AsyncEmpty(),
+            media_archive_total_size=_AsyncZero(),
+            delete_media_archive_by_ids=_AsyncZero(),
+        )
+        archiver = MediaArchiver(db, Path(tmp) / "data", enabled=True,
+                                 include_video=False, retention_days=30,
+                                 max_total_mb=64)
+        ok = asyncio.run(archiver.archive_local(
+            "aaaa" + "0" * 28, src, "umo_demo", "cid_demo", "turn_demo", "voice",
+        ))
+        assert ok
+        row = insert.last
+        assert row["kind"] == "voice" and row["ext"] == "amr"
+        assert row["mime_type"] == "audio/amr"
+        assert row["file_name"].startswith("aaaa") and row["file_name"].endswith(".amr")
+        # 文件真实落盘（按月分桶）
+        month_dir = archiver.media_dir / datetime.now().strftime("%Y%m")
+        assert list(month_dir.glob("aaaa*"))
+        # 级联删除文件
+        deleted = asyncio.run(archiver.delete_files([{
+            "file_name": row["file_name"],
+            "created_at": datetime.now(),
+        }]))
+        assert deleted == 1
+        assert not list(month_dir.glob("aaaa*"))
+        # 视频开关关闭 / 归档关闭：拒绝
+        assert not archiver.allowed_kind("video")
+        off = MediaArchiver(db, Path(tmp) / "off", enabled=False,
+                            include_video=False, retention_days=30,
+                            max_total_mb=64)
+        assert not off.allowed_kind("image")
+        assert not asyncio.run(off.archive_local("b" * 32, src, "u", "c", "t", "voice"))
+        print("[T49] media_archive_local_and_cleanup ✓")
 
 
 def test_log_with_bot_id_migration():

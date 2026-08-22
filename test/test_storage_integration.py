@@ -211,9 +211,17 @@ async def _verify_plugin_lifecycle(tmp_root: Path) -> None:
         assert in_round[2]["content"] == "轮内任务已创建"
         assert "公开 API 回答" in in_round[3]["content"]
 
-        # /reset 联动：工具表与主表同 CID 记录一起清除
-        await plugin.db.delete_by_conversation(umo, cid)
+        # /reset 联动：工具表、媒体归档与主表同 CID 记录一起清除
+        media_id = "aa" * 16
+        await plugin.db.insert_media_archive(
+            media_id, umo, cid, "turn_public_api", "image",
+            f"{media_id}.png", "png", "image/png", 128,
+        )
+        deleted, media_rows = await plugin.db.delete_by_conversation(umo, cid)
+        assert deleted == 2  # turn_public_api 的 user + assistant
         assert await plugin.db.query_tool_records(umo, cid, turn_limit=2) == []
+        assert await plugin.db.query_media_archive_by_ids([media_id]) == {}
+        assert [row["file_name"] for row in media_rows] == [f"{media_id}.png"]
 
         # 日志配置迁移：旧 log_config 组并入顶层并移除旧组（dict config 仅内存迁移）
         migrate_cfg = {
@@ -262,6 +270,13 @@ async def _run() -> None:
                     "VALUES ('platform_demo:FriendMessage:10001', 'legacy', '10001', "
                     "'user', '旧记录', 'legacy_turn')"
                 )
+                # 旧 kind 值 face:迁移后应变为 emoji(1.2.5 数据迁移)
+                conn.execute(
+                    "INSERT INTO chat_memory_records "
+                    "(umo, conversation_id, user_id, role, content, content_kind, turn_id) "
+                    "VALUES ('platform_demo:FriendMessage:10001', 'legacy', '10001', "
+                    "'user', '旧表情', '[\"face\"]', 'legacy_turn_face')"
+                )
                 conn.execute("PRAGMA user_version = 2")
                 conn.commit()
             legacy_db = DBManager(legacy_dir, tz=ZoneInfo("UTC"))
@@ -271,14 +286,17 @@ async def _run() -> None:
             )
             assert legacy_rows[0]["content"] == "旧记录"
             assert legacy_rows[0]["relation_data"] is None
+            kinds = {tuple(item["content_kind"]) for item in legacy_rows}
+            assert ("emoji",) in kinds
+            assert not any("face" in (item["content_kind"] or []) for item in legacy_rows)
             await legacy_db.engine.dispose()
             with closing(sqlite3.connect(legacy_path)) as conn:
-                assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+                assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
                 assert "relation_data" in {
                     row[1] for row in conn.execute("PRAGMA table_info(chat_memory_records)")
                 }
-                # v2 → v4 迁移应同时建立工具表
-                assert "chat_memory_tool_records" in {
+                # v2 → v5 迁移应同时建立工具表与媒体归档表
+                assert {"chat_memory_tool_records", "chat_memory_media_archive"} <= {
                     row[0] for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     )
@@ -468,10 +486,76 @@ async def _run() -> None:
                 )
                 assert [item["content"] for item in mixed] == ["历史问题", "历史回答"]
 
+                # ── 媒体归档表（schema v5）──────────────────────────
+                mid1, mid2 = "ab" * 16, "cd" * 16
+                await db.insert_media_archive(
+                    mid1, "platform_demo:FriendMessage:10001",
+                    "conversation_demo", "turn_history", "image",
+                    f"{mid1}.jpg", "jpg", "image/jpeg", 111,
+                )
+                await db.insert_media_archive(
+                    mid2, "platform_demo:FriendMessage:10001",
+                    "conversation_demo", "turn_history", "file",
+                    f"{mid2}.pdf", "pdf", "application/pdf", 222,
+                )
+                archive_rows = await db.query_media_archive_by_ids(
+                    [mid1, mid2, "ee" * 16]
+                )
+                assert set(archive_rows) == {mid1, mid2}
+                assert archive_rows[mid1]["mime_type"] == "image/jpeg"
+                assert archive_rows[mid1]["size_bytes"] == 111
+                assert await db.media_archive_total_size() == 333
+                cleanup_rows = await db.query_media_archive_for_cleanup(limit=1)
+                assert [row["media_id"] for row in cleanup_rows] == [mid1]
+                assert await db.delete_media_archive_by_ids([mid1]) == 1
+                assert await db.media_archive_total_size() == 222
+
+                # 超期级联：旧记录与其媒体行一起被 delete_old 清除（不影响 2026 年记录）
+                old_mid = "ef" * 16
+                await db.insert(
+                    "platform_demo:FriendMessage:10001",
+                    "conversation_old_media",
+                    "10001",
+                    "user",
+                    "老媒体消息",
+                    llm_status="",
+                    content_kind=["image"],
+                    turn_id="turn_old_media",
+                )
+                await db.insert_media_archive(
+                    old_mid, "platform_demo:FriendMessage:10001",
+                    "conversation_old_media", "turn_old_media", "image",
+                    f"{old_mid}.png", "png", "image/png", 99,
+                )
+                async with db.async_session() as session:
+                    await session.execute(
+                        text(
+                            "UPDATE chat_memory_records SET created_at = "
+                            "'2020-01-01 00:00:00' "
+                            "WHERE conversation_id = 'conversation_old_media'"
+                        )
+                    )
+                    await session.execute(
+                        text(
+                            "UPDATE chat_memory_media_archive SET created_at = "
+                            "'2020-01-01 00:00:00' WHERE media_id = :media_id"
+                        ),
+                        {"media_id": old_mid},
+                    )
+                    await session.commit()
+                deleted_old, deleted_old_media = await db.delete_old(
+                    datetime(2021, 1, 1)
+                )
+                assert deleted_old == 1
+                assert [row["file_name"] for row in deleted_old_media] == [
+                    f"{old_mid}.png"
+                ]
+                assert await db.query_media_archive_by_ids([old_mid]) == {}
+
                 await db.engine.dispose()
                 with closing(sqlite3.connect(db.db_path)) as conn:
                     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-                    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+                    assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
                     assert conn.execute(
                         "SELECT COUNT(*) FROM chat_memory_records"
                     ).fetchone()[0] == 11

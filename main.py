@@ -11,7 +11,7 @@
 
 - ``content_kind``：消息内容形态（JSON 数组，可多值）
   - ``'text'`` / ``'image'`` / ``'video'`` / ``'voice'`` / ``'file'``
-    / ``'face'`` / ``'forward'`` / ``'system_event'``
+    / ``'emoji'`` / ``'forward'`` / ``'system_event'`` / ``'poke'``
   - ``[]`` 空数组 = empty（如纯 @ 无文字、纯 Reply 无文字）
   - ``'at'`` / ``'reply'`` 不入 content_kind，用独立字段 ``at_id`` / ``reply_id`` 表达
 
@@ -36,12 +36,15 @@ from astrbot.api.message_components import Plain
 from astrbot.core.agent.message import TextPart
 
 from .storage import DBManager
+from .media_archive import MediaArchiver
 from .message_classifier import (
     classify_assistant_chain as _classify_assistant_chain_impl,
     classify_content as _classify_content_impl,
     content_placeholder as _content_placeholder_impl,
     build_relation_seed as _build_relation_seed_impl,
+    build_relation_seed_full as _build_relation_seed_full_impl,
     extract_text as _extract_text_impl,
+    system_event_summary as _system_event_summary_impl,
 )
 from .context_builder import (
     CM_GENERAL_RULES,
@@ -60,6 +63,7 @@ from .models import (
     LLM_PENDING as _LLM_PENDING,
     LLM_PROACTIVE as _LLM_PROACTIVE,
     LLM_SUCCESS as _LLM_SUCCESS,
+    K_SYSTEM as _K_SYSTEM,
     MEDIA_KINDS as _MEDIA_KINDS,
     SEND_ATTEMPTED as _SEND_ATTEMPTED,
     SEND_PREPARED as _SEND_PREPARED,
@@ -127,6 +131,18 @@ class ChatMemoryPlugin(Star):
         data_dir = StarTools.get_data_dir("chat_memory")
         self.db = DBManager(data_dir, tz=self._tz)
 
+        # 媒体归档（1.3.0）：user 侧媒体落盘供 CM_UI 回看；尽力而为，不阻塞管线。
+        media_conf = config.get("media_archive", {}) or {}
+        self.media_archiver = MediaArchiver(
+            self.db,
+            data_dir,
+            enabled=bool(media_conf.get("enabled", True)),
+            include_video=bool(media_conf.get("include_video", False)),
+            retention_days=int(media_conf.get("retention_days", 30) or 30),
+            max_total_mb=int(media_conf.get("max_total_mb", 2048) or 2048),
+        )
+        self._media_cleanup_task: Optional[asyncio.Task] = None
+
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_started = False
 
@@ -136,6 +152,14 @@ class ChatMemoryPlugin(Star):
             else "自动清理关闭"
         )
         logger.info(f"[ChatMemory] 对话记录存档已启用（{cleanup_desc}）")
+        archive_desc = (
+            f"媒体归档启用（保留 {self.media_archiver.retention_days} 天，"
+            f"上限 {self.media_archiver.max_total_bytes // (1024 * 1024)}MB，"
+            f"视频={'含' if self.media_archiver.include_video else '不含'}）"
+            if self.media_archiver.enabled
+            else "媒体归档关闭（仅存元信息）"
+        )
+        logger.info(f"[ChatMemory] {archive_desc}")
 
         if self.ct_enable:
             modes = []
@@ -162,6 +186,12 @@ class ChatMemoryPlugin(Star):
             await self._migrate_log_config()
             await self.db.init_db()
             await self._ensure_cleanup_started()
+            # 媒体归档：worker 与周期清理独立于记录自动清理（auto_cleanup_days 关闭也运行）
+            self.media_archiver.start()
+            if self.media_archiver.enabled:
+                self._media_cleanup_task = asyncio.create_task(
+                    self._media_cleanup_loop()
+                )
         except BaseException:
             try:
                 await self.db.engine.dispose()
@@ -222,7 +252,8 @@ class ChatMemoryPlugin(Star):
                 await asyncio.sleep(86400)
                 cutoff = datetime.now(dt_timezone.utc).replace(tzinfo=None) - timedelta(days=self.auto_cleanup_days)
                 try:
-                    deleted = await self.db.delete_old(cutoff)
+                    deleted, media_rows = await self.db.delete_old(cutoff)
+                    await self.media_archiver.delete_files(media_rows)
                     if deleted > 0:
                         logger.info(
                             f"{self._log_prefix()} 自动清理：删除 {deleted} 条 "
@@ -234,6 +265,24 @@ class ChatMemoryPlugin(Star):
                     raise
                 except Exception as e:
                     logger.warning(f"{self._log_prefix()} 自动清理失败: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _media_cleanup_loop(self):
+        """媒体归档周期清理（每小时）：保留期 → 总量上限 → 孤儿文件。"""
+        try:
+            while True:
+                await asyncio.sleep(3600)
+                try:
+                    stats = await self.media_archiver.cleanup_cycle()
+                    if any(stats.values()):
+                        logger.info(
+                            f"{self._log_prefix()} 媒体归档清理: {stats}"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"{self._log_prefix()} 媒体归档清理失败: {e}")
         except asyncio.CancelledError:
             pass
 
@@ -304,6 +353,87 @@ class ChatMemoryPlugin(Star):
     @staticmethod
     def _build_relation_seed(event: AstrMessageEvent) -> tuple[str, Optional[dict]]:
         return _build_relation_seed_impl(event)
+
+    @staticmethod
+    def _build_relation_seed_full(
+        event: AstrMessageEvent,
+    ) -> tuple[str, Optional[dict], list[dict], list]:
+        """user 捕获专用：额外返回 media 条目与来源引用（媒体归档用）。"""
+        return _build_relation_seed_full_impl(event)
+
+    async def _archive_media(
+        self,
+        event: AstrMessageEvent,
+        umo: str,
+        cid: str,
+        turn_id: str,
+        media_entries: list[dict],
+        media_refs: list,
+    ) -> None:
+        """把 user 侧媒体交给归档器：本地源同步拷贝、base64/data 同步写、URL 入队。
+
+        全部尽力而为：任何失败都只降级为"未归档"，不影响已完成的记录存档。
+        """
+        if not media_entries:
+            return
+        for entry, ref in zip(media_entries, media_refs):
+            if not isinstance(entry, dict) or not ref:
+                continue
+            media_id = str(entry.get("id") or "")
+            kind = str(entry.get("kind") or "")
+            name = str(entry.get("name") or "")
+            if not media_id:
+                continue
+            try:
+                if ref.get("local"):
+                    await self.media_archiver.archive_local(
+                        media_id, ref["local"], umo, cid, turn_id, kind, name=name
+                    )
+                elif ref.get("base64") is not None:
+                    import base64
+
+                    data = base64.b64decode(ref["base64"])
+                    await self.media_archiver.archive_bytes(
+                        media_id, data, umo, cid, turn_id, kind, name=name
+                    )
+                elif ref.get("data"):
+                    data = self._decode_data_uri(ref["data"])
+                    if data:
+                        await self.media_archiver.archive_bytes(
+                            media_id, data, umo, cid, turn_id, kind, name=name
+                        )
+                elif ref.get("url"):
+                    self.media_archiver.enqueue(
+                        {
+                            "media_id": media_id,
+                            "kind": kind,
+                            "url": ref["url"],
+                            "umo": umo,
+                            "conversation_id": cid,
+                            "turn_id": turn_id,
+                            "name": name,
+                        }
+                    )
+            except Exception as exc:
+                logger.debug(
+                    f"{self._log_prefix(event)} 媒体归档提交失败 "
+                    f"kind={kind} id={media_id[:8]}: {exc}"
+                )
+
+    @staticmethod
+    def _decode_data_uri(uri: str) -> Optional[bytes]:
+        """解析 data:[<mime>][;base64],<payload>；失败返回 None。"""
+        try:
+            header, _, payload = uri.partition(",")
+            if not payload or not header.startswith("data:"):
+                return None
+            import base64
+
+            if header.endswith(";base64"):
+                return base64.b64decode(payload)
+            return payload.encode("utf-8")
+        except Exception:
+            return None
 
     @staticmethod
     def _content_placeholder(kind: list[str]) -> str:
@@ -464,12 +594,18 @@ class ChatMemoryPlugin(Star):
             return False
 
         kind, at_id, reply_id, forward_id = self._classify_content(event)
-        user_template, relation_data = self._build_relation_seed(event)
+        user_template, relation_data, media_entries, media_refs = (
+            self._build_relation_seed_full(event)
+        )
         user_text = user_template or self._extract_text(event)
 
-        # content 决定：有文本用文本；否则用占位；empty（[] + 无引用字段）用空串
+        # content 决定：有文本用文本；否则用占位；empty（[] + 无引用字段）用空串。
+        # system_event 优先使用 notice/request 事件的可读摘要（如 [撤回消息]），
+        # kind 保持 system_event，不写成 text 类型。
         if user_text:
             content = user_text
+        elif kind == [_K_SYSTEM]:
+            content = self._system_event_summary_impl(event) or self._content_placeholder(kind)
         elif kind:
             content = self._content_placeholder(kind)
         else:
@@ -511,6 +647,9 @@ class ChatMemoryPlugin(Star):
         if not ok:
             logger.warning(f"{self._log_prefix(event)} user 写入失败，extras 未标记，assistant 将标 orphan")
             return False
+
+        # 媒体归档：本地源同步接管（毫秒级）+ 远程源后台下载，失败不影响存档。
+        await self._archive_media(event, umo, cid, turn_id, media_entries, media_refs)
 
         kind_repr = "/".join(kind) if kind else "empty"
         ref_repr = []
@@ -1310,7 +1449,8 @@ class ChatMemoryPlugin(Star):
 
         if command == "reset":
             # 直接删除并记录实际数量：一次 DELETE 完成，不再先 COUNT 预查。
-            deleted = await self.db.delete_by_conversation(umo, cid)
+            deleted, media_rows = await self.db.delete_by_conversation(umo, cid)
+            await self.media_archiver.delete_files(media_rows)
             if deleted > 0:
                 logger.info(
                     f"{self._log_prefix(event)} /reset 完成：清除 CID={cid[:8]} "
@@ -1560,7 +1700,22 @@ class ChatMemoryPlugin(Star):
                 logger.warning(f"{self._log_prefix()} 清理 task 停止异常: {e}")
             self._cleanup_task = None
 
-        # 2. 释放 DB 连接池（关键写入均直接 await，不再维护后台写入任务）
+        # 2. 停止媒体归档（取消后台下载 worker，清 .tmp）与媒体清理 task
+        if self._media_cleanup_task and not self._media_cleanup_task.done():
+            self._media_cleanup_task.cancel()
+            try:
+                await self._media_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"{self._log_prefix()} 媒体清理 task 停止异常: {e}")
+            self._media_cleanup_task = None
+        try:
+            await self.media_archiver.stop()
+        except Exception as e:
+            logger.warning(f"{self._log_prefix()} 媒体归档停止异常: {e}")
+
+        # 3. 释放 DB 连接池（关键写入均直接 await，不再维护后台写入任务）
         try:
             await self.db.engine.dispose()
         except Exception as e:

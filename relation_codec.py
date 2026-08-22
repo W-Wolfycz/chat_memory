@@ -10,16 +10,54 @@ RELATION_VERSION = 1
 AT_TOKEN_RE = re.compile(r"⟦CM_AT:(\d+)⟧")
 AT_TOKEN_LITERAL = "⟦CM_AT:"
 AT_TOKEN_ESCAPED = "⟦CM_LITERAL_AT:"
+# 媒体/动作位置 token（relation v1 新增 media 数组，schema 零迁移）：
+# 统一规则——凡与文字同时出现的媒体/动作类型，一律按原始位置写类型化
+# token（如 ⟦CM_IMAGE:0⟧），索引为 media 数组中的统一下标；纯媒体/纯动作
+# 消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存占位符
+# （media 数组仍保留元信息）。
+_MEDIA_PREFIXES = ("IMAGE", "VIDEO", "VOICE", "FILE", "EMOJI", "FORWARD", "POKE")
+MEDIA_TOKEN_RE = re.compile(
+    r"⟦CM_(?:IMAGE|VIDEO|VOICE|FILE|EMOJI|FORWARD|POKE):(\d+)⟧"
+)
+# kind → 上下文占位标签（与 context_builder.MEDIA_PLACEHOLDER_LABELS 保持一致）
+MEDIA_KIND_LABELS = {
+    "image": "<cm_image/>",
+    "video": "<cm_video/>",
+    "voice": "<cm_voice/>",
+    "file": "<cm_file/>",
+    "emoji": "<cm_emoji/>",
+    "forward": "<cm_forward/>",
+    "poke": "<cm_poke/>",
+}
 MAX_REPLY_SNAPSHOT_CHARS = 300
 
 
 def escape_plain_text(text: str) -> str:
-    """避免用户原文伪造 ChatMemory 内部 At placeholder。"""
-    return (text or "").replace(AT_TOKEN_LITERAL, AT_TOKEN_ESCAPED)
+    """避免用户原文伪造 ChatMemory 内部 At / 媒体 placeholder。"""
+    value = (text or "").replace(AT_TOKEN_LITERAL, AT_TOKEN_ESCAPED)
+    for prefix in _MEDIA_PREFIXES:
+        value = value.replace(f"⟦CM_{prefix}:", f"⟦CM_LITERAL_{prefix}:")
+    return value
 
 
 def at_token(index: int) -> str:
     return f"⟦CM_AT:{index}⟧"
+
+
+def media_token(kind: str, index: int) -> str:
+    prefix = _MEDIA_KIND_PREFIXES.get(kind, "IMAGE")
+    return f"⟦CM_{prefix}:{index}⟧"
+
+
+_MEDIA_KIND_PREFIXES = {
+    "image": "IMAGE",
+    "video": "VIDEO",
+    "voice": "VOICE",
+    "file": "FILE",
+    "emoji": "EMOJI",
+    "forward": "FORWARD",
+    "poke": "POKE",
+}
 
 
 def parse_relation_data(value: Any) -> Optional[dict]:
@@ -37,6 +75,12 @@ def parse_relation_data(value: Any) -> Optional[dict]:
     mentions = data.get("mentions")
     if not isinstance(mentions, list):
         data["mentions"] = []
+    media = data.get("media")
+    if not isinstance(media, list):
+        data["media"] = []
+    poke_target = data.get("poke_target")
+    if poke_target is not None and not isinstance(poke_target, str):
+        data["poke_target"] = ""
     if data.get("reply") is not None and not isinstance(data.get("reply"), dict):
         data["reply"] = None
     return data
@@ -46,10 +90,16 @@ def dump_relation_data(data: Optional[dict]) -> Optional[str]:
     if not data:
         return None
     mentions = data.get("mentions") or []
+    media = data.get("media") or []
+    poke_target = data.get("poke_target") or ""
     reply = data.get("reply")
-    if not mentions and not reply:
+    if not mentions and not media and not poke_target and not reply:
         return None
     payload = {"v": RELATION_VERSION, "mentions": mentions, "reply": reply}
+    if media:
+        payload["media"] = media
+    if poke_target:
+        payload["poke_target"] = poke_target
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -71,24 +121,57 @@ def render_content_template(template: str, relation_data: Any) -> str:
     if not data:
         return template or ""
     mentions = data.get("mentions", [])
+    media = data.get("media", [])
     value = template or ""
     parts: list[str] = []
     cursor = 0
-    for match in AT_TOKEN_RE.finditer(value):
-        plain = value[cursor:match.start()].replace(
-            AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL
-        )
-        parts.append(xml_escape(plain, quote=True))
-        index = int(match.group(1))
-        if index >= len(mentions):
-            parts.append('<cm_mention target="未知成员"/>')
+
+    def unescape(plain: str) -> str:
+        value = plain.replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+        for prefix in _MEDIA_PREFIXES:
+            value = value.replace(f"⟦CM_LITERAL_{prefix}:", f"⟦CM_{prefix}:")
+        return value
+
+    def media_label(index: int) -> str:
+        if index >= len(media) or not isinstance(media[index], dict):
+            return "<cm_image/>"
+        return MEDIA_KIND_LABELS.get(str(media[index].get("kind") or ""), "<cm_image/>")
+
+    # At 与媒体 token 可能交错出现：合并后按位置顺序渲染
+    matches = [
+        (m.start(), "at", int(m.group(1)))
+        for m in AT_TOKEN_RE.finditer(value)
+    ] + [
+        (m.start(), "media", int(m.group(1)))
+        for m in MEDIA_TOKEN_RE.finditer(value)
+    ]
+    matches = [(m.start(), m.end(), "at", int(m.group(1))) for m in AT_TOKEN_RE.finditer(value)] + [
+        (m.start(), m.end(), "media", int(m.group(1))) for m in MEDIA_TOKEN_RE.finditer(value)
+    ]
+    matches.sort(key=lambda item: item[0])
+    for start, end, token_kind, index in matches:
+        parts.append(xml_escape(unescape(value[cursor:start]), quote=True))
+        if token_kind == "at":
+            if index >= len(mentions):
+                parts.append('<cm_mention target="未知成员"/>')
+            else:
+                label = mention_label(mentions[index])
+                parts.append(f'<cm_mention target="{xml_escape(label, quote=True)}"/>')
         else:
-            label = mention_label(mentions[index])
-            parts.append(f'<cm_mention target="{xml_escape(label, quote=True)}"/>')
-        cursor = match.end()
-    tail = value[cursor:].replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
-    parts.append(xml_escape(tail, quote=True))
-    return "".join(parts)
+            parts.append(media_label(index))
+        cursor = end
+    tail = value[cursor:]
+    parts.append(xml_escape(unescape(tail), quote=True))
+    result = "".join(parts)
+    if not result.strip() and media:
+        # 纯媒体消息（正文无 token 且无文本）：按 media 数组顺序输出占位标签
+        labels = [
+            MEDIA_KIND_LABELS.get(str(item.get("kind") or ""), "")
+            for item in media
+            if isinstance(item, dict)
+        ]
+        result = " ".join(label for label in labels if label)
+    return result
 
 
 def _current_mention_xml(mention: Any, self_id: str) -> str:
@@ -180,11 +263,14 @@ def truncate_reply_snapshot(text: str) -> str:
 
 
 def truncate_content_template(template: str, max_chars: int) -> str:
-    """按字符预算截断，但绝不留下半个内部 At placeholder。"""
+    """按字符预算截断，但绝不留下半个内部 At / 媒体 placeholder。"""
     if max_chars <= 0 or len(template) <= max_chars:
         return template
     value = template[:max_chars]
-    for marker in (AT_TOKEN_LITERAL, AT_TOKEN_ESCAPED):
+    markers = [AT_TOKEN_LITERAL, AT_TOKEN_ESCAPED]
+    for prefix in _MEDIA_PREFIXES:
+        markers.extend((f"⟦CM_{prefix}:", f"⟦CM_LITERAL_{prefix}:"))
+    for marker in markers:
         start = value.rfind(marker)
         if start >= 0 and value.find("⟧", start) < 0:
             value = value[:start]

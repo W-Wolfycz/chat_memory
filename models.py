@@ -18,11 +18,12 @@ K_IMAGE = "image"
 K_VIDEO = "video"
 K_VOICE = "voice"
 K_FILE = "file"
-K_FACE = "face"
+K_EMOJI = "emoji"
+K_POKE = "poke"
 K_FORWARD = "forward"
 K_SYSTEM = "system_event"
 
-MEDIA_KINDS = {K_IMAGE, K_VIDEO, K_VOICE, K_FILE, K_FACE, K_FORWARD}
+MEDIA_KINDS = {K_IMAGE, K_VIDEO, K_VOICE, K_FILE, K_EMOJI, K_FORWARD}
 
 VALID_LLM_STATUSES = {
     LLM_DEFAULT,
