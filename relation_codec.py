@@ -9,7 +9,12 @@ from typing import Any, Optional
 RELATION_VERSION = 1
 AT_TOKEN_RE = re.compile(r"⟦CM_AT:(\d+)⟧")
 AT_TOKEN_LITERAL = "⟦CM_AT:"
-AT_TOKEN_ESCAPED = "⟦CM_LITERAL_AT:"
+# 用户正文转义哨兵（成对）：用户文本中的每个 ``⟦``/``⟧`` 都替换为对应哨兵
+# （比 ⟦⟧ 更罕见、键盘/IME 几乎无法输入），使内部 token（一律以 ⟦ 开头、
+# ⟧ 结尾）与用户文字绝无碰撞。展示侧 unescape_plain_text 反向还原，任意含
+# ⟦/⟧ 的输入均双射。
+_SENTINEL_LEFT = "⦑"
+_SENTINEL_RIGHT = "⦒"
 # 媒体/动作位置 token（relation v1 新增 media 数组，schema 零迁移）：
 # 统一规则——凡与文字同时出现的媒体/动作类型，一律按原始位置写类型化
 # token（如 ⟦CM_IMAGE:0⟧），索引为 media 数组中的统一下标；纯媒体/纯动作
@@ -33,11 +38,13 @@ MAX_REPLY_SNAPSHOT_CHARS = 300
 
 
 def escape_plain_text(text: str) -> str:
-    """避免用户原文伪造 ChatMemory 内部 At / 媒体 placeholder。"""
-    value = (text or "").replace(AT_TOKEN_LITERAL, AT_TOKEN_ESCAPED)
-    for prefix in _MEDIA_PREFIXES:
-        value = value.replace(f"⟦CM_{prefix}:", f"⟦CM_LITERAL_{prefix}:")
-    return value
+    """把用户文本里的每个 ``⟦``/``⟧`` 换成哨兵字符，杜绝伪造内部 At / 媒体 token。"""
+    return (text or "").replace("⟦", _SENTINEL_LEFT).replace("⟧", _SENTINEL_RIGHT)
+
+
+def unescape_plain_text(text: str) -> str:
+    """``escape_plain_text`` 的逆操作。"""
+    return (text or "").replace(_SENTINEL_LEFT, "⟦").replace(_SENTINEL_RIGHT, "⟧")
 
 
 def at_token(index: int) -> str:
@@ -126,31 +133,18 @@ def render_content_template(template: str, relation_data: Any) -> str:
     parts: list[str] = []
     cursor = 0
 
-    def unescape(plain: str) -> str:
-        value = plain.replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
-        for prefix in _MEDIA_PREFIXES:
-            value = value.replace(f"⟦CM_LITERAL_{prefix}:", f"⟦CM_{prefix}:")
-        return value
-
     def media_label(index: int) -> str:
         if index >= len(media) or not isinstance(media[index], dict):
             return "<cm_image/>"
         return MEDIA_KIND_LABELS.get(str(media[index].get("kind") or ""), "<cm_image/>")
 
     # At 与媒体 token 可能交错出现：合并后按位置顺序渲染
-    matches = [
-        (m.start(), "at", int(m.group(1)))
-        for m in AT_TOKEN_RE.finditer(value)
-    ] + [
-        (m.start(), "media", int(m.group(1)))
-        for m in MEDIA_TOKEN_RE.finditer(value)
-    ]
     matches = [(m.start(), m.end(), "at", int(m.group(1))) for m in AT_TOKEN_RE.finditer(value)] + [
         (m.start(), m.end(), "media", int(m.group(1))) for m in MEDIA_TOKEN_RE.finditer(value)
     ]
     matches.sort(key=lambda item: item[0])
     for start, end, token_kind, index in matches:
-        parts.append(xml_escape(unescape(value[cursor:start]), quote=True))
+        parts.append(xml_escape(unescape_plain_text(value[cursor:start]), quote=True))
         if token_kind == "at":
             if index >= len(mentions):
                 parts.append('<cm_mention target="未知成员"/>')
@@ -161,7 +155,7 @@ def render_content_template(template: str, relation_data: Any) -> str:
             parts.append(media_label(index))
         cursor = end
     tail = value[cursor:]
-    parts.append(xml_escape(unescape(tail), quote=True))
+    parts.append(xml_escape(unescape_plain_text(tail), quote=True))
     result = "".join(parts)
     if not result.strip() and media:
         # 纯媒体消息（正文无 token 且无文本）：按 media 数组顺序输出占位标签
@@ -196,13 +190,13 @@ def _current_message_xml(template: str, mentions: list[Any], self_id: str) -> st
     found = False
     for match in AT_TOKEN_RE.finditer(value):
         found = True
-        plain = value[cursor:match.start()].replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+        plain = unescape_plain_text(value[cursor:match.start()])
         parts.append(xml_escape(plain, quote=True))
         index = int(match.group(1))
         mention = mentions[index] if index < len(mentions) else None
         parts.append(_current_mention_xml(mention, self_id))
         cursor = match.end()
-    tail = value[cursor:].replace(AT_TOKEN_ESCAPED, AT_TOKEN_LITERAL)
+    tail = unescape_plain_text(value[cursor:])
     parts.append(xml_escape(tail, quote=True))
 
     # 正常的新消息一定有带索引 placeholder；这里仅为损坏/第三方构造数据保底，
@@ -267,11 +261,23 @@ def truncate_content_template(template: str, max_chars: int) -> str:
     if max_chars <= 0 or len(template) <= max_chars:
         return template
     value = template[:max_chars]
-    markers = [AT_TOKEN_LITERAL, AT_TOKEN_ESCAPED]
+    markers = [AT_TOKEN_LITERAL]
     for prefix in _MEDIA_PREFIXES:
-        markers.extend((f"⟦CM_{prefix}:", f"⟦CM_LITERAL_{prefix}:"))
+        markers.append(f"⟦CM_{prefix}:")
     for marker in markers:
         start = value.rfind(marker)
         if start >= 0 and value.find("⟧", start) < 0:
+            value = value[:start]
+    # 截断点落在 token 前缀字面中间（如 ⟦CM_IMAG）时剥掉未闭合的 ⟦ 残片。
+    # 用户正文的 ⟦ 已全部被哨兵转义，此处只会命中真实 token 前缀形态。
+    start = value.rfind("⟦")
+    if start >= 0 and value.find("⟧", start) < 0:
+        fragment = value[start:]
+        if (
+            fragment == "⟦"
+            or fragment == "⟦C"
+            or fragment == "⟦CM"
+            or fragment.startswith("⟦CM_")
+        ):
             value = value[:start]
     return value.rstrip()

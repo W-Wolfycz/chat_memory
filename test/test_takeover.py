@@ -23,7 +23,7 @@ import re
 import sqlite3
 import sys
 import types
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -611,7 +611,7 @@ def test_render_content_template_at():
            "reply": None}
     assert r.render_content_template("⟦CM_AT:0⟧在干嘛", rel) == '<cm_mention target="虾仁粽子"/>在干嘛'
     assert r.render_content_template("⟦CM_AT:9⟧越界", rel) == '<cm_mention target="未知成员"/>越界'
-    assert r.render_content_template("⟦CM_LITERAL_AT:0⟧原文", rel) == "⟦CM_AT:0⟧原文"
+    assert r.render_content_template("⦑CM_AT:0⦒原文", rel) == "⟦CM_AT:0⟧原文"
     assert r.render_content_template("无 token", None) == "无 token"
     print("[T14] render_content_template_at ✓")
 
@@ -619,7 +619,7 @@ def test_render_content_template_at():
 def test_relation_codec_tokens():
     """token 编解码与截断：转义、截断不切半 token。"""
     r = relation_codec_mod
-    assert r.escape_plain_text("⟦CM_AT:0⟧") == "⟦CM_LITERAL_AT:0⟧"
+    assert r.escape_plain_text("⟦CM_AT:0⟧") == "⦑CM_AT:0⦒"
     assert r.at_token(0) == "⟦CM_AT:0⟧"
     assert r.truncate_reply_snapshot("短") == "短"
     long_t = "长" * 500
@@ -1307,6 +1307,151 @@ def test_media_metadata_and_source_refs():
     print("[T48] media_metadata_and_source_refs ✓")
 
 
+def test_empty_chain_seed_full_returns_five_tuple():
+    """空 chain（notice/request 转空消息、空消息）也必须返回 5 元组。
+
+    回归：extract_user_template 的空链早退曾漏掉 media_refs（4 元组），
+    导致 build_relation_seed_full 解包爆炸（生产 15:52 的 ValueError）。
+    """
+    classifier_mod = sys.modules["chat_memory.message_classifier"]
+
+    class _EvEmpty:
+        def __init__(self):
+            self.message_str = ""
+
+        def get_messages(self):
+            return []
+
+    template, mentions, media, refs, reply_seed = (
+        classifier_mod.extract_user_template(_EvEmpty())
+    )
+    assert template == "" and mentions == [] and media == [] and refs == []
+    assert reply_seed is None
+    t2, rel2, media2, refs2 = classifier_mod.build_relation_seed_full(_EvEmpty())
+    assert t2 == "" and rel2 is None and media2 == [] and refs2 == []
+    assert classifier_mod.build_relation_seed(_EvEmpty()) == ("", None)
+
+    # 空链 + message_str 兜底
+    class _EvStr:
+        message_str = "你好"
+
+        def get_messages(self):
+            return []
+
+    template3, rel3 = classifier_mod.build_relation_seed(_EvStr())
+    assert template3 == "你好" and rel3 is None
+    print("[T50] empty_chain_seed_full_returns_five_tuple ✓")
+
+
+def test_codec_escape_sentinel_and_truncate_fragment():
+    """单级哨兵转义：任意含 ⟦ 的输入双射；截断不残留 ⟦ 残片。"""
+    codec = sys.modules["chat_memory.relation_codec"]
+
+    # 用户输入 ⟦⟧ → 哨兵对，展示侧还原回 ⟦⟧
+    escaped = codec.escape_plain_text("看⟦CM_AT:0⟧这个")
+    assert escaped == "看⦑CM_AT:0⦒这个"
+    assert codec.unescape_plain_text(escaped) == "看⟦CM_AT:0⟧这个"
+
+    # 任意含 ⟦/⟧ 的字面输入（含内部形态 ⟦CM_LITERAL_* 等）均双射
+    for text in (
+        "⟦CM_LITERAL_IMAGE:3⟧",
+        "x⟦CM_LITERAL2_⟧y",
+        "⟦⟧",
+        "前⟦CM_AT:0⟧后⟦CM_POKE:1⟧",
+        "只有右括号⟧",
+    ):
+        assert codec.unescape_plain_text(codec.escape_plain_text(text)) == text
+
+    # 截断落在 token 前缀中间：剥掉未闭合的 ⟦ 残片
+    template = "一二三四五⟦CM_IMAGE:0⟧尾巴"
+    assert "⟦" not in codec.truncate_content_template(template, 8)
+    assert "⟦" not in codec.truncate_content_template(template, 12)
+    assert codec.truncate_content_template(template, 8) == "一二三四五"
+
+    # 手造/损坏数据里的裸 ⟦ 不得被误剥（仅剥离疑似 token 前缀形态）
+    assert codec.truncate_content_template("⟦你好啊再见", 4) == "⟦你好啊"
+    assert codec.truncate_content_template("你好⟦世界再见啊", 7) == "你好⟦世界再见"
+    print("[T51] codec_escape_sentinel_and_truncate_fragment ✓")
+
+
+def test_sniff_ext_mp4_box_offset():
+    """MP4 magic 位于偏移 4（box size 在前），嗅探必须按 offset 判定。"""
+    archiver_mod = sys.modules["chat_memory.media_archive"]
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "x.bin"
+        path.write_bytes(b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00")
+        assert archiver_mod._sniff_ext(path, "video") == "mp4"
+    print("[T52] sniff_ext_mp4_box_offset ✓")
+
+
+def test_capture_notice_event_stores_system_event():
+    """notice 空消息走捕获路径：不崩溃、落库 content_kind=system_event、正文为可读摘要。
+
+    回归：system_event 摘要包装曾缺失（模块级名经 self 访问），捕获时 AttributeError。
+    """
+    p = _make_plugin()
+
+    async def _cid(umo):
+        return "cid_demo"
+
+    async def _persona(umo, event, cid):
+        return ""
+
+    class _InsertCapture:
+        def __init__(self):
+            self.rows = []
+
+        async def __call__(self, umo, cid, user_id, role, content, **kwargs):
+            self.rows.append({"content": content, "content_kind": kwargs.get("content_kind")})
+            return True
+
+    insert = _InsertCapture()
+    p._get_curr_cid = _cid
+    p._get_effective_persona = _persona
+    p._safe_insert = insert
+
+    class _Obj:
+        pass
+
+    class _Ev:
+        unified_msg_origin = "aiocqhttp:GroupMessage:g1"
+        message_str = ""
+        extras = {}
+
+        def __init__(self):
+            self.message_obj = _Obj()
+            self.message_obj.raw_message = {
+                "post_type": "notice", "notice_type": "group_recall",
+            }
+
+        def get_sender_id(self):
+            return "10001"
+
+        def get_self_id(self):
+            return "99999"
+
+        def get_messages(self):
+            return []
+
+        def get_message_type(self):
+            return types.SimpleNamespace(value="GroupMessage")
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+    ok = asyncio.run(p._capture_user_internal(_Ev()))
+    assert ok is True
+    assert len(insert.rows) == 1
+    assert insert.rows[0]["content"] == "[撤回消息]"
+    assert insert.rows[0]["content_kind"] == ["system_event"]
+    print("[T53] capture_notice_event_stores_system_event ✓")
+
+
 def test_media_archive_local_and_cleanup():
     """MediaArchiver：本地接管落盘登记、级联删除文件、关闭时拒绝。"""
     import tempfile
@@ -1356,13 +1501,14 @@ def test_media_archive_local_and_cleanup():
         assert row["kind"] == "voice" and row["ext"] == "amr"
         assert row["mime_type"] == "audio/amr"
         assert row["file_name"].startswith("aaaa") and row["file_name"].endswith(".amr")
-        # 文件真实落盘（按月分桶）
-        month_dir = archiver.media_dir / datetime.now().strftime("%Y%m")
+        # 文件真实落盘（按月分桶；归档行 created_at 为 UTC naive，与生产一致）
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        month_dir = archiver.media_dir / utc_now.strftime("%Y%m")
         assert list(month_dir.glob("aaaa*"))
         # 级联删除文件
         deleted = asyncio.run(archiver.delete_files([{
             "file_name": row["file_name"],
-            "created_at": datetime.now(),
+            "created_at": utc_now,
         }]))
         assert deleted == 1
         assert not list(month_dir.glob("aaaa*"))

@@ -115,7 +115,8 @@ def _sniff_ext(path: Path, kind: str) -> str:
         return "ogg"
     if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
         return "wav"
-    if head.startswith(b"ftyp"):
+    # MP4：box 头 4 字节是 size，'ftyp' 在偏移 4
+    if head[4:8] == b"ftyp":
         return "mp4"
     if head.startswith(b"fLaC"):
         return "flac"
@@ -276,19 +277,24 @@ class MediaArchiver:
             dest = self._dest(f"{media_id}.{ext}", now)
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(tmp, dest)
-            size = dest.stat().st_size
-            await self.db.insert_media_archive(
-                media_id=media_id,
-                umo=umo,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-                kind=kind,
-                file_name=dest.name,
-                ext=ext,
-                mime_type=_MIME_BY_EXT.get(ext),
-                size_bytes=size,
-                created_at=now,
-            )
+            try:
+                size = dest.stat().st_size
+                await self.db.insert_media_archive(
+                    media_id=media_id,
+                    umo=umo,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    kind=kind,
+                    file_name=dest.name,
+                    ext=ext,
+                    mime_type=_MIME_BY_EXT.get(ext),
+                    size_bytes=size,
+                    created_at=now,
+                )
+            except Exception:
+                # 文件已落位但登记失败：回删文件，不留无行孤儿
+                dest.unlink(missing_ok=True)
+                raise
             return True
         except Exception as exc:
             logger.debug("[ChatMemory] 媒体归档登记失败 %s: %s", media_id[:8], exc)
@@ -331,6 +337,7 @@ class MediaArchiver:
         cap = self._cap_bytes(kind)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.tmp_dir / f"{media_id}.part"
+        # finally 清理 .part：超时取消（CancelledError 是 BaseException）也要删
         try:
             import aiohttp  # 懒加载：本地 mock 测试环境不依赖 aiohttp
 
@@ -361,9 +368,8 @@ class MediaArchiver:
                 kind,
                 name,
             )
-        except Exception:
+        finally:
             tmp.unlink(missing_ok=True)
-            raise
 
     # ── 清理 ─────────────────────────────────────────
 
@@ -456,14 +462,25 @@ class MediaArchiver:
                 if not path.is_file() or path.name.startswith("."):
                     continue
                 try:
-                    if datetime.fromtimestamp(path.stat().st_mtime) >= cutoff:
+                    mtime_utc = datetime.fromtimestamp(
+                        path.stat().st_mtime, tz=timezone.utc
+                    ).replace(tzinfo=None)
+                    if mtime_utc >= cutoff:
                         continue
                 except OSError:
                     continue
                 stale_files[path.name.split(".", 1)[0]] = path
         if not stale_files:
             return 0
-        alive = await self.db.query_media_archive_by_ids(list(stale_files.keys()))
+        # 分批查询：单次 IN 超过 SQLite 变量上限（32766）会整体失败
+        alive: set[str] = set()
+        stale_ids = list(stale_files.keys())
+        for chunk_start in range(0, len(stale_ids), 500):
+            alive.update(
+                await self.db.query_media_archive_by_ids(
+                    stale_ids[chunk_start : chunk_start + 500]
+                )
+            )
         for media_id, path in stale_files.items():
             if media_id in alive:
                 continue

@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.3.0`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=5`。
+当前发布版本：`1.3.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=5`。
 
 ## 特性
 

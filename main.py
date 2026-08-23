@@ -44,7 +44,7 @@ from .message_classifier import (
     build_relation_seed as _build_relation_seed_impl,
     build_relation_seed_full as _build_relation_seed_full_impl,
     extract_text as _extract_text_impl,
-    system_event_summary as _system_event_summary_impl,
+    system_event_summary as _system_event_summary_fn,
 )
 from .context_builder import (
     CM_GENERAL_RULES,
@@ -136,10 +136,10 @@ class ChatMemoryPlugin(Star):
         self.media_archiver = MediaArchiver(
             self.db,
             data_dir,
-            enabled=bool(media_conf.get("enabled", True)),
-            include_video=bool(media_conf.get("include_video", False)),
-            retention_days=int(media_conf.get("retention_days", 30) or 30),
-            max_total_mb=int(media_conf.get("max_total_mb", 2048) or 2048),
+            enabled=self._to_bool(media_conf.get("enabled"), True),
+            include_video=self._to_bool(media_conf.get("include_video"), False),
+            retention_days=self._to_int(media_conf.get("retention_days"), 30),
+            max_total_mb=self._to_int(media_conf.get("max_total_mb"), 2048),
         )
         self._media_cleanup_task: Optional[asyncio.Task] = None
 
@@ -276,7 +276,7 @@ class ChatMemoryPlugin(Star):
                 try:
                     stats = await self.media_archiver.cleanup_cycle()
                     if any(stats.values()):
-                        logger.info(
+                        logger.debug(
                             f"{self._log_prefix()} 媒体归档清理: {stats}"
                         )
                 except asyncio.CancelledError:
@@ -287,6 +287,25 @@ class ChatMemoryPlugin(Star):
             pass
 
     # ── 日志/工具辅助 ───────────────────────────────────
+
+    @staticmethod
+    def _to_bool(value, default: bool) -> bool:
+        """配置布尔兜底：字符串 'false'/'0' 等不能误判为 True。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return bool(default)
+
+    @staticmethod
+    def _to_int(value, default: int) -> int:
+        """配置整数兜底：非数字输入回退默认值而不是抛异常。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
 
     @staticmethod
     def _resolve_log_with_bot_id(config) -> bool:
@@ -438,6 +457,10 @@ class ChatMemoryPlugin(Star):
     @staticmethod
     def _content_placeholder(kind: list[str]) -> str:
         return _content_placeholder_impl(kind)
+
+    @staticmethod
+    def _system_event_summary_impl(event: AstrMessageEvent) -> str:
+        return _system_event_summary_fn(event)
 
     async def _get_curr_cid(self, umo: str) -> str:
         try:
@@ -1351,7 +1374,7 @@ class ChatMemoryPlugin(Star):
             # 没经过 capture_user → 主动消息（含 cron）
             asst_status = _LLM_PROACTIVE
             pair_id: Optional[str] = None
-            logger.info(f"{self._log_prefix(event)} assistant 标 proactive（主动消息）")
+            logger.debug(f"{self._log_prefix(event)} assistant 标 proactive（主动消息）")
         elif not captured:
             # 经过 capture_user 但落库失败 → 漏存
             asst_status = _LLM_ORPHAN

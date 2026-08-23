@@ -140,7 +140,13 @@ def extract_user_template(
     except Exception:
         chain = []
     if not chain:
-        return escape_plain_text(getattr(event, "message_str", "") or ""), [], [], None
+        return (
+            escape_plain_text(getattr(event, "message_str", "") or ""),
+            [],
+            [],
+            [],
+            None,
+        )
 
     parts: list[str] = []
     mentions: list[dict] = []
