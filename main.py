@@ -459,6 +459,25 @@ class ChatMemoryPlugin(Star):
         return _content_placeholder_impl(kind)
 
     @staticmethod
+    def _is_notice_derived_event(event: AstrMessageEvent) -> bool:
+        """chain 为空且原始 JSON 是 OneBot notice/request 的事件。
+
+        AstrBot 把 notice/request 转成空消息（sender 取 notice.user_id，即被操作
+        对象而非操作者），因此不能按 sender 做 BOT 自身跳过。
+        """
+        try:
+            if event.get_messages():
+                return False
+        except Exception:
+            return False
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        return isinstance(raw, dict) and str(raw.get("post_type") or "") in (
+            "notice",
+            "request",
+        )
+
+    @staticmethod
     def _system_event_summary_impl(event: AstrMessageEvent) -> str:
         return _system_event_summary_fn(event)
 
@@ -597,8 +616,14 @@ class ChatMemoryPlugin(Star):
 
         try:
             if user_id == event.get_self_id():
-                logger.debug(f"{self._log_prefix(event)} 跳过 user 捕获：BOT 自身消息")
-                return False
+                # notice/request 转成的空消息里，sender 取的是 notice.user_id
+                # （被操作对象）——自己被禁言/被踢等事件 sender 就是 BOT 自己。
+                # 这类事件应继续走 system_event 归档，BOT 自身守卫只拦真正的 bot 发言。
+                if not self._is_notice_derived_event(event):
+                    logger.debug(
+                        f"{self._log_prefix(event)} 跳过 user 捕获：BOT 自身消息"
+                    )
+                    return False
         except Exception:
             pass
 

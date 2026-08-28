@@ -1452,6 +1452,103 @@ def test_capture_notice_event_stores_system_event():
     print("[T53] capture_notice_event_stores_system_event ✓")
 
 
+def test_capture_bot_muted_notice_not_self_skipped():
+    """自己被禁言（group_ban，sender=BOT 自己）：仍按 system_event 归档。
+
+    回归：notice 的 sender 取 notice.user_id（被操作对象），BOT 自身守卫曾
+    把这类事件吞掉；真正的 bot 发言（非 notice 空消息）仍应跳过。
+    """
+    p = _make_plugin()
+
+    async def _cid(umo):
+        return "cid_demo"
+
+    async def _persona(umo, event, cid):
+        return ""
+
+    class _InsertCapture:
+        def __init__(self):
+            self.rows = []
+
+        async def __call__(self, umo, cid, user_id, role, content, **kwargs):
+            self.rows.append({"content": content, "content_kind": kwargs.get("content_kind")})
+            return True
+
+    insert = _InsertCapture()
+    p._get_curr_cid = _cid
+    p._get_effective_persona = _persona
+    p._safe_insert = insert
+
+    class _Obj:
+        pass
+
+    class _EvBan:
+        unified_msg_origin = "aiocqhttp:GroupMessage:g1"
+        message_str = ""
+        extras = {}
+
+        def __init__(self):
+            self.message_obj = _Obj()
+            self.message_obj.raw_message = {
+                "post_type": "notice", "notice_type": "group_ban",
+            }
+
+        def get_sender_id(self):
+            return "99999"
+
+        def get_self_id(self):
+            return "99999"
+
+        def get_messages(self):
+            return []
+
+        def get_message_type(self):
+            return types.SimpleNamespace(value="GroupMessage")
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+    ok = asyncio.run(p._capture_user_internal(_EvBan()))
+    assert ok is True
+    assert len(insert.rows) == 1
+    assert insert.rows[0]["content"] == "[群禁言]"
+    assert insert.rows[0]["content_kind"] == ["system_event"]
+
+    # 反例：bot 自身的普通空消息（无 notice raw）仍被跳过
+    class _EvBotEmpty:
+        unified_msg_origin = "aiocqhttp:GroupMessage:g1"
+        message_str = ""
+        extras = {}
+
+        def __init__(self):
+            self.message_obj = _Obj()
+
+        def get_sender_id(self):
+            return "99999"
+
+        def get_self_id(self):
+            return "99999"
+
+        def get_messages(self):
+            return []
+
+        def get_message_type(self):
+            return types.SimpleNamespace(value="GroupMessage")
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+    assert asyncio.run(p._capture_user_internal(_EvBotEmpty())) is False
+    assert len(insert.rows) == 1
+    print("[T54] capture_bot_muted_notice_not_self_skipped ✓")
+
+
 def test_media_archive_local_and_cleanup():
     """MediaArchiver：本地接管落盘登记、级联删除文件、关闭时拒绝。"""
     import tempfile
