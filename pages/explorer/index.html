@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatMemory 查询台</title>
+  <script>
+    (function () {
+      try {
+        var theme = localStorage.getItem('astrbot-theme') || 'light';
+        document.documentElement.setAttribute('data-theme', theme);
+      } catch (error) {
+        document.documentElement.setAttribute('data-theme', 'light');
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M7 4h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3h-5l-4.5 3v-3H7a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3Z"/><path d="M8 9h8M8 13h5"/></svg>
+        </div>
+        <div>
+          <div class="brand-title">ChatMemory</div>
+          <div class="brand-subtitle">只读查询台</div>
+        </div>
+      </div>
+
+      <nav class="side-nav" aria-label="页面导航">
+        <button class="nav-button active" data-target="overview-section">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          数据概览
+        </button>
+        <button class="nav-button" data-target="query-section">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+          记录查询
+        </button>
+        <button class="nav-button" data-target="tools-section">
+          <svg viewBox="0 0 24 24"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/></svg>
+          工具调用
+        </button>
+      </nav>
+
+      <div class="sidebar-status">
+        <div class="status-line"><span class="status-dot" id="sidebar-status-dot"></span><span id="sidebar-status-text">正在连接数据库</span></div>
+        <div class="sidebar-version" id="version-label">chat_memory</div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">CHAT ARCHIVE EXPLORER</div>
+          <h1 id="page-title">数据概览</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="readonly-pill">
+            <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            只读模式
+          </span>
+          <button class="icon-button" id="theme-toggle" title="切换主题" aria-label="切换主题">
+            <svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>
+          </button>
+          <button class="icon-button" id="reload-button" title="刷新数据" aria-label="刷新数据">
+            <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7L20 14"/><path d="M20 5v6h-6"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="content">
+        <div class="database-banner hidden" id="database-banner" role="status">
+          <div class="banner-icon">!</div>
+          <div>
+            <div class="banner-title" id="database-banner-title">数据库提示</div>
+            <div class="banner-copy" id="database-banner-copy"></div>
+          </div>
+        </div>
+
+        <section id="overview-section" class="page-section active">
+          <article class="panel source-settings-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>数据源设置</h2>
+                <p>修改 ChatMemory 数据库的服务器绝对路径；保存前会执行只读校验</p>
+              </div>
+              <span class="panel-note" id="database-path-mode">正在读取设置…</span>
+            </div>
+            <form id="database-settings-form" class="source-settings-form">
+              <label class="source-path-field">
+                <span>数据库路径</span>
+                <div class="source-path-row">
+                  <input id="database-path-input" type="text" maxlength="4096" spellcheck="false" autocomplete="off" placeholder="例如：D:\AstrBot\data\plugin_data\chat_memory\chat_memory.db">
+                  <button class="primary-button compact-button" id="save-database-settings" type="submit">保存并切换</button>
+                  <button class="secondary-button compact-button" id="restore-database-path" type="button">恢复默认</button>
+                </div>
+              </label>
+              <div class="source-settings-footer">
+                <label class="check-field source-check-field">
+                  <input type="checkbox" id="immutable-fallback-input" checked>
+                  <span class="check-box"></span>
+                  <span><strong>WAL 异常时允许读取主库快照</strong><small>仅忽略不一致的 WAL/SHM，不修改数据库</small></span>
+                </label>
+                <div class="source-default-path">默认路径：<code id="default-database-path">—</code></div>
+              </div>
+              <div class="source-settings-message" id="database-settings-message" aria-live="polite"></div>
+            </form>
+          </article>
+
+          <div class="metrics-grid" id="metrics-grid">
+            <article class="metric-card"><div class="skeleton wide"></div><div class="skeleton short"></div></article>
+            <article class="metric-card"><div class="skeleton wide"></div><div class="skeleton short"></div></article>
+            <article class="metric-card"><div class="skeleton wide"></div><div class="skeleton short"></div></article>
+            <article class="metric-card"><div class="skeleton wide"></div><div class="skeleton short"></div></article>
+          </div>
+
+          <div class="overview-grid">
+            <article class="panel activity-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>近 30 天写入</h2>
+                  <p>按 UTC 入库日期统计</p>
+                </div>
+                <span class="panel-note" id="activity-total">—</span>
+              </div>
+              <div class="activity-chart" id="activity-chart">
+                <div class="empty-state compact">正在读取统计…</div>
+              </div>
+            </article>
+
+            <article class="panel distribution-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>记录构成</h2>
+                  <p>Role 与 LLM 路径状态</p>
+                </div>
+              </div>
+              <div id="distribution-content" class="distribution-content">
+                <div class="empty-state compact">正在读取统计…</div>
+              </div>
+            </article>
+          </div>
+
+          <article class="panel database-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>数据库状态</h2>
+                <p>当前页面的实际只读数据源</p>
+              </div>
+            </div>
+            <dl class="database-details" id="database-details">
+              <div><dt>路径</dt><dd>—</dd></div>
+              <div><dt>读取模式</dt><dd>—</dd></div>
+              <div><dt>Schema</dt><dd>—</dd></div>
+              <div><dt>Journal</dt><dd>—</dd></div>
+            </dl>
+          </article>
+        </section>
+
+        <section id="query-section" class="page-section">
+          <article class="panel filter-panel">
+            <div class="filter-heading">
+              <div>
+                <h2>筛选条件</h2>
+                <p>所有条件均在服务端以参数化 SQL 执行</p>
+              </div>
+              <button class="text-button" id="reset-filters">清空条件</button>
+            </div>
+
+            <form id="query-form">
+              <div class="search-row">
+                <label class="search-field">
+                  <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+                  <input id="filter-keyword" type="search" maxlength="200" placeholder="搜索正文、昵称、用户 ID、消息 ID 或 turn_id">
+                </label>
+                <button class="primary-button" type="submit">
+                  <span>查询记录</span>
+                  <svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+                </button>
+              </div>
+
+              <div class="filters-grid">
+                <label class="field"><span>会话来源 UMO</span><select id="filter-umo"><option value="">全部 UMO</option></select></label>
+                <label class="field"><span>Conversation ID</span><select id="filter-conversation"><option value="">全部 CID</option></select></label>
+                <label class="field"><span>用户</span><select id="filter-user"><option value="">全部用户</option></select></label>
+                <label class="field"><span>Persona</span><select id="filter-persona"><option value="__all__">全部 Persona</option></select></label>
+                <label class="field"><span>Role</span><select id="filter-role"><option value="">全部 Role</option><option value="user">user</option><option value="assistant">assistant</option></select></label>
+                <label class="field"><span>LLM 状态</span><select id="filter-status"><option value="__all__">全部状态</option><option value="__empty__">no_llm（空值）</option><option value="llm_success">llm_success</option><option value="llm_pending">llm_pending</option><option value="proactive">proactive</option><option value="orphan">orphan</option></select></label>
+                <label class="field"><span>内容类型</span><select id="filter-kind"><option value="">全部类型</option></select></label>
+                <label class="field"><span>平台类型</span><select id="filter-platform"><option value="">全部平台</option></select></label>
+                <label class="field"><span>消息类型</span><select id="filter-message-type"><option value="">全部消息类型</option></select></label>
+                <label class="field"><span>起始时间</span><input id="filter-since" type="datetime-local"></label>
+                <label class="field"><span>结束时间</span><input id="filter-until" type="datetime-local"></label>
+                <label class="field"><span>每页数量</span><select id="filter-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+              </div>
+
+              <label class="check-field">
+                <input type="checkbox" id="filter-paired">
+                <span class="check-box"></span>
+                <span><strong>仅看完整配对轮次</strong><small>排除未配对 user、proactive 与 orphan 单边消息</small></span>
+              </label>
+            </form>
+          </article>
+
+          <div class="results-heading">
+            <div>
+              <h2>查询结果</h2>
+              <p id="result-summary">载入后将显示最新记录</p>
+            </div>
+            <div class="results-actions">
+              <button class="secondary-button" id="copy-query-button">复制查询条件</button>
+            </div>
+          </div>
+
+          <div class="records-list" id="records-list">
+            <div class="empty-state"><span class="loader"></span><strong>正在载入记录</strong><p>数据库较大时首次查询可能需要几秒</p></div>
+          </div>
+
+          <nav class="pagination hidden" id="pagination" aria-label="查询结果分页">
+            <button id="page-prev">上一页</button>
+            <div id="page-label">第 1 页</div>
+            <button id="page-next">下一页</button>
+          </nav>
+        </section>
+
+        <section id="tools-section" class="page-section">
+          <article class="panel filter-panel">
+            <div class="filter-heading">
+              <div>
+                <h2>工具调用筛选</h2>
+                <p>ChatMemory schema v4 起记录的 LLM 工具调用（chat_memory_tool_records）</p>
+              </div>
+              <button class="text-button" id="reset-tool-filters">清空条件</button>
+            </div>
+
+            <form id="tool-query-form">
+              <div class="search-row">
+                <label class="search-field">
+                  <svg viewBox="0 0 24 24"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 13l-3-3 3.7-3.7Z"/></svg>
+                  <input id="tool-filter-name" type="search" maxlength="200" placeholder="按工具名模糊搜索（如 draw）">
+                </label>
+                <button class="primary-button" type="submit">
+                  <span>查询工具调用</span>
+                  <svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+                </button>
+              </div>
+
+              <div class="filters-grid">
+                <label class="field"><span>会话来源 UMO</span><select id="tool-filter-umo"><option value="">全部 UMO</option></select></label>
+                <label class="field"><span>Conversation ID</span><select id="tool-filter-conversation"><option value="">全部 CID</option></select></label>
+                <label class="field"><span>轮次 turn_id</span><input id="tool-filter-turn" type="text" maxlength="256" placeholder="精确匹配 turn_id"></label>
+                <label class="field"><span>起始时间</span><input id="tool-filter-since" type="datetime-local"></label>
+                <label class="field"><span>结束时间</span><input id="tool-filter-until" type="datetime-local"></label>
+                <label class="field"><span>每页数量</span><select id="tool-filter-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+              </div>
+            </form>
+          </article>
+
+          <div class="results-heading">
+            <div>
+              <h2>工具调用结果</h2>
+              <p id="tool-result-summary">载入后将显示最近的工具调用</p>
+            </div>
+          </div>
+
+          <div class="records-list" id="tools-list">
+            <div class="empty-state"><span class="loader"></span><strong>正在载入工具调用</strong><p>旧版数据库（schema &lt; v4）没有工具表</p></div>
+          </div>
+
+          <nav class="pagination hidden" id="tool-pagination" aria-label="工具调用分页">
+            <button id="tool-page-prev">上一页</button>
+            <div id="tool-page-label">第 1 页</div>
+            <button id="tool-page-next">下一页</button>
+          </nav>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="detail-modal">
+    <section class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <header class="detail-header">
+        <div>
+          <div class="eyebrow">RECORD INSPECTOR</div>
+          <h2 id="detail-title">记录详情</h2>
+        </div>
+        <button class="icon-button" id="detail-close" aria-label="关闭详情">
+          <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+      <div class="detail-content" id="detail-content"></div>
+    </section>
+  </div>
+
+  <div class="toast-stack" id="toast-stack"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

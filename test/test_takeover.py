@@ -171,6 +171,24 @@ exec(compile((PLUGIN_DIR / "storage.py").read_text(), "storage.py", "exec"),
      storage_mod.__dict__)
 setattr(pkg, "storage", storage_mod)
 
+# 查询台子包（1.4.0 并入）：repository 为纯 stdlib，web_api 依赖 quart/astrbot.api
+quart_mock = types.ModuleType("quart")
+quart_mock.request = types.SimpleNamespace(args={})
+sys.modules["quart"] = quart_mock
+ui_pkg = types.ModuleType("chat_memory.ui")
+sys.modules["chat_memory.ui"] = ui_pkg
+setattr(pkg, "ui", ui_pkg)
+ui_repository_mod = types.ModuleType("chat_memory.ui.repository")
+sys.modules["chat_memory.ui.repository"] = ui_repository_mod
+exec(compile((PLUGIN_DIR / "ui" / "repository.py").read_text(), "ui/repository.py", "exec"),
+     ui_repository_mod.__dict__)
+setattr(ui_pkg, "repository", ui_repository_mod)
+ui_web_api_mod = types.ModuleType("chat_memory.ui.web_api")
+sys.modules["chat_memory.ui.web_api"] = ui_web_api_mod
+exec(compile((PLUGIN_DIR / "ui" / "web_api.py").read_text(), "ui/web_api.py", "exec"),
+     ui_web_api_mod.__dict__)
+setattr(ui_pkg, "web_api", ui_web_api_mod)
+
 _main_src = (PLUGIN_DIR / "main.py").read_text()
 _mod_ns = {"__name__": "chat_memory.main"}
 exec(compile(ast.parse(_main_src), "main.py", "exec"), _mod_ns)

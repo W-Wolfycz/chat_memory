@@ -24,6 +24,7 @@ import inspect
 import json
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
+from pathlib import Path
 from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -37,6 +38,8 @@ from astrbot.core.agent.message import TextPart
 
 from .storage import DBManager
 from .media_archive import MediaArchiver
+from .ui.repository import ChatMemoryRepository
+from .ui.web_api import ChatMemoryUiWebApi
 from .message_classifier import (
     classify_assistant_chain as _classify_assistant_chain_impl,
     classify_content as _classify_content_impl,
@@ -143,6 +146,10 @@ class ChatMemoryPlugin(Star):
         )
         self._media_cleanup_task: Optional[asyncio.Task] = None
 
+        # 只读查询台（1.4.0 并入）：initialize 阶段构建，此处占位防误用。
+        self.ui_repository: Optional[ChatMemoryRepository] = None
+        self.ui_web_api: Optional[ChatMemoryUiWebApi] = None
+
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_started = False
 
@@ -192,6 +199,8 @@ class ChatMemoryPlugin(Star):
                 self._media_cleanup_task = asyncio.create_task(
                     self._media_cleanup_loop()
                 )
+            # 只读查询台（原 chat_memory_ui，1.4.0 起并入）：失败不影响存档。
+            await self._init_ui()
         except BaseException:
             try:
                 await self.db.engine.dispose()
@@ -250,7 +259,10 @@ class ChatMemoryPlugin(Star):
         try:
             while True:
                 await asyncio.sleep(86400)
-                cutoff = datetime.now(dt_timezone.utc).replace(tzinfo=None) - timedelta(days=self.auto_cleanup_days)
+                cutoff = (
+                    datetime.now(dt_timezone.utc).replace(tzinfo=None)
+                    - timedelta(days=self.auto_cleanup_days)
+                )
                 try:
                     deleted, media_rows = await self.db.delete_old(cutoff)
                     await self.media_archiver.delete_files(media_rows)
@@ -285,6 +297,75 @@ class ChatMemoryPlugin(Star):
                     logger.warning(f"{self._log_prefix()} 媒体归档清理失败: {e}")
         except asyncio.CancelledError:
             pass
+
+    # ── 只读查询台（原 chat_memory_ui，1.4.0 并入）────────────
+
+    async def _init_ui(self) -> None:
+        """启用只读查询台。失败只降级（存档功能不受影响），不阻断插件加载。"""
+        if not hasattr(self.context, "register_web_api"):
+            logger.warning(
+                f"{self._log_prefix()} 当前 AstrBot 不支持 Plugin Page Web API，"
+                "查询台未启用"
+            )
+            return
+        try:
+            settings = await self.get_kv_data("ui_settings", {})
+            settings = settings if isinstance(settings, dict) else {}
+            database_path = self._normalize_ui_db_path(settings.get("database_path", ""))
+            immutable_fallback = settings.get("immutable_fallback", True)
+            if not isinstance(immutable_fallback, bool):
+                immutable_fallback = True
+            self.ui_repository = ChatMemoryRepository(
+                database_path,
+                timezone=self._tz,
+                default_page_size=50,
+                max_page_size=200,
+                allow_immutable_fallback=immutable_fallback,
+            )
+            self.ui_web_api = ChatMemoryUiWebApi(
+                self.context,
+                self.ui_repository,
+                default_database_path=self.db.db_path,
+                repository_updater=self._update_ui_repository,
+                media_root=self.media_archiver.media_dir,
+            )
+            self.ui_web_api.register()
+            logger.info(f"{self._log_prefix()} 只读查询台已启用：{database_path}")
+        except Exception as exc:
+            logger.warning(
+                f"{self._log_prefix()} 查询台启用失败（存档功能不受影响）：{exc}"
+            )
+
+    def _normalize_ui_db_path(self, value) -> Path:
+        raw = str(value or "").strip()
+        if not raw:
+            return self.db.db_path
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise ValueError("数据库路径必须是 AstrBot 服务器上的绝对路径")
+        return path.resolve(strict=False)
+
+    async def _update_ui_repository(
+        self, database_path: str, immutable_fallback: bool
+    ) -> tuple:
+        """查询台数据源切换：校验新库、持久化设置、替换只读仓库。"""
+        normalized = self._normalize_ui_db_path(database_path)
+        candidate = ChatMemoryRepository(
+            normalized,
+            timezone=self._tz,
+            default_page_size=50,
+            max_page_size=200,
+            allow_immutable_fallback=immutable_fallback,
+        )
+        health = await candidate.health()
+        stored = "" if normalized == self.db.db_path else str(normalized)
+        await self.put_kv_data(
+            "ui_settings",
+            {"database_path": stored, "immutable_fallback": immutable_fallback},
+        )
+        self.ui_repository = candidate
+        logger.info(f"{self._log_prefix()} 查询台已切换只读数据库：{candidate.db_path}")
+        return candidate, health
 
     # ── 日志/工具辅助 ───────────────────────────────────
 
@@ -362,7 +443,9 @@ class ChatMemoryPlugin(Star):
         return _extract_text_impl(event)
 
     @staticmethod
-    def _classify_content(event: AstrMessageEvent) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
+    def _classify_content(
+        event: AstrMessageEvent,
+    ) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
         return _classify_content_impl(event)
 
     @staticmethod

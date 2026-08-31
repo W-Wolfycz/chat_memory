@@ -6,3 +6,8 @@ logo-*/
 dumps/
 data/
 docs/
+
+.pytest_cache/
+.coverage
+htmlcov/
+node_modules/

@@ -1,7 +1,9 @@
 name: chat_memory
 display_name: ChatMemory
-description: 独立对话记录存档，以 UMO + conversation_id + 用户ID 为维度存储全量对话文本，双列状态（llm_status 描述 LLM 路径，content_kind JSON 数组描述内容形态），暴露查询接口供其他插件调用。可选开启上下文接管，让 CM 成为唯一上下文源（跨重启 / 跨会话 / 跨用户）。
-version: 1.3.2
+short_desc: 全量对话记录存档、上下文接管与只读查询台插件
+desc: 独立对话记录存档，以 UMO + conversation_id + 用户ID 为维度存储全量对话文本，双列状态（llm_status 描述 LLM 路径，content_kind JSON 数组描述内容形态），暴露查询接口供其他插件调用。可选开启上下文接管，让 CM 成为唯一上下文源（跨重启 / 跨会话 / 跨用户）。自带只读查询台（Plugin Page）：记录检索筛选、工具调用、历史媒体回看与数据库健康诊断。
+version: 1.4.0
 author: Wolfycz
 repo: "https://github.com/W-Wolfycz/chat_memory"
 astrbot_version: ">=4.16,<5"
+tags: ["记忆", "存档", "上下文接管", "查询台", "ChatMemory"]
