@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -18,6 +21,10 @@ RepositoryUpdater = Callable[
     [str, bool], Awaitable[tuple[ChatMemoryRepository, dict[str, Any]]]
 ]
 
+# 导出快照文件名（时间戳 + 6 位随机）：同时用作防路径穿越的校验白名单
+_EXPORT_NAME_RE = re.compile(r"^chat_memory_[0-9]{8}_[0-9]{6}_[a-f0-9]{6}\.db$")
+_EXPORT_RETENTION_SEC = 24 * 3600
+
 # base64 内联模式的大小上限（避免大视频把 JSON 撑爆；超限引导走下载）
 _BASE64_MAX_BYTES = 16 * 1024 * 1024
 
@@ -31,6 +38,7 @@ class ChatMemoryUiWebApi:
         default_database_path: str | Path | None = None,
         repository_updater: RepositoryUpdater | None = None,
         media_root: str | Path | None = None,
+        export_dir: str | Path | None = None,
     ) -> None:
         self.context = context
         self.repository = repository
@@ -41,13 +49,16 @@ class ChatMemoryUiWebApi:
         self.media_root = (
             Path(media_root).resolve(strict=False) if media_root else None
         )
+        self.export_dir = (
+            Path(export_dir).resolve(strict=False) if export_dir else None
+        )
 
     async def about(self):
         return _ok(
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.4.0",
+                "version": "1.4.1",
                 "read_only": True,
                 "default_page_size": self.repository.default_page_size,
                 "max_page_size": self.repository.max_page_size,
@@ -177,6 +188,67 @@ class ChatMemoryUiWebApi:
             },
         )
 
+    async def export(self):
+        """生成 SQLite backup 一致快照（点击时刻的时点）。
+
+        备份在后台线程执行，源库读写不受阻塞；返回快照文件名供下载。
+        """
+        if self.export_dir is None:
+            return _error("导出目录不可用", 503)
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        file_name = f"chat_memory_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.db"
+        dest = self.export_dir / file_name
+        try:
+            size = await asyncio.to_thread(self.repository.export_snapshot, dest)
+        except DatabaseUnavailableError as exc:
+            dest.unlink(missing_ok=True)
+            return _error(str(exc), 503)
+        except Exception as exc:
+            dest.unlink(missing_ok=True)
+            logger.exception("[ChatMemoryUI] 导出快照失败")
+            return _error(f"导出失败：{exc}", 500)
+        try:
+            await asyncio.to_thread(self._cleanup_exports)
+        except Exception:
+            pass
+        return _ok({"file_name": file_name, "size_bytes": int(size)})
+
+    async def export_file(self, file_name):
+        """下载导出的快照文件（附件）。"""
+        if not _EXPORT_NAME_RE.fullmatch(str(file_name or "")):
+            return _error("文件名不合法", 400)
+        if self.export_dir is None:
+            return _error("导出目录不可用", 503)
+        path = self.export_dir / str(file_name)
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError:
+            return _error("导出快照已过期或不存在", 404)
+        from urllib.parse import quote
+
+        return (
+            data,
+            200,
+            {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": (
+                    f"attachment; filename*=UTF-8''{quote(str(file_name))}"
+                ),
+                "Content-Length": str(len(data)),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    def _cleanup_exports(self) -> None:
+        """清理超期的导出快照（尽力而为，失败静默）。"""
+        now = datetime.now().timestamp()
+        for path in self.export_dir.glob("chat_memory_*.db"):
+            try:
+                if now - path.stat().st_mtime > _EXPORT_RETENTION_SEC:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
     async def _apply_settings(
         self, database_path: str, immutable_fallback: bool
     ) -> dict[str, Any]:
@@ -232,6 +304,13 @@ class ChatMemoryUiWebApi:
                 self.media,
                 ["GET"],
                 "ChatMemory archived media file",
+            ),
+            ("export", self.export, ["POST"], "Export a consistent DB snapshot"),
+            (
+                "export/<file_name>",
+                self.export_file,
+                ["GET"],
+                "Download an exported DB snapshot",
             ),
         )
         for path, handler, methods, description in endpoints:

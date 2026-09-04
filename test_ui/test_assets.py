@@ -6,7 +6,8 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
 class AssetsTestCase(unittest.TestCase):
-    def test_required_plugin_files_exist(self):
+    def test_plugin_assets(self):
+        # 小节：必需文件存在且非空
         for relative in (
             "metadata.yaml",
             "main.py",
@@ -21,7 +22,7 @@ class AssetsTestCase(unittest.TestCase):
             self.assertTrue(path.is_file(), relative)
             self.assertGreater(path.stat().st_size, 0, relative)
 
-    def test_page_uses_bridge_and_read_only_copy(self):
+        # 小节：页面用 Bridge 且只读（无删除能力）
         html = (PLUGIN_ROOT / "pages/explorer/index.html").read_text(encoding="utf-8")
         javascript = (PLUGIN_ROOT / "pages/explorer/app.js").read_text(encoding="utf-8")
         self.assertIn("只读模式", html)
@@ -29,11 +30,11 @@ class AssetsTestCase(unittest.TestCase):
         self.assertIn("apiPost('query'", javascript)
         self.assertIn("Bridge 模式下这里收到的就是业务 payload", javascript)
         self.assertIn("数据源设置", html)
+        self.assertIn("export-button", html)
         self.assertIn("apiPost('settings'", javascript)
         self.assertNotIn("delete", javascript.lower())
 
-    def test_astrbot_config_schema_is_valid(self):
-        """并入后沿用 chat_memory 自身的配置 schema，必须是合法 JSON。"""
+        # 小节：配置 schema 为合法 JSON
         import json
 
         schema = PLUGIN_ROOT / "_conf_schema.json"

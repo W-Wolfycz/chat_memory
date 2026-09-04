@@ -746,6 +746,19 @@ class ChatMemoryRepository:
                 }
         return result
 
+    def export_snapshot(self, dest: Path) -> int:
+        """用 SQLite backup API 把当前库导出为一致快照文件。
+
+        WAL 模式下备份走读事务，源库的读写均不阻塞；返回快照字节数。
+        """
+        with closing(self._connect(immutable=False)) as source:
+            dest_conn = sqlite3.connect(str(dest))
+            try:
+                source.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        return dest.stat().st_size
+
     async def media_file(self, media_id: str) -> dict[str, Any]:
         """按 media_id 读取归档行（媒体 API 用）；不存在抛 ValueError。"""
         normalized = str(media_id or "").strip()

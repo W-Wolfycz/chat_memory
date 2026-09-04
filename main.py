@@ -20,7 +20,6 @@ assistant 配对：新记录优先用内部 ``turn_id``；旧记录用 ``pair_id
 """
 
 import asyncio
-import inspect
 import json
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -72,8 +71,11 @@ from .models import (
     SEND_PREPARED as _SEND_PREPARED,
 )
 from .relation_codec import (
+    AT_TOKEN_RE as _AT_TOKEN_RE,
+    MEDIA_TOKEN_RE as _MEDIA_TOKEN_RE,
     build_current_turn_xml,
     dump_relation_data,
+    escape_plain_text as _escape_plain_text,
     truncate_content_template,
 )
 
@@ -89,10 +91,10 @@ class ChatMemoryPlugin(Star):
         self.auto_cleanup_days = config.get("auto_cleanup_days", 0)
         # 日志前缀附加机器人 ID（顶层配置）：多 Bot 实例环境便于定位。
         # 日志等级不再由插件配置：AstrBot WebUI 可运行期修改插件日志等级。
-        # 1.2.2 前该开关位于 log_config 组内：读时继承旧值，initialize 阶段
-        # 执行一次性迁移写回（旧组并入顶层后删除），此后只有顶层键生效。
         self._config = config
         self.log_with_bot_id = self._resolve_log_with_bot_id(config)
+        # 与 AstrBot 内置「群聊上下文感知」共存警告（1.4.1）：始终启用，进程内只提示一次。
+        self._builtin_ltm_warned = False
 
         ct_conf = config.get("context_takeover", {}) or {}
         self.ct_enable = bool(ct_conf.get("enable", False))
@@ -188,9 +190,6 @@ class ChatMemoryPlugin(Star):
         表面可用、实际从第一条消息开始持续漏存。失败前释放已创建的数据库连接。
         """
         try:
-            # 一次性配置迁移（1.2.2）：旧 log_config 组并入顶层并写回删除。
-            # 迁移本身失败不阻断加载——读时继承已保证行为正确，仅下次启动重试。
-            await self._migrate_log_config()
             await self.db.init_db()
             await self._ensure_cleanup_started()
             # 媒体归档：worker 与周期清理独立于记录自动清理（auto_cleanup_days 关闭也运行）
@@ -210,38 +209,6 @@ class ChatMemoryPlugin(Star):
                     f"{dispose_error}"
                 )
             raise
-
-    async def _migrate_log_config(self) -> None:
-        """把旧 ``log_config`` 组迁移到顶层 ``log_with_bot_id`` 并写回删除旧组。
-
-        规则：顶层键已存在时以顶层为准，旧组直接删除；顶层键不存在时先继承旧值。
-        写回成功后配置文件中不再有旧组，后续 WebUI 修改只作用于顶层键。
-        """
-        config = self._config
-        if not isinstance(config, dict) or "log_config" not in config:
-            return
-        legacy = config.get("log_config") or {}
-        if config.get("log_with_bot_id") is None and "log_with_bot_id" in legacy:
-            config["log_with_bot_id"] = bool(legacy["log_with_bot_id"])
-            self.log_with_bot_id = bool(legacy["log_with_bot_id"])
-        del config["log_config"]
-        save = getattr(config, "save_config_async", None) or getattr(
-            config, "save_config", None
-        )
-        if not callable(save):
-            logger.warning(
-                f"{self._log_prefix()} 配置迁移已在内存完成，但 config 对象不支持写回"
-            )
-            return
-        try:
-            result = save()
-            if inspect.isawaitable(result):
-                await result
-            logger.info(
-                f"{self._log_prefix()} 已迁移日志配置：log_config 组并入顶层并移除旧组"
-            )
-        except Exception as exc:
-            logger.warning(f"{self._log_prefix()} 配置迁移写回失败: {exc}")
 
     # ── 自动清理 ─────────────────────────────────────
 
@@ -328,6 +295,7 @@ class ChatMemoryPlugin(Star):
                 default_database_path=self.db.db_path,
                 repository_updater=self._update_ui_repository,
                 media_root=self.media_archiver.media_dir,
+                export_dir=self.db.data_dir / "exports",
             )
             self.ui_web_api.register()
             logger.info(f"{self._log_prefix()} 只读查询台已启用：{database_path}")
@@ -390,16 +358,8 @@ class ChatMemoryPlugin(Star):
 
     @staticmethod
     def _resolve_log_with_bot_id(config) -> bool:
-        """解析日志实例前缀开关（含旧版 log_config 组的一次性迁移）。
-
-        顶层 ``log_with_bot_id`` 存在时（WebUI 已保存过）以它为准；键不存在时
-        继承旧 ``log_config.log_with_bot_id`` 的值，避免升级后功能静默关闭。
-        """
-        top_level = config.get("log_with_bot_id")
-        if top_level is not None:
-            return bool(top_level)
-        legacy = (config.get("log_config") or {}).get("log_with_bot_id")
-        return bool(legacy)
+        """解析日志实例前缀开关：仅读顶层配置，无旧组继承。"""
+        return bool(config.get("log_with_bot_id"))
 
     def _log_prefix(self, event=None) -> str:
         if self.log_with_bot_id and event is not None:
@@ -563,6 +523,33 @@ class ChatMemoryPlugin(Star):
     @staticmethod
     def _system_event_summary_impl(event: AstrMessageEvent) -> str:
         return _system_event_summary_fn(event)
+
+    async def _recall_snippet(self, umo: str, event: AstrMessageEvent) -> str:
+        """撤回 notice：用 message_id 本地关联被撤回的 user 记录，返回可读摘要。
+
+        失败/未命中/原文为空时返回空串（调用方回退为纯 "[撤回消息]"）。
+        """
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return ""
+        message_id = str(raw.get("message_id") or "").strip()
+        if not message_id:
+            return ""
+        try:
+            row = await self.db.find_by_message_id(umo, message_id)
+        except Exception:
+            return ""
+        if not row:
+            return ""
+        text = _AT_TOKEN_RE.sub("", str(row.get("content") or ""))
+        text = _MEDIA_TOKEN_RE.sub("", text)
+        text = " ".join(text.split())
+        if not text:
+            return ""
+        nickname = str(row.get("sender_nickname") or "").strip()
+        head = f"{nickname}：" if nickname else ""
+        return f"[撤回消息] {_escape_plain_text(head + text[:60])}"
 
     async def _get_curr_cid(self, umo: str) -> str:
         try:
@@ -737,6 +724,10 @@ class ChatMemoryPlugin(Star):
             content = user_text
         elif kind == [_K_SYSTEM]:
             content = self._system_event_summary_impl(event) or self._content_placeholder(kind)
+            if content == "[撤回消息]":
+                snippet = await self._recall_snippet(umo, event)
+                if snippet:
+                    content = snippet
         elif kind:
             content = self._content_placeholder(kind)
         else:
@@ -1149,6 +1140,9 @@ class ChatMemoryPlugin(Star):
             await self._handle_empty_takeover(event, req, umo, cid, "CM 无数据")
             return
 
+        # 真正注入时才检查内置群聊上下文感知共存（关闭或未命中不发提示）
+        self._warn_builtin_ltm_coexist(event)
+
         # 通用规则无条件注入（cm_ 标签禁令 + cm_time 说明），位于模式指令之前。
         self._append_general_rules(req)
         if self.ct_full_group and self._is_group_umo(umo):
@@ -1387,6 +1381,35 @@ class ChatMemoryPlugin(Star):
         if len(parts) != 3:
             return False
         return parts[1] == "GroupMessage"
+
+    def _warn_builtin_ltm_coexist(self, event: AstrMessageEvent) -> None:
+        """检测 AstrBot 内置「群聊上下文感知」与 CM 接管共存，进程内提示一次。
+
+        内置功能经 extra_user_content_parts 以纯文本格式额外注入群聊历史，
+        与 CM 接管注入的 <cm_*> 结构化历史重复且格式冲突。仅群聊事件检测；
+        始终启用（不可配置），配置读取失败静默，不干扰主流程。
+        """
+        if self._builtin_ltm_warned:
+            return
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if not self._is_group_umo(umo):
+            return
+        try:
+            settings = self.context.get_config(umo=umo).get(
+                "provider_ltm_settings"
+            ) or {}
+            group_icl_enable = bool(settings.get("group_icl_enable", False))
+        except Exception:
+            return
+        if not group_icl_enable:
+            return
+        self._builtin_ltm_warned = True
+        logger.warning(
+            f"{self._log_prefix(event)} 检测到 AstrBot 内置「群聊上下文感知」已启用："
+            f"群聊历史会以纯文本格式额外注入，与 chat_memory 接管注入重复且格式冲突；"
+            f"建议在 Dashboard 关闭「群聊上下文感知」或关闭本插件接管"
+            f"（本次运行仅提示一次）"
+        )
 
     @staticmethod
     def _record_umo(record: dict, fallback_umo: str = "") -> str:

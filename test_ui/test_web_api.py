@@ -98,6 +98,8 @@ class WebApiTestCase(unittest.TestCase):
                 "/chat_memory/record",
                 "/chat_memory/tools",
                 "/chat_memory/media/<media_id>",
+                "/chat_memory/export",
+                "/chat_memory/export/<file_name>",
             },
         )
         self.assertTrue(all(set(route[2]) <= {"GET", "POST"} for route in context.routes))
@@ -105,20 +107,19 @@ class WebApiTestCase(unittest.TestCase):
             any("delete" in route[0] or "update" in route[0] for route in context.routes)
         )
 
-    def test_query_rejects_non_object_json(self):
+    def test_query_tools_and_facets_contract(self):
+        # 小节：非对象 JSON → 400
         module = load_module(body=[])
         controller = module.ChatMemoryUiWebApi(Context(), Repository())
         response = asyncio.run(controller.query_records())
         self.assertEqual(response[1], 400)
         self.assertFalse(response[0]["success"])
 
-    def test_tools_query_rejects_non_object_json_and_forwards(self):
-        module = load_module(body=[])
-        controller = module.ChatMemoryUiWebApi(Context(), Repository())
         response = asyncio.run(controller.query_tools())
         self.assertEqual(response[1], 400)
         self.assertFalse(response[0]["success"])
 
+        # 小节：tools 查询转发参数
         module = load_module(body={"tool_name": "draw", "page": 2})
         controller = module.ChatMemoryUiWebApi(Context(), Repository())
         response = asyncio.run(controller.query_tools())
@@ -126,7 +127,7 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(response["data"]["tool_payload"]["tool_name"], "draw")
         self.assertEqual(response["data"]["tool_payload"]["page"], 2)
 
-    def test_facets_and_record_forward_parameters(self):
+        # 小节：facets 与 record 转发 query 参数
         module = load_module(
             args={
                 "umo": "bot:FriendMessage:u1",
@@ -146,12 +147,10 @@ class WebApiTestCase(unittest.TestCase):
         record = asyncio.run(controller.record_detail())
         self.assertEqual(record["data"]["record"]["record_id"], 9)
 
-    def test_settings_are_read_and_updated_in_ui(self):
+    def test_settings_read_update_and_validate(self):
+        # 小节：读取默认路径 + 更新设置
         module = load_module(
-            body={
-                "database_path": "D:/Memory/new.db",
-                "immutable_fallback": False,
-            }
+            body={"database_path": "D:/Memory/new.db", "immutable_fallback": False}
         )
         updates = []
 
@@ -161,8 +160,7 @@ class WebApiTestCase(unittest.TestCase):
             return repository, {"database": {"path": path, "mode": "wal_aware"}}
 
         controller = module.ChatMemoryUiWebApi(
-            Context(),
-            Repository(),
+            Context(), Repository(),
             default_database_path="C:/AstrBot/chat_memory.db",
             repository_updater=updater,
         )
@@ -171,7 +169,6 @@ class WebApiTestCase(unittest.TestCase):
 
         updated = asyncio.run(controller.update_settings())
         self.assertEqual(updates, [("D:/Memory/new.db", False)])
-        # 平台无关：Windows 上 resolve 为 D:\Memory\new.db，Linux 上为 cwd 相对路径
         self.assertEqual(
             updated["data"]["database_path"],
             str(Path("D:/Memory/new.db").resolve(strict=False)),
@@ -179,23 +176,25 @@ class WebApiTestCase(unittest.TestCase):
         self.assertFalse(updated["data"]["immutable_fallback"])
         self.assertFalse(updated["data"]["using_default_path"])
 
-    def test_settings_reject_non_boolean_fallback(self):
+        # 小节：非布尔 fallback 拒绝
         module = load_module(
             body={"database_path": "D:/Memory/new.db", "immutable_fallback": "false"}
         )
-        async def updater(path, fallback):
+
+        async def rejecting_updater(path, fallback):
             return Repository(path, fallback), {}
 
         controller = module.ChatMemoryUiWebApi(
-            Context(), Repository(), repository_updater=updater
+            Context(), Repository(), repository_updater=rejecting_updater
         )
         response = asyncio.run(controller.update_settings())
         self.assertEqual(response[1], 400)
 
-    def test_media_endpoint_base64_and_raw(self):
+    def test_media_endpoint(self):
         import base64 as b64
         import tempfile
 
+        # 小节：base64 / thumb / raw 三种返回
         media_id = "ab" * 16
         payload = b"\x89PNG\r\nfake"
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,15 +238,11 @@ class WebApiTestCase(unittest.TestCase):
                 Context(), MediaRepository(), media_root=root
             )
             response2 = asyncio.run(controller2.media(media_id))
-            # 元组返回（AstrBot 运行时会包成 Response）：(bytes, status, headers)
             self.assertEqual(response2[1], 200)
             self.assertEqual(response2[0], payload)
             self.assertEqual(response2[2]["Content-Type"], "image/png")
 
-    def test_media_raw_file_disposition_filename(self):
-        """file 类 raw 下载：Content-Disposition 为 attachment 且带 filename*。"""
-        import tempfile
-
+        # 小节：file 类 raw 下载带 attachment + filename*
         media_id = "ef" * 16
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -275,7 +270,7 @@ class WebApiTestCase(unittest.TestCase):
             self.assertIn("attachment", disposition)
             self.assertIn(f"filename*=UTF-8''{media_id}.pdf", disposition)
 
-    def test_media_endpoint_missing_archive_and_missing_root(self):
+        # 小节：未归档 → 400；无 media_root → 503
         media_id = "cd" * 16
 
         class EmptyRepository(Repository):
@@ -299,6 +294,43 @@ class WebApiTestCase(unittest.TestCase):
         response2 = asyncio.run(controller2.media(media_id))
         self.assertEqual(response2[1], 503)
         self.assertFalse(response2[0]["success"])
+
+    def test_export_snapshot_flow(self):
+        """导出快照：生成→下载→非法名→不存在，四段行为。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            export_root = Path(tmp)
+
+            class ExportRepository(Repository):
+                def export_snapshot(self, dest):
+                    dest.write_bytes(b"fake-snapshot")
+                    return len(b"fake-snapshot")
+
+            module = load_module(body={})
+            controller = module.ChatMemoryUiWebApi(
+                Context(), ExportRepository(), export_dir=export_root
+            )
+            response = asyncio.run(controller.export())
+            self.assertTrue(response["success"])
+            name = response["data"]["file_name"]
+            self.assertRegex(name, r"^chat_memory_\d{8}_\d{6}_[a-f0-9]{6}\.db$")
+            self.assertTrue((export_root / name).is_file())
+
+            controller2 = module.ChatMemoryUiWebApi(
+                Context(), ExportRepository(), export_dir=export_root
+            )
+            resp2 = asyncio.run(controller2.export_file(name))
+            self.assertEqual(resp2[1], 200)
+            self.assertEqual(resp2[0], b"fake-snapshot")
+            self.assertIn("attachment", resp2[2]["Content-Disposition"])
+
+            resp3 = asyncio.run(controller2.export_file("../../etc/passwd"))
+            self.assertEqual(resp3[1], 400)
+            resp4 = asyncio.run(
+                controller2.export_file("chat_memory_20200101_000000_abcdef.db")
+            )
+            self.assertEqual(resp4[1], 404)
 
 
 if __name__ == "__main__":

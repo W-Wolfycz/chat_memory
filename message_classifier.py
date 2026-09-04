@@ -359,12 +359,41 @@ _NOTICE_LABELS = {
     "group_decrease": "群成员减少",
     "group_ban": "群禁言",
     "friend_add": "好友添加",
-    "notify": "系统通知",
+    "group_card": "群名片变更",
+    "offline_file": "离线文件",
+    "client_status": "客户端状态变更",
+}
+
+_NOTIFY_SUB_LABELS = {
+    "poke": "戳一戳",
+    "title": "设置群头衔",
+    "lucky_king": "群运气王",
+    "honor": "群荣誉变更",
 }
 
 
+def _fmt_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        minutes = seconds // 60
+        return f"{minutes}分钟" if seconds % 60 == 0 else f"{minutes}分{seconds % 60}秒"
+    hours = seconds // 3600
+    return f"{hours}小时"
+
+
+def _clean_event_text(value: str, limit: int) -> str:
+    """净化 notice 携带的用户文本（头衔/文件名）：去控制字符、转义 token 前缀、限长。"""
+    text = "".join(
+        ch for ch in str(value or "") if ch >= " " or ch == "\t"
+    ).strip()
+    if not text:
+        return ""
+    return escape_plain_text(text)[:limit]
+
+
 def system_event_summary(event: AstrMessageEvent) -> str:
-    """从 notice/request 原始事件提取可读摘要（只描述类别，不带账号/正文）。
+    """从 notice/request 原始事件提取可读摘要（不含账号，仅类别 + 关键信息）。
 
     AstrBot 把 OneBot notice/request 转成空消息，CM 据此补存系统事件；
     摘要用于落库 content（kind 仍为 system_event，不写成 text 类型）。
@@ -376,12 +405,39 @@ def system_event_summary(event: AstrMessageEvent) -> str:
     if not isinstance(raw, dict):
         return ""
     post_type = str(raw.get("post_type") or "")
-    if post_type == "notice":
-        notice_type = str(raw.get("notice_type") or "")
-        return f"[{_NOTICE_LABELS.get(notice_type, '系统事件')}]"
-    if post_type == "request":
-        return "[请求事件]"
-    return ""
+    if post_type != "notice":
+        return "[请求事件]" if post_type == "request" else ""
+    notice_type = str(raw.get("notice_type") or "")
+    if notice_type == "group_ban":
+        if str(raw.get("sub_type") or "") == "lift_ban":
+            return "[解除禁言]"
+        try:
+            duration = int(raw.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        return f"[群禁言 {_fmt_duration(duration)}]" if duration > 0 else "[群禁言]"
+    if notice_type == "group_admin":
+        return (
+            "[设置群管理员]"
+            if str(raw.get("sub_type") or "") == "set"
+            else "[取消群管理员]"
+        )
+    if notice_type == "group_upload":
+        file_info = raw.get("file") or {}
+        name = _clean_event_text(file_info.get("name"), 40) if isinstance(
+            file_info, dict
+        ) else ""
+        return f"[群文件上传] {name}" if name else "[群文件上传]"
+    if notice_type == "notify":
+        sub = str(raw.get("sub_type") or "")
+        if sub == "title":
+            title = _clean_event_text(raw.get("title"), 50)
+            return f"[设置群头衔] {title}" if title else "[设置群头衔]"
+        label = _NOTIFY_SUB_LABELS.get(sub)
+        return f"[{label}]" if label else "[系统通知]"
+    label = _NOTICE_LABELS.get(notice_type)
+    # 撤回类只有 message_id，原文片段由捕获侧本地关联补齐（见 main._recall_snippet）
+    return f"[{label}]" if label else "[系统事件]"
 
 
 def classify_assistant_chain(chain) -> tuple[list[str], str]:

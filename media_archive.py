@@ -9,7 +9,6 @@
 """
 
 import asyncio
-import logging
 import os
 import re
 import shutil
@@ -19,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
-logger = logging.getLogger("ChatMemory.MediaArchive")
+from astrbot.api import logger
 
 # 参与归档的 kind（emoji/poke/forward 只有元信息，不落盘）
 ARCHIVE_KINDS = ("image", "video", "voice", "file")

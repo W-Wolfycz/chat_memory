@@ -851,6 +851,38 @@ async function copyQuery() {
   }
 }
 
+async function exportSnapshot() {
+  // SQLite backup 一致快照：服务端后台生成，源库读写不阻塞，无需排队。
+  const button = $('#export-button');
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = '导出中…';
+  try {
+    const info = unwrap(await apiPost('export', {}));
+    if (bridge && typeof bridge.download === 'function') {
+      await bridge.download(`export/${info.file_name}`, {}, info.file_name);
+    } else {
+      const response = await fetch(`/api/plug/${PLUGIN_NAME}/export/${info.file_name}`);
+      if (!response.ok) throw new Error(`下载失败：HTTP ${response.status}`);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = info.file_name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    }
+    showToast(`已导出：${info.file_name}（${formatBytes(info.size_bytes)}）`);
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
 function toggleTheme() {
   const current = document.documentElement.getAttribute('data-theme') || 'light';
   const next = current === 'dark' ? 'light' : 'dark';
@@ -874,6 +906,7 @@ function bindEvents() {
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeDetail(); });
   $('#theme-toggle').addEventListener('click', toggleTheme);
   $('#reload-button').addEventListener('click', initialize);
+  $('#export-button').addEventListener('click', exportSnapshot);
   $('#database-settings-form').addEventListener('submit', saveDatabaseSettings);
   $('#restore-database-path').addEventListener('click', restoreDefaultDatabasePath);
   FACET_SELECTORS.forEach((selector) => $(selector).addEventListener('change', async () => {

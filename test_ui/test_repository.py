@@ -144,6 +144,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_overview_and_health(self):
+        # 小节：概览与健康检查（含工具表与工具计数）
         overview = asyncio.run(self.repository.overview())
         self.assertEqual(overview["summary"]["total_records"], 4)
         self.assertEqual(overview["summary"]["total_conversations"], 2)
@@ -159,7 +160,36 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertTrue(health["healthy"])
         self.assertEqual(health["total_records"], 4)
 
-    def test_tool_records_query_and_filters(self):
+        # 小节：media 归档概览（无表 → 有表 + 行数/字节统计）
+        path = Path(self.temp_dir.name) / "media_ov.db"
+        make_database(path)
+        repo = ChatMemoryRepository(
+            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+        )
+        overview = asyncio.run(repo.overview())
+        self.assertFalse(overview["media"]["present"])
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE chat_memory_media_archive ("
+            "media_id TEXT PRIMARY KEY, umo TEXT NOT NULL, "
+            "conversation_id TEXT NOT NULL, turn_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL, file_name TEXT NOT NULL, ext TEXT NOT NULL, "
+            "mime_type TEXT, size_bytes INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO chat_memory_media_archive VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("ab" * 16, "umo_demo", "cid_demo", "turn_demo", "voice",
+             "ab" * 16 + ".amr", "amr", "audio/amr", 2048, "2026-08-11 02:00:00"),
+        )
+        connection.commit()
+        connection.close()
+        overview = asyncio.run(repo.overview())
+        self.assertTrue(overview["media"]["present"])
+        self.assertEqual(overview["media"]["total_files"], 1)
+        self.assertEqual(overview["media"]["total_bytes"], 2048)
+
+    def test_tool_records(self):
+        # 小节：按名称/轮次/范围过滤工具记录
         result = asyncio.run(
             self.repository.tool_records(
                 {"tool_name": "draw", "page": 1, "page_size": 20}
@@ -174,9 +204,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(first["created_at"], "2026-08-11 10:00:02")
 
         by_turn = asyncio.run(
-            self.repository.tool_records(
-                {"turn_id": "turn-a", "page_size": 50}
-            )
+            self.repository.tool_records({"turn_id": "turn-a", "page_size": 50})
         )
         self.assertEqual([item["call_index"] for item in by_turn["items"]], [2, 1])
 
@@ -188,12 +216,11 @@ class RepositoryTestCase(unittest.TestCase):
         )
         self.assertEqual(scoped["total"], 1)
 
-    def test_tool_records_degrade_without_tool_table(self):
+        # 小节：无工具表的旧库降级为空结果
         legacy_path = Path(self.temp_dir.name) / "legacy.db"
         make_database(legacy_path, include_tools=False)
         legacy_repo = ChatMemoryRepository(
-            legacy_path,
-            timezone=timezone(timedelta(hours=8), name="Asia/Shanghai"),
+            legacy_path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
         )
         overview = asyncio.run(legacy_repo.overview())
         self.assertFalse(overview["tools"]["present"])
@@ -202,7 +229,8 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(result["total"], 0)
         self.assertEqual(result["items"], [])
 
-    def test_query_filters_and_renders_relations(self):
+    def test_query_filters_and_edges(self):
+        # 小节：关键词/状态/类型过滤 + relation 渲染
         result = asyncio.run(
             self.repository.query(
                 {
@@ -218,7 +246,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(result["items"][0]["content"], "你好 @Bob")
         self.assertEqual(result["items"][0]["created_at"], "2026-08-10 09:00:00")
 
-    def test_empty_status_persona_and_paired_only(self):
+        # 小节：空状态/persona 与 paired_only 过滤
         no_llm = asyncio.run(
             self.repository.query({"llm_status": "__empty__", "page_size": 50})
         )
@@ -235,7 +263,19 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(paired["total"], 2)
         self.assertEqual({item["turn_id"] for item in paired["items"]}, {"turn-a"})
 
-    def test_facets_are_scoped(self):
+        # 小节：非法时间范围拒绝
+        with self.assertRaisesRegex(ValueError, "起始时间"):
+            asyncio.run(
+                self.repository.query(
+                    {
+                        "since": "2026-08-12T10:00",
+                        "until": "2026-08-11T10:00",
+                    }
+                )
+            )
+
+    def test_facets_scoped(self):
+        # 小节：按会话范围返回用户/会话
         facets = asyncio.run(
             self.repository.facets(
                 {"umo": "bot:FriendMessage:u1", "conversation_id": "cid-a"}
@@ -245,11 +285,9 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(facets["users"][0]["nickname"], "Alpha-new")
         self.assertEqual(facets["conversations"][0]["value"], "cid-a")
 
-    def test_facets_are_mutually_scoped_and_nickname_tracks_latest_match(self):
+        # 小节：按 role 互斥范围，昵称跟踪最新匹配
         user_facets = asyncio.run(
-            self.repository.facets(
-                {"umo": "bot:FriendMessage:u1", "role": "user"}
-            )
+            self.repository.facets({"umo": "bot:FriendMessage:u1", "role": "user"})
         )
         self.assertEqual(user_facets["users"][0]["nickname"], "Zulu-old")
         self.assertEqual(
@@ -272,7 +310,8 @@ class RepositoryTestCase(unittest.TestCase):
             {"text"},
         )
 
-    def test_corrupt_wal_fallback_is_reported(self):
+    def test_corrupt_database_fallback(self):
+        # 小节：WAL 损坏时 immutable 回退并报告 main_snapshot
         original_connect = self.repository._connect
 
         def fake_connect(*, immutable: bool):
@@ -285,7 +324,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(result["database"]["mode"], "main_snapshot")
         self.assertIn("WAL/SHM", result["database"]["warning"])
 
-    def test_corrupt_database_without_fallback_fails(self):
+        # 小节：禁用回退后直接失败
         repository = ChatMemoryRepository(
             self.db_path, allow_immutable_fallback=False
         )
@@ -296,17 +335,6 @@ class RepositoryTestCase(unittest.TestCase):
         with patch.object(repository, "_connect", side_effect=fail_connect):
             with self.assertRaisesRegex(DatabaseUnavailableError, "不可读"):
                 asyncio.run(repository.health())
-
-    def test_query_rejects_bad_time_range(self):
-        with self.assertRaisesRegex(ValueError, "起始时间"):
-            asyncio.run(
-                self.repository.query(
-                    {
-                        "since": "2026-08-12T10:00",
-                        "until": "2026-08-11T10:00",
-                    }
-                )
-            )
 
     def test_reply_view_turn_and_snapshot(self):
         path = Path(self.temp_dir.name) / "reply.db"
@@ -384,7 +412,8 @@ class RepositoryTestCase(unittest.TestCase):
         detail = asyncio.run(repo.record(result["items"][0]["record_id"]))
         self.assertIn("reply_view", detail["record"])
 
-    def test_media_view_and_archive_join(self):
+    def test_media_view_and_archive(self):
+        # 小节：归档 join（archived/mime/size/name/poke_label）+ media_file 单查
         path = Path(self.temp_dir.name) / "media.db"
         make_database(path)
         connection = sqlite3.connect(path)
@@ -447,33 +476,29 @@ class RepositoryTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             asyncio.run(repo.media_file("ff" * 16))
 
-    def test_media_overview_presence(self):
-        path = Path(self.temp_dir.name) / "media_ov.db"
-        make_database(path)
-        repo = ChatMemoryRepository(
-            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
-        )
-        overview = asyncio.run(repo.overview())
-        self.assertFalse(overview["media"]["present"])
-        connection = sqlite3.connect(path)
+        # 小节：表缺失时 media_file 报 ValueError，详情仍带 media_view（未归档）
+        path2 = Path(self.temp_dir.name) / "media_detail.db"
+        make_database(path2)
+        connection = sqlite3.connect(path2)
+        media_id = "ab" * 16
+        relation = json.dumps({"v": 1, "mentions": [], "media": [
+            {"kind": "image", "id": media_id}]}, ensure_ascii=False)
         connection.execute(
-            "CREATE TABLE chat_memory_media_archive ("
-            "media_id TEXT PRIMARY KEY, umo TEXT NOT NULL, "
-            "conversation_id TEXT NOT NULL, turn_id TEXT NOT NULL, "
-            "kind TEXT NOT NULL, file_name TEXT NOT NULL, ext TEXT NOT NULL, "
-            "mime_type TEXT, size_bytes INTEGER NOT NULL, created_at DATETIME NOT NULL)"
-        )
-        connection.execute(
-            "INSERT INTO chat_memory_media_archive VALUES (?,?,?,?,?,?,?,?,?,?)",
-            ("ab" * 16, "umo_demo", "cid_demo", "turn_demo", "voice",
-             "ab" * 16 + ".amr", "amr", "audio/amr", 2048, "2026-08-11 02:00:00"),
+            "UPDATE chat_memory_records SET relation_data = ? WHERE turn_id = ?",
+            (relation, "turn-b"),
         )
         connection.commit()
         connection.close()
-        overview = asyncio.run(repo.overview())
-        self.assertTrue(overview["media"]["present"])
-        self.assertEqual(overview["media"]["total_files"], 1)
-        self.assertEqual(overview["media"]["total_bytes"], 2048)
+        repo2 = ChatMemoryRepository(
+            path2, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+        )
+        with self.assertRaises(ValueError):
+            asyncio.run(repo2.media_file(media_id))
+        result = asyncio.run(repo2.query({"page_size": 50}))
+        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
+        detail = asyncio.run(repo2.record(item["record_id"]))
+        self.assertEqual(len(detail["record"]["media_view"]), 1)
+        self.assertFalse(detail["record"]["media_view"][0]["archived"])
 
     def test_pure_media_english_placeholder_localized(self):
         """纯媒体英文占位本地化：media 非空才翻，用户真输入 '[image]' 不翻。"""
@@ -522,32 +547,24 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(by_turn["turn-legacy-text"], "[image]")
         self.assertEqual(by_turn["turn-mixed-poke"], "[image]")
 
-    def test_media_file_missing_table_and_detail_view(self):
-        """media_file 表缺失 → ValueError（400 语义）；详情接口同样带 media_view。"""
-        path = Path(self.temp_dir.name) / "media_detail.db"
-        make_database(path)
-        connection = sqlite3.connect(path)
-        media_id = "ab" * 16
-        relation = json.dumps({"v": 1, "mentions": [], "media": [
-            {"kind": "image", "id": media_id}]}, ensure_ascii=False)
-        connection.execute(
-            "UPDATE chat_memory_records SET relation_data = ? WHERE turn_id = ?",
-            (relation, "turn-b"),
-        )
-        connection.commit()
-        connection.close()
+    def test_export_snapshot_backup(self):
+        """export_snapshot 用 backup API 生成一致快照，行数一致。"""
+        src_path = Path(self.temp_dir.name) / "export_src.db"
+        make_database(src_path)
+        dest = Path(self.temp_dir.name) / "snapshot.db"
         repo = ChatMemoryRepository(
-            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+            src_path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
         )
-        # 表不存在：不报 DatabaseUnavailableError，而是 ValueError（媒体未归档语义）
-        with self.assertRaises(ValueError):
-            asyncio.run(repo.media_file(media_id))
-        # 详情接口返回 media_view（未归档）
-        result = asyncio.run(repo.query({"page_size": 50}))
-        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
-        detail = asyncio.run(repo.record(item["record_id"]))
-        self.assertEqual(len(detail["record"]["media_view"]), 1)
-        self.assertFalse(detail["record"]["media_view"][0]["archived"])
+        size = repo.export_snapshot(dest)
+        self.assertGreater(size, 0)
+        connection = sqlite3.connect(dest)
+        try:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM chat_memory_records"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(count, 4)
 
 
 if __name__ == "__main__":

@@ -1106,6 +1106,32 @@ class DBManager:
             await session.commit()
             return result.rowcount
 
+    async def find_by_message_id(self, umo: str, message_id: str) -> Optional[dict]:
+        """按平台 message_id 查 user 记录（撤回 notice 的本地关联）。
+
+        返回原始 ``content`` / ``relation_data`` / ``sender_nickname``；
+        无命中返回 None。message_id 在平台实例内唯一，umo 已含实例 ID。
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT content, relation_data, sender_nickname "
+                    "FROM chat_memory_records "
+                    "WHERE umo = :umo AND message_id = :mid AND role = 'user' "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"umo": umo, "mid": str(message_id or "")},
+            )
+            row = result.first()
+            if row is None:
+                return None
+            return {
+                "content": row[0] or "",
+                "relation_data": row[1],
+                "sender_nickname": row[2] or "",
+            }
+
     async def query_rounds_raw(
         self,
         umo: str,

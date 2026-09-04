@@ -6,6 +6,7 @@ logo-*/
 dumps/
 data/
 docs/
+integration/
 
 .pytest_cache/
 .coverage

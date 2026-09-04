@@ -3,15 +3,16 @@
 策略：
 - ast.parse + exec 加载生产源码；sys.modules 注入 AstrBot / sqlalchemy mock
 - 只断言行为（输出内容 / 边界 / 隐私），不锁实现细节与参数透传
-- DB 生命周期 / 迁移 / send_status 依赖真实 sqlalchemy，由 test_storage_integration.py 覆盖
+- DB 生命周期 / 迁移 / send_status 依赖真实 sqlalchemy，由 integration/storage_integration.py 覆盖
 
 覆盖（对应生产代码可测面）：
-- context_builder：时间戳 / 媒体 / 前缀 / 当前发言者 XML / 合并 / 首尾 / 字符裁剪
-  / Reply 还原 / 跨会话来源 / assistant cm_ 标签裁剪
-- relation_codec：token / 转义 / 截断 / 当前轮 XML 锚（含 ID 隐私）
-- message_classifier：组件提取 / message_str 回退 / assistant 链
+- context_builder：cm_ XML 清理与防伪造 / 昵称隐私 / 发言者与 solo 标记 / 跨会话来源
+  / 首尾与拆分 / Reply 还原 / think 与旧前缀剥离 / 字符预算 / 媒体占位渲染与输出清洗
+- relation_codec：token 编解码 / 转义 / 截断 / 当前轮 XML 锚（含 ID 隐私）
+- message_classifier：内容分类 / 戳一戳 / 位置 token / 媒体元信息 / 空链 / system_event 摘要
 - storage 纯函数：_scope_filter 4 组合 / _normalize_dt / _row_to_dict
-- main：指令幂等 / 接管策略（排除当前 turn / 公开 API / 字符预算 / think 剥离）
+- media_archive：MP4 嗅探 / 本地归档与清理
+- main：指令幂等 / 接管策略（缓存人设 / 公开 API / 字符预算 / 工具上下文 / 捕获落库）
 """
 
 import ast
@@ -176,6 +177,8 @@ quart_mock = types.ModuleType("quart")
 quart_mock.request = types.SimpleNamespace(args={})
 sys.modules["quart"] = quart_mock
 ui_pkg = types.ModuleType("chat_memory.ui")
+# 补 __path__ 让 ui 成为真 package：test_ui 同进程收集时 pop 后可重新 import 真实模块
+ui_pkg.__path__ = [str(PLUGIN_DIR / "ui")]
 sys.modules["chat_memory.ui"] = ui_pkg
 setattr(pkg, "ui", ui_pkg)
 ui_repository_mod = types.ModuleType("chat_memory.ui.repository")
@@ -218,6 +221,7 @@ def _make_plugin():
     p.log_with_bot_id = False
     p.max_len = 0
     p.ct_keep_tool_turns = 2
+    p._builtin_ltm_warned = False
     return p
 
 
@@ -240,49 +244,6 @@ def _rec(role="user", content="你好", user_id="u1", nickname="Alice",
 # ── 测试用例：context_builder 纯函数 ────────────────
 
 
-def test_extract_time_str():
-    """时间戳 → [MM/DD HH:MM:SS]，空/非法返回空串。"""
-    ets = context_builder_mod.extract_time_str
-    assert ets("2026-07-09 10:00:00") == "07/09 10:00:00"
-    assert ets("2026-07-09T10:00:00") == "07/09 10:00:00"
-    assert ets("") == ""
-    assert ets(None) == ""
-    assert ets("2026-07-09") == "2026-07-09"  # 不足 19 位原样
-    print("[T01] extract_time_str ✓")
-
-
-def test_is_pure_media():
-    """全媒体判定：全媒体 True，混合/空 False。"""
-    f = context_builder_mod.is_pure_media
-    assert f({"content_kind": ["image"]}, {"image"}) is True
-    assert f({"content_kind": ["image", "video"]}, {"image", "video"}) is True
-    assert f({"content_kind": ["image", "text"]}, {"image"}) is False
-    assert f({"content_kind": []}, {"image"}) is False
-    assert f({}, {"image"}) is False
-    print("[T02] is_pure_media ✓")
-
-
-def test_strip_reasoning_prefix():
-    """剥离 AstrBot 错误序列化进 Plain 的 think 前缀。"""
-    f = context_builder_mod.strip_reasoning_prefix
-    src = "[{'type': 'think', 'content': '内部推理', 'encrypted': None}]实际回复"
-    assert f(src) == "实际回复"
-    assert f("普通文本") == "普通文本"
-    assert f("[{'type': 'think'") == "[{'type': 'think'"  # 不完整前缀原样
-    print("[T03] strip_reasoning_prefix ✓")
-
-
-def test_strip_legacy_assistant_source_prefix():
-    """清理旧版 CM 注入到 assistant 正文开头的 [群N]/[私N]/[会N]/[未知] 标签。"""
-    f = context_builder_mod.strip_legacy_assistant_source_prefix
-    assert f("[群1] 你好") == "你好"
-    assert f("[私1][会2] 你好") == "你好"
-    assert f("[未知] 你好") == "你好"
-    assert f("[群1] 中间[群2] 保留") == "中间[群2] 保留"  # 只清开头
-    assert f("无标签") == "无标签"
-    print("[T04] strip_legacy_assistant_source_prefix ✓")
-
-
 def test_strip_cm_xml_tags():
     """LLM 回复入库前移除 cm_ XML 结构：标签连同内文整体删除。"""
     f = context_builder_mod.strip_cm_xml_tags
@@ -300,7 +261,7 @@ def test_strip_cm_xml_tags():
     assert f("<cm_image>xxx</cm_image>正文") == "正文"
     assert f('<code>&lt;cm_source/&gt;</code>') == '<code>&lt;cm_source/&gt;</code>'
     assert f("普通回复") == "普通回复"
-    print("[T30] strip_cm_xml_tags ✓")
+    print("[T01] strip_cm_xml_tags ✓")
 
 
 def test_user_forged_cm_tags_stripped():
@@ -321,18 +282,7 @@ def test_user_forged_cm_tags_stripped():
     assert out2[0]["content"] == (
         "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 真实内容"
     )
-    print("[T31] user_forged_cm_tags_stripped ✓")
-
-
-def test_user_prefix_basic():
-    """非 full_group：时间 + 昵称前缀，无 speaker 标记。"""
-    p = _make_plugin()
-    out = p._takeover_normalize([_rec()], _UMO_GROUP)
-    assert out[0]["content"] == "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 你好"
-    # 无时间
-    out2 = p._takeover_normalize([_rec(created_at="")], _UMO_GROUP)
-    assert out2[0]["content"] == "<cm_nickname>Alice</cm_nickname> 你好"
-    print("[T05] user_prefix_basic ✓")
+    print("[T02] user_forged_cm_tags_stripped ✓")
 
 
 def test_nickname_fallback_hides_user_id():
@@ -344,7 +294,7 @@ def test_nickname_fallback_hides_user_id():
     content = out[0]["content"]
     assert "<cm_nickname>?</cm_nickname> 你好" in content
     assert "10001" not in content
-    print("[T33] nickname_fallback_hides_user_id ✓")
+    print("[T03] nickname_fallback_hides_user_id ✓")
 
 
 def test_full_group_speaker_xml():
@@ -369,7 +319,7 @@ def test_full_group_speaker_xml():
     neutral_joined = "\n".join(c["content"] for c in neutral)
     assert "<cm_speaker/> <cm_nickname>Alice</cm_nickname> 当前用户发言" in neutral_joined
     assert '<cm_speaker current="1"/>' not in neutral_joined
-    print("[T06] full_group_speaker_xml ✓")
+    print("[T04] full_group_speaker_xml ✓")
 
 
 def test_solo_assistant_prefix():
@@ -398,157 +348,7 @@ def test_solo_assistant_prefix():
     out2 = p._takeover_normalize(orphan_records, _UMO_GROUP)
     assert '<cm_solo orphan="1"/> 孤立' in \
         "\n".join(c["content"] for c in out2)
-    print("[T07] solo_assistant_prefix ✓")
-
-
-def test_split_no_merge():
-    """拆分模式（默认）：相邻同 role 不合并，每条独立。"""
-    p = _make_plugin()
-    records = [
-        _rec(content="第一段", created_at="2026-07-09 10:00:00"),
-        _rec(content="第二段", nickname="Bob", created_at="2026-07-09 10:00:03"),
-        _rec(role="assistant", content="回复", created_at="2026-07-09 10:00:05"),
-    ]
-    out = p._takeover_normalize(records, _UMO_GROUP)
-    assert len(out) == 3  # 拆分：每条独立
-    assert "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 第一段" in out[0]["content"]
-    assert "<cm_time>07/09 10:00:03</cm_time> <cm_nickname>Bob</cm_nickname> 第二段" in out[1]["content"]
-    assert "回复" in out[2]["content"]
-    print("[T08] split_no_merge ✓")
-
-
-def test_head_tail_normalize():
-    """拆分模式：不做任何 pop，头部/尾部均保留；proactive 独立带标记。"""
-    p = _make_plugin()
-    records = [
-        _rec(role="assistant", content="头部孤儿", created_at="2026-07-09 09:00:00"),
-        _rec(content="中间用户", created_at="2026-07-09 10:00:00"),
-        _rec(role="assistant", content="配对回复", created_at="2026-07-09 10:00:05"),
-        _rec(role="assistant", content="尾部主动", status="proactive",
-             created_at="2026-07-09 10:01:00"),
-    ]
-    out = p._takeover_normalize(records, _UMO_GROUP)
-    assert len(out) == 4  # 拆分：全部保留，不做 pop
-    joined = "\n".join(c["content"] for c in out)
-    assert "头部孤儿" in joined
-    assert "中间用户" in joined
-    assert "配对回复" in joined
-    assert "尾部主动" in joined
-    assert '<cm_solo active="1"/>' in joined  # proactive 独立保留并带标记
-    print("[T09] head_tail_normalize ✓")
-
-
-def test_media_filter_mixed():
-    """纯媒体以 cm 媒体标签保留；图文混合在文本后补标签。"""
-    p = _make_plugin()
-    records = [
-        _rec(content="", kinds=["image"]),          # 纯图 → <cm_image/>
-        _rec(content="带图文字", kinds=["image", "text"], nickname="Bob",
-             created_at="2026-07-09 10:00:03"),    # 图文 → 文本 + <cm_image/>
-    ]
-    out = p._takeover_normalize(records, _UMO_GROUP)
-    assert len(out) == 2
-    assert out[0]["content"].endswith("<cm_image/>")
-    assert "带图文字 <cm_image/>" in out[1]["content"]
-    print("[T10] media_filter_mixed ✓")
-
-
-def test_media_placeholders_solo_and_variants():
-    """占位细节：solo 纯图、多 kind、旧英文占位替换、已含标签不重复。"""
-    p = _make_plugin()
-    records = [
-        # 主动纯图(imago):solo 前缀 + cm 媒体标签
-        _rec(role="assistant", content="[image]", status="proactive",
-             kinds=["image"], created_at="2026-08-18 04:04:02"),
-        # 纯媒体多 kind
-        _rec(content="", kinds=["image", "voice"], created_at="2026-08-18 04:05:00"),
-        # 戳一戳:纯动作消息,旧占位替换为 <cm_poke/>
-        _rec(content="[poke]", kinds=["poke"], created_at="2026-08-18 04:05:30"),
-        # 文本已含同款标签:不重复
-        _rec(content="看图 <cm_image/>", kinds=["text", "image"],
-             created_at="2026-08-18 04:06:00"),
-        # 无媒体 kind:原样
-        _rec(content="普通文本", kinds=["text"], created_at="2026-08-18 04:07:00"),
-    ]
-    out = p._takeover_normalize(records, _UMO_GROUP)
-    joined = "\n".join(c["content"] for c in out)
-    assert '<cm_solo active="1"/> <cm_image/>' in joined
-    assert "<cm_image/> <cm_voice/>" in joined
-    assert "<cm_poke/>" in joined
-    assert "看图 <cm_image/>" in joined
-    assert "看图 <cm_image/> <cm_image/>" not in joined
-    assert "普通文本" in joined
-    assert "普通文本 <cm_" not in joined
-    print("[T41] media_placeholders_solo_and_variants ✓")
-
-
-def test_strip_bracket_media_placeholders():
-    """LLM 回复中模仿的方括号占位字面清洗为裸词。"""
-    f = context_builder_mod.strip_bracket_media_placeholders
-    assert f("好的 [图片]") == "好的 图片"
-    assert f("发你 [语音] 和 [文件]") == "发你 语音 和 文件"
-    assert f("[image] [video]") == "图片 视频"
-    assert f("转发 [forward]") == "转发 转发消息"
-    assert f("普通回复，含 [自定义] 标签") == "普通回复，含 [自定义] 标签"
-    assert f("") == ""
-    assert f(None) == ""
-    print("[T43] strip_bracket_media_placeholders ✓")
-
-
-def test_character_budget_keeps_latest_user():
-    """字符预算裁剪：始终保留最新一条 user，避免以 assistant 开头。"""
-    p = _make_plugin()
-    records = [
-        _rec(content="长" * 100, created_at="2026-07-09 09:00:00"),
-        _rec(role="assistant", content="中" * 100, created_at="2026-07-09 09:01:00"),
-        _rec(content="最新用户", nickname="Bob", created_at="2026-07-09 10:00:00"),
-    ]
-    out = p._takeover_normalize(records, _UMO_GROUP, max_chars=120)
-    assert out[0]["role"] == "user"
-    assert out[-1]["content"].startswith("<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Bob</cm_nickname> 最新用户")
-    print("[T11] character_budget_keeps_latest_user ✓")
-
-
-def test_apply_relation_reply():
-    """Reply 还原三态：turn 命中 / snapshot / 降级。"""
-    p = _make_plugin()
-    target_map = {("turn_1", "user"): {
-        "sender_nickname": "Wolfycz", "content": "被引用的原文"}}
-    # turn 命中
-    rec = _rec(content="回复内容", relation={"v": 1, "mentions": [], "reply": {
-        "resolution": "turn", "target_turn_id": "turn_1", "target_role": "user"}})
-    out = p._takeover_normalize([rec], _UMO_GROUP, target_map=target_map)
-    assert '<cm_reply target="Wolfycz">被引用的原文</cm_reply>' in out[0]["content"]
-    assert "回复内容" in out[0]["content"]
-    # snapshot
-    rec2 = _rec(content="x", relation={"v": 1, "mentions": [], "reply": {
-        "resolution": "snapshot", "target_nickname": "虾仁粽子",
-        "fallback_text": "快照原文"}})
-    out2 = p._takeover_normalize([rec2], _UMO_GROUP)
-    assert '<cm_reply target="虾仁粽子">快照原文</cm_reply>' in out2[0]["content"]
-    # 全空降级：昵称与原文都缺失 → 不泄露账号，仅中性未知成员标记
-    rec3 = _rec(content="y", relation={"v": 1, "mentions": [], "reply": {}})
-    out3 = p._takeover_normalize([rec3], _UMO_GROUP)
-    assert '<cm_reply target="未知成员"/>' in out3[0]["content"]
-    print("[T12] apply_relation_reply ✓")
-
-
-def test_reply_target_hides_user_id():
-    """Reply 目标昵称缺失时不回退 user_id：账号 ID 不进入 LLM 上下文。"""
-    p = _make_plugin()
-    target = {"sender_nickname": "", "content": "被引用的原文", "user_id": "10001"}
-    rec = _rec(content="回复内容", user_id="u1",
-               relation={"v": 1, "mentions": [], "reply": {
-                   "resolution": "turn", "target_turn_id": "turn_1",
-                   "target_role": "user"}})
-    out = p._takeover_normalize(
-        [rec], _UMO_GROUP,
-        target_map={("turn_1", "user"): target},
-    )
-    content = out[0]["content"]
-    assert '<cm_reply target="未知成员">被引用的原文</cm_reply>' in content
-    assert "10001" not in content
-    print("[T32] reply_target_hides_user_id ✓")
+    print("[T05] solo_assistant_prefix ✓")
 
 
 def test_cross_session_source_tags():
@@ -573,27 +373,90 @@ def test_cross_session_source_tags():
     out2 = p._takeover_normalize(records, _UMO_GROUP, current_user_id="u1",
                                  full_group=True)
     assert '<cm_source n="' not in "\n".join(c["content"] for c in out2)
-    print("[T13] cross_session_source_tags ✓")
+    print("[T06] cross_session_source_tags ✓")
 
 
-def test_cross_session_reply_uses_record_umo():
-    """跨会话历史 Reply 按原消息 UMO 回填，不拿当前群 UMO 查询。"""
+def test_normalize_split_keeps_order_and_head_tail():
+    """拆分模式：相邻同 role 不合并；头部孤儿/尾部 proactive 均保留不 pop。"""
     p = _make_plugin()
-    p.ct_cross_session = True
-    p.ct_full_group = False
 
+    # 小节：相邻同 role 不合并，每条独立带各自时间/昵称
+    records = [
+        _rec(content="第一段", created_at="2026-07-09 10:00:00"),
+        _rec(content="第二段", nickname="Bob", created_at="2026-07-09 10:00:03"),
+        _rec(role="assistant", content="回复", created_at="2026-07-09 10:00:05"),
+    ]
+    out = p._takeover_normalize(records, _UMO_GROUP)
+    assert len(out) == 3
+    assert ("<cm_time>07/09 10:00:00</cm_time> "
+            "<cm_nickname>Alice</cm_nickname> 第一段") in out[0]["content"]
+    assert ("<cm_time>07/09 10:00:03</cm_time> "
+            "<cm_nickname>Bob</cm_nickname> 第二段") in out[1]["content"]
+    assert "回复" in out[2]["content"]
+
+    # 小节：头部孤儿/尾部 proactive 均保留，proactive 独立带标记
+    records2 = [
+        _rec(role="assistant", content="头部孤儿", created_at="2026-07-09 09:00:00"),
+        _rec(content="中间用户", created_at="2026-07-09 10:00:00"),
+        _rec(role="assistant", content="配对回复", created_at="2026-07-09 10:00:05"),
+        _rec(role="assistant", content="尾部主动", status="proactive",
+             created_at="2026-07-09 10:01:00"),
+    ]
+    out2 = p._takeover_normalize(records2, _UMO_GROUP)
+    assert len(out2) == 4
+    joined = "\n".join(c["content"] for c in out2)
+    assert "头部孤儿" in joined
+    assert "中间用户" in joined
+    assert "配对回复" in joined
+    assert "尾部主动" in joined
+    assert '<cm_solo active="1"/>' in joined
+    print("[T07] normalize_split_keeps_order_and_head_tail ✓")
+
+
+def test_reply_restoration():
+    """Reply 还原：turn/snapshot/降级三态；昵称缺失不回退 user_id；跨会话用原 UMO 查询。"""
+    p = _make_plugin()
+
+    # 小节：turn 命中 / snapshot / 全空降级
+    target_map = {("turn_1", "user"): {
+        "sender_nickname": "Wolfycz", "content": "被引用的原文"}}
+    rec = _rec(content="回复内容", relation={"v": 1, "mentions": [], "reply": {
+        "resolution": "turn", "target_turn_id": "turn_1", "target_role": "user"}})
+    out = p._takeover_normalize([rec], _UMO_GROUP, target_map=target_map)
+    assert '<cm_reply target="Wolfycz">被引用的原文</cm_reply>' in out[0]["content"]
+    assert "回复内容" in out[0]["content"]
+
+    rec2 = _rec(content="x", relation={"v": 1, "mentions": [], "reply": {
+        "resolution": "snapshot", "target_nickname": "虾仁粽子",
+        "fallback_text": "快照原文"}})
+    out2 = p._takeover_normalize([rec2], _UMO_GROUP)
+    assert '<cm_reply target="虾仁粽子">快照原文</cm_reply>' in out2[0]["content"]
+
+    rec3 = _rec(content="y", relation={"v": 1, "mentions": [], "reply": {}})
+    out3 = p._takeover_normalize([rec3], _UMO_GROUP)
+    assert '<cm_reply target="未知成员"/>' in out3[0]["content"]
+
+    # 小节：目标昵称缺失不回退 user_id（账号 ID 不进上下文）
+    target = {"sender_nickname": "", "content": "被引用的原文", "user_id": "10001"}
+    rec4 = _rec(content="回复内容", user_id="u1",
+                relation={"v": 1, "mentions": [], "reply": {
+                    "resolution": "turn", "target_turn_id": "turn_1",
+                    "target_role": "user"}})
+    out4 = p._takeover_normalize(
+        [rec4], _UMO_GROUP, target_map={("turn_1", "user"): target})
+    assert '<cm_reply target="未知成员">被引用的原文</cm_reply>' in out4[0]["content"]
+    assert "10001" not in out4[0]["content"]
+
+    # 小节：跨会话历史 Reply 按原消息 UMO 回填，不拿当前群 UMO 查询
+    p.ct_cross_session = True
     source_umo = "aiocqhttp:GroupMessage:g2"
     replied_user = _rec(
         content="群2里的回复",
         relation={"v": 1, "mentions": [], "reply": {
-            "resolution": "turn",
-            "target_turn_id": "turn_g2_target",
-            "target_role": "user",
-        }},
-        platform_id="aiocqhttp",
-        message_type="GroupMessage",
-        session_id="g2",
-        group_id="g2",
+            "resolution": "turn", "target_turn_id": "turn_g2_target",
+            "target_role": "user"}},
+        platform_id="aiocqhttp", message_type="GroupMessage",
+        session_id="g2", group_id="g2",
     )
 
     class _ReplyDB(_FakeDB):
@@ -611,42 +474,154 @@ def test_cross_session_reply_uses_record_umo():
 
     db = _ReplyDB()
     p.db = db
-    out = asyncio.run(p.build_takeover_contexts(
+    out5 = asyncio.run(p.build_takeover_contexts(
         _UMO_GROUP, "u1", "cid_demo",
     ))
     assert db.target_calls == [(source_umo, ["turn_g2_target"])]
-    assert '<cm_reply target="Bob">群2被引用原文</cm_reply>' in out[0]["content"]
-    print("[T31] cross_session_reply_uses_record_umo ✓")
+    assert '<cm_reply target="Bob">群2被引用原文</cm_reply>' in out5[0]["content"]
+    print("[T08] reply_restoration ✓")
+
+
+def test_strip_think_and_legacy_prefixes():
+    """think 前缀与旧版 source 前缀剥离：纯函数 + normalize 注入路径。"""
+    # 小节：剥离 AstrBot 序列化进 Plain 的 think 前缀
+    f = context_builder_mod.strip_reasoning_prefix
+    src = "[{'type': 'think', 'content': '内部推理', 'encrypted': None}]实际回复"
+    assert f(src) == "实际回复"
+    assert f("普通文本") == "普通文本"
+    assert f("[{'type': 'think'") == "[{'type': 'think'"  # 不完整前缀原样
+
+    # 小节：清理旧版 CM 注入到 assistant 开头的 [群N]/[私N]/[会N]/[未知] 标签
+    g = context_builder_mod.strip_legacy_assistant_source_prefix
+    assert g("[群1] 你好") == "你好"
+    assert g("[私1][会2] 你好") == "你好"
+    assert g("[未知] 你好") == "你好"
+    assert g("[群1] 中间[群2] 保留") == "中间[群2] 保留"  # 只清开头
+    assert g("无标签") == "无标签"
+
+    # 小节：_takeover_normalize 注入时剥离老库已存的 think 前缀
+    p = _make_plugin()
+    records = [
+        _rec(content="你好"),
+        _rec(role="assistant",
+             content="[{'type': 'think', 'content': '推理', 'encrypted': None}]实际回复",
+             created_at="2026-07-09 10:00:05"),
+    ]
+    out = p._takeover_normalize(records, _UMO_GROUP)
+    assert out[0]["content"] == (
+        "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 你好"
+    )
+    assert out[1]["content"] == "<cm_time>07/09 10:00:05</cm_time> 实际回复"
+    print("[T09] strip_think_and_legacy_prefixes ✓")
+
+
+def test_character_budget_keeps_latest_user():
+    """字符预算：normalize 层与接管 API 均保留最新 user 起点，避免 assistant 开头。"""
+    p = _make_plugin()
+
+    # 小节：normalize 层裁剪，保留最新 user
+    records = [
+        _rec(content="长" * 100, created_at="2026-07-09 09:00:00"),
+        _rec(role="assistant", content="中" * 100, created_at="2026-07-09 09:01:00"),
+        _rec(content="最新用户", nickname="Bob", created_at="2026-07-09 10:00:00"),
+    ]
+    out = p._takeover_normalize(records, _UMO_GROUP, max_chars=120)
+    assert out[0]["role"] == "user"
+    assert out[-1]["content"].startswith(
+        "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Bob</cm_nickname> 最新用户"
+    )
+
+    # 小节：接管 API 跨多轮裁剪，同样保留最新完整 user 起点
+    p.ct_max_context_chars = 60
+    p.db = _FakeDB(rounds=[
+        [_rec(content="长" * 30, created_at="2026-07-09 08:00:00"),
+         _rec(role="assistant", content="回1", created_at="2026-07-09 08:00:05")],
+        [_rec(content="长" * 30, nickname="Bob", created_at="2026-07-09 09:00:00"),
+         _rec(role="assistant", content="回2", created_at="2026-07-09 09:00:05")],
+        [_rec(content="最新", created_at="2026-07-09 10:00:00")],
+    ])
+    out2 = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert len(out2) == 1
+    assert out2[0]["content"].startswith(
+        "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 最新"
+    )
+    print("[T10] character_budget_keeps_latest_user ✓")
+
+
+def test_media_placeholder_render_and_cleanup():
+    """媒体占位渲染（纯媒体/混合/变体）+ 输出清洗（方括号占位字面）。"""
+    p = _make_plugin()
+
+    # 小节：纯媒体以 cm 标签保留；图文混合在文本后补标签
+    records = [
+        _rec(content="", kinds=["image"]),
+        _rec(content="带图文字", kinds=["image", "text"], nickname="Bob",
+             created_at="2026-07-09 10:00:03"),
+    ]
+    out = p._takeover_normalize(records, _UMO_GROUP)
+    assert len(out) == 2
+    assert out[0]["content"].endswith("<cm_image/>")
+    assert "带图文字 <cm_image/>" in out[1]["content"]
+
+    # 小节：占位细节（solo 纯图 / 多 kind / 旧英文占位 / 已含标签不重复 / 无媒体原样）
+    records2 = [
+        _rec(role="assistant", content="[image]", status="proactive",
+             kinds=["image"], created_at="2026-08-18 04:04:02"),
+        _rec(content="", kinds=["image", "voice"], created_at="2026-08-18 04:05:00"),
+        _rec(content="[poke]", kinds=["poke"], created_at="2026-08-18 04:05:30"),
+        _rec(content="看图 <cm_image/>", kinds=["text", "image"],
+             created_at="2026-08-18 04:06:00"),
+        _rec(content="普通文本", kinds=["text"], created_at="2026-08-18 04:07:00"),
+    ]
+    out2 = p._takeover_normalize(records2, _UMO_GROUP)
+    joined = "\n".join(c["content"] for c in out2)
+    assert '<cm_solo active="1"/> <cm_image/>' in joined
+    assert "<cm_image/> <cm_voice/>" in joined
+    assert "<cm_poke/>" in joined
+    assert "看图 <cm_image/>" in joined
+    assert "看图 <cm_image/> <cm_image/>" not in joined
+    assert "普通文本" in joined
+    assert "普通文本 <cm_" not in joined
+
+    # 小节：LLM 回复中模仿的方括号占位字面清洗为裸词
+    f = context_builder_mod.strip_bracket_media_placeholders
+    assert f("好的 [图片]") == "好的 图片"
+    assert f("发你 [语音] 和 [文件]") == "发你 语音 和 文件"
+    assert f("[image] [video]") == "图片 视频"
+    assert f("转发 [forward]") == "转发 转发消息"
+    assert f("普通回复，含 [自定义] 标签") == "普通回复，含 [自定义] 标签"
+    assert f("") == ""
+    assert f(None) == ""
+    print("[T11] media_placeholder_render_and_cleanup ✓")
 
 
 # ── 测试用例：relation_codec ─────────────────────────
 
 
-def test_render_content_template_at():
-    """At token → <cm_mention target="昵称"/>；越界 → 未知成员；原样文本不渲染。"""
+def test_relation_codec_render_and_tokens():
+    """At token 渲染（越界/转义/原样）+ token 编解码与截断（不切半 token）。"""
     r = relation_codec_mod
+
+    # 小节：At token 渲染
     rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "虾仁粽子"}],
            "reply": None}
-    assert r.render_content_template("⟦CM_AT:0⟧在干嘛", rel) == '<cm_mention target="虾仁粽子"/>在干嘛'
-    assert r.render_content_template("⟦CM_AT:9⟧越界", rel) == '<cm_mention target="未知成员"/>越界'
+    assert (r.render_content_template("⟦CM_AT:0⟧在干嘛", rel)
+            == '<cm_mention target="虾仁粽子"/>在干嘛')
+    assert (r.render_content_template("⟦CM_AT:9⟧越界", rel)
+            == '<cm_mention target="未知成员"/>越界')
     assert r.render_content_template("⦑CM_AT:0⦒原文", rel) == "⟦CM_AT:0⟧原文"
     assert r.render_content_template("无 token", None) == "无 token"
-    print("[T14] render_content_template_at ✓")
 
-
-def test_relation_codec_tokens():
-    """token 编解码与截断：转义、截断不切半 token。"""
-    r = relation_codec_mod
+    # 小节：token 编解码与截断
     assert r.escape_plain_text("⟦CM_AT:0⟧") == "⦑CM_AT:0⦒"
     assert r.at_token(0) == "⟦CM_AT:0⟧"
     assert r.truncate_reply_snapshot("短") == "短"
     long_t = "长" * 500
     assert len(r.truncate_reply_snapshot(long_t)) <= 300
-    # 截断 content 不留下半个 At token
     tmpl = "前" + "⟦CM_AT:0⟧" + "后"
     cut = r.truncate_content_template(tmpl, 1)
     assert "⟦CM_AT:" not in cut or cut.endswith("⟧")
-    print("[T15] relation_codec_tokens ✓")
+    print("[T12] relation_codec_render_and_tokens ✓")
 
 
 def test_build_current_turn_xml():
@@ -672,7 +647,38 @@ def test_build_current_turn_xml():
     assert '<cm_mention target="Alice &amp; &lt;A&gt;"/>' in xml2
     assert '<cm_mention target="assistant"/>' in xml2  # bot 命中 self_id → assistant
     assert "10002" not in xml2 and "bot_demo" not in xml2
-    print("[T16] build_current_turn_xml ✓")
+    print("[T13] build_current_turn_xml ✓")
+
+
+def test_codec_escape_sentinel_and_truncate_fragment():
+    """单级哨兵转义：任意含 ⟦ 的输入双射；截断不残留 ⟦ 残片。"""
+    codec = sys.modules["chat_memory.relation_codec"]
+
+    # 用户输入 ⟦⟧ → 哨兵对，展示侧还原回 ⟦⟧
+    escaped = codec.escape_plain_text("看⟦CM_AT:0⟧这个")
+    assert escaped == "看⦑CM_AT:0⦒这个"
+    assert codec.unescape_plain_text(escaped) == "看⟦CM_AT:0⟧这个"
+
+    # 任意含 ⟦/⟧ 的字面输入（含内部形态 ⟦CM_LITERAL_* 等）均双射
+    for text in (
+        "⟦CM_LITERAL_IMAGE:3⟧",
+        "x⟦CM_LITERAL2_⟧y",
+        "⟦⟧",
+        "前⟦CM_AT:0⟧后⟦CM_POKE:1⟧",
+        "只有右括号⟧",
+    ):
+        assert codec.unescape_plain_text(codec.escape_plain_text(text)) == text
+
+    # 截断落在 token 前缀中间：剥掉未闭合的 ⟦ 残片
+    template = "一二三四五⟦CM_IMAGE:0⟧尾巴"
+    assert "⟦" not in codec.truncate_content_template(template, 8)
+    assert "⟦" not in codec.truncate_content_template(template, 12)
+    assert codec.truncate_content_template(template, 8) == "一二三四五"
+
+    # 手造/损坏数据里的裸 ⟦ 不得被误剥（仅剥离疑似 token 前缀形态）
+    assert codec.truncate_content_template("⟦你好啊再见", 4) == "⟦你好啊"
+    assert codec.truncate_content_template("你好⟦世界再见啊", 7) == "你好⟦世界再见"
+    print("[T14] codec_escape_sentinel_and_truncate_fragment ✓")
 
 
 # ── 测试用例：message_classifier ─────────────────────
@@ -691,11 +697,12 @@ def _mk_event(components, message_str="", message_type_value=None):
     return _E()
 
 
-def test_classify_content_extraction():
-    """组件提取：纯图 / At+文本 / 纯 At / Reply / Forward / 混合 kind。"""
+def test_classify_content():
+    """内容分类：组件提取 / message_str 回退 / assistant 链。"""
     components = sys.modules["astrbot.api.message_components"]
     p = _make_plugin()
 
+    # 小节：组件提取（纯图 / At+文本 / 纯 At / Reply / Forward / 混合 kind）
     img = components.Image()
     kind, at, rep, fwd = p._classify_content(_mk_event([img]))
     assert kind == ["image"] and at is None and rep is None and fwd is None
@@ -719,405 +726,55 @@ def test_classify_content_extraction():
     pl3 = components.Plain(); pl3.text = "看图听话"
     kind, _, _, _ = p._classify_content(_mk_event([img2, vc, pl3]))
     assert kind == ["image", "voice", "text"]
-    print("[T17] classify_content_extraction ✓")
 
-
-def test_classify_content_message_str_fallback():
-    """chain 无文本时回退 event.message_str 补 text。"""
-    p = _make_plugin()
+    # 小节：chain 无文本时回退 message_str；有 Plain 不走回退；全空保持 []
     kind, _, _, _ = p._classify_content(_mk_event([], message_str="你好啊"))
     assert kind == ["text"]
-    # chain 有 Plain 时不走回退
-    components = sys.modules["astrbot.api.message_components"]
-    pl = components.Plain(); pl.text = "hello"
-    kind, _, _, _ = p._classify_content(_mk_event([pl], message_str=""))
+    pl4 = components.Plain(); pl4.text = "hello"
+    kind, _, _, _ = p._classify_content(_mk_event([pl4], message_str=""))
     assert kind == ["text"]
-    # 全空保持 []
     kind, _, _, _ = p._classify_content(_mk_event([], message_str=""))
     assert kind == []
-    print("[T18] classify_content_message_str_fallback ✓")
 
-
-def test_classify_assistant_chain():
-    """assistant 组件链分类：纯文本 / 图片+文本。"""
-    components = sys.modules["astrbot.api.message_components"]
-    p = _make_plugin()
-
-    pl = components.Plain(); pl.text = "回复正文"
-    kind, text = p._classify_assistant_chain([pl])
+    # 小节：assistant 组件链分类（纯文本 / 图片+文本 / 空链）
+    pl5 = components.Plain(); pl5.text = "回复正文"
+    kind, text = p._classify_assistant_chain([pl5])
     assert kind == ["text"] and text == "回复正文"
 
-    img = components.Image()
-    pl2 = components.Plain(); pl2.text = "带图"
-    kind, text = p._classify_assistant_chain([img, pl2])
+    img3 = components.Image()
+    pl6 = components.Plain(); pl6.text = "带图"
+    kind, text = p._classify_assistant_chain([img3, pl6])
     assert kind == ["image", "text"] and text == "带图"
 
     kind, text = p._classify_assistant_chain([])
     assert kind == [] and text == ""
-    print("[T19] classify_assistant_chain ✓")
+    print("[T15] classify_content ✓")
 
 
-# ── 测试用例：storage 纯函数 ─────────────────────────
-
-
-def test_scope_filter_matrix():
-    """_scope_filter 4 组合 + 空 user_id 边界。"""
-    sf = storage_mod._scope_filter
-    umo, uid = "aiocqhttp:GroupMessage:g1", "u1"
-
-    cond, params = sf(umo, uid, False, False)
-    assert cond == "umo = :scope_umo AND user_id = :scope_uid"
-    assert params == {"scope_umo": umo, "scope_uid": uid}
-
-    cond, params = sf(umo, uid, True, False)
-    assert "platform_id = :scope_pid" in cond and "user_id = :scope_uid" in cond
-
-    cond, params = sf(umo, uid, False, True)
-    assert cond == "umo = :scope_umo" and params == {"scope_umo": umo}
-
-    cond, _ = sf(umo, uid, True, True)
-    assert "umo = :scope_umo" in cond and "platform_id = :scope_pid" in cond
-
-    # 空 user_id：整群可降级，否则恒假
-    assert sf(umo, "", True, False) == ("1 = 0", {})
-    cond, params = sf(umo, "", False, True)
-    assert cond == "umo = :scope_umo"
-    print("[T20] scope_filter_matrix ✓")
-
-
-def test_normalize_dt():
-    """datetime 归一化：None 透传 / naive 原样 / aware 转 UTC naive。"""
-    from datetime import datetime, timezone
-    nd = storage_mod._normalize_dt
-    assert nd(None) is None
-    naive = datetime(2026, 7, 9, 2, 0, 0)
-    assert nd(naive) == naive
-    aware = datetime(2026, 7, 9, 2, 0, 0, tzinfo=timezone.utc)
-    assert nd(aware).tzinfo is None
-    print("[T21] normalize_dt ✓")
-
-
-def test_row_to_dict_mapping():
-    """_row_to_dict：字段映射 + content 渲染 + created_at/UTC。"""
-    from datetime import datetime, timezone
-    r = (
-        "user", "⟦CM_AT:0⟧在干嘛", "u1", "m1", "p1", "llm_success",
-        '["text"]', "aiocqhttp", "cq", "GroupMessage", "g1", "s1",
-        "g1", "Alice", 0, "at1", "rep1", "fwd1", "", "2026-07-09 02:00:00",
-        "turn_1", "", None, 42,
+def test_unknown_text_and_assistant_poke():
+    """Unknown 组件文本提取；assistant 链识别戳一戳。"""
+    c = classifier_mod
+    Plain, Poke, Unknown = (
+        sys.modules["astrbot.api.message_components"].Plain,
+        sys.modules["astrbot.api.message_components"].Poke,
+        sys.modules["astrbot.api.message_components"].Unknown,
     )
-    rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "虾仁粽子"}],
-           "reply": None}
-    r_with_rel = list(r)
-    r_with_rel[1] = "⟦CM_AT:0⟧在干嘛"
-    r_with_rel[22] = json.dumps(rel, ensure_ascii=False)
-    d = storage_mod._row_to_dict(tuple(r_with_rel))
-    assert d["role"] == "user"
-    assert d["content"] == '<cm_mention target="虾仁粽子"/>在干嘛'   # relation 渲染
-    assert d["content_template"] == "⟦CM_AT:0⟧在干嘛"
-    assert d["user_id"] == "u1" and d["message_id"] == "m1"
-    assert d["content_kind"] == ["text"]
-    assert d["relation_data"]["v"] == 1
-    assert d["record_id"] == 42
-    # tz 输出
-    tz = timezone.utc
-    d2 = storage_mod._row_to_dict(tuple(r), tz)
-    assert d2["created_at_utc"].endswith("Z")
-    print("[T22] row_to_dict_mapping ✓")
+    unk = Unknown(); unk.text = "平台未知段文本"
 
+    class _Ev:
+        message_str = ""
 
-# ── 测试用例：main 指令与接管策略 ────────────────────
+        def get_messages(self):
+            return [unk]
 
+        def get_message_type(self):
+            return types.SimpleNamespace(value="GroupMessage")
 
-class _EventStub:
-    """最小 event 桩：extras 与事件级属性，供 main 钩子方法测试。"""
-
-    def __init__(self, extras=None, umo=_UMO_GROUP, sender="u1"):
-        self._extras = dict(extras or {})
-        self.unified_msg_origin = umo
-        self._sender = sender
-
-    def get_extra(self, key, default=None):
-        return self._extras.get(key, default)
-
-    def set_extra(self, key, value):
-        self._extras[key] = value
-
-    def get_sender_id(self):
-        return self._sender
-
-
-def test_mark_llm_triggered_idempotent():
-    """同一事件多次 LLM 调用（tool loop）只升级一次 llm_status，避免重复 DB 写。"""
-    p = _make_plugin()
-    updates = []
-
-    async def fake_update(umo, cid, turn_id, status):
-        updates.append((turn_id, status))
-        return 1
-
-    p._safe_update_llm_status_by_turn = fake_update
-    event = _EventStub(extras={
-        "chat_memory_captured": True,
-        "chat_memory_cid": "cid_demo",
-        "chat_memory_turn_id": "turn_x",
-    })
-    req = types.SimpleNamespace()
-    for _ in range(3):
-        asyncio.run(p.mark_llm_triggered(event, req))
-    assert updates == [("turn_x", "llm_pending")]
-    assert event.get_extra("chat_memory_llm_triggered") is True
-    print("[T34] mark_llm_triggered_idempotent ✓")
-
-
-def test_takeover_reuses_cached_persona():
-    """filter_by_persona 复用 capture_user 缓存的 persona，不重复解析；缺失时兜底解析。"""
-    p = _make_plugin()
-    p.ct_filter_by_persona = True
-    p.ct_clear_native_history = True
-    resolved = []
-
-    async def fake_effective(umo, event, cid):
-        resolved.append(cid)
-        return "p_resolved"
-
-    p._get_effective_persona = fake_effective
-    seen = {}
-
-    async def fake_build(umo=None, user_id=None, conversation_id=None,
-                         persona_id="", exclude_turn_id=""):
-        seen["persona_id"] = persona_id
-        return [{"role": "user", "content": "x"}]
-
-    p.build_takeover_contexts = fake_build
-
-    async def fake_reset_history(umo, cid):
-        return None
-
-    p._safe_reset_history = fake_reset_history
-
-    async def fake_cid(umo):
-        return "cid_demo"
-
-    p._get_curr_cid = fake_cid
-
-    # 已缓存：不触发解析
-    event = _EventStub(extras={"chat_memory_persona_id": "p1",
-                               "chat_memory_turn_id": "turn_x"})
-    req = types.SimpleNamespace(system_prompt="", contexts=[], extra_user_content_parts=[])
-    asyncio.run(p.take_over_context(event, req))
-    assert resolved == []
-    assert seen.get("persona_id") == "p1"
-    assert req.contexts == [{"role": "user", "content": "x"}]
-    assert event.get_extra("chat_memory_takeover_applied") is True
-
-    # 未缓存：兜底解析一次
-    event2 = _EventStub(extras={"chat_memory_turn_id": "turn_y"})
-    req2 = types.SimpleNamespace(system_prompt="", contexts=[], extra_user_content_parts=[])
-    asyncio.run(p.take_over_context(event2, req2))
-    assert resolved == ["cid_demo"]
-    assert seen.get("persona_id") == "p_resolved"
-    print("[T35] takeover_reuses_cached_persona ✓")
-
-
-def test_build_tool_contexts_and_result_text():
-    """方案 B：工具记录渲染成 OpenAI 格式；结果提取只取文本、图片用占位符。"""
-    p = _make_plugin()
-    records = [
-        {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
-         "tool_args": '{"prompt": "猫"}', "tool_result": "任务 x 已创建，不要再次调用"},
-        {"turn_id": "turn_a", "call_index": 2, "tool_name": "query",
-         "tool_args": "{}", "tool_result": "运行中：任务 x"},
-        {"turn_id": "turn_b", "call_index": 1, "tool_name": "draw",
-         "tool_args": '{"prompt": "狗"}', "tool_result": "第二任务已创建"},
-    ]
-    out = p._build_tool_contexts(records)
-    assert [m["role"] for m in out] == ["assistant", "tool", "tool", "assistant", "tool"]
-    # 每轮一条 assistant(tool_calls)，N 条 role=tool，id 自造且成对
-    assert [c["id"] for c in out[0]["tool_calls"]] == ["cm_tool_turn_a_0", "cm_tool_turn_a_1"]
-    assert [c["function"]["name"] for c in out[0]["tool_calls"]] == ["draw", "query"]
-    assert out[1]["tool_call_id"] == "cm_tool_turn_a_0"
-    assert out[2]["tool_call_id"] == "cm_tool_turn_a_1"
-    assert out[2]["content"] == "运行中：任务 x"
-    assert out[3]["tool_calls"][0]["id"] == "cm_tool_turn_b_0"
-    assert out[4]["tool_call_id"] == "cm_tool_turn_b_0"
-    assert out[0]["content"] is None
-
-    # 结果提取：TextContent 文本、图片占位、structured、isError、None
-    class _Text:
-        text = "完成"
-    class _Image:
-        data = "base64secret"
-    class _ResText:
-        resource = types.SimpleNamespace(text="资源文本")
-    class _ResBlob:
-        resource = types.SimpleNamespace()
-    class _Res:
-        content = [_Text(), _Image(), _ResText(), _ResBlob()]
-        structuredContent = {"task": "x"}
-        isError = False
-    text = p._tool_result_to_text(_Res())
-    assert "完成" in text and "[image content]" in text and "资源文本" in text
-    assert "base64secret" not in text
-    assert '{"task": "x"}' in text
-    assert p._tool_result_to_text(None) == ""
-    _Res.isError = True
-    assert p._tool_result_to_text(_Res()).startswith("[error]")
-    _Res.isError = False
-
-    # 参数截断保 JSON 合法；0/未超限不截断
-    assert p._truncate_tool_args('{"a": 1}', 50) == '{"a": 1}'
-    assert p._truncate_tool_args('{"a": 1}', 3) == '{"_cm_truncated": true}'
-    assert p._truncate_tool_args("x" * 100, 0) == "x" * 100
-    print("[T36] build_tool_contexts_and_result_text ✓")
-
-
-def test_capture_tool_writes_db():
-    """on_llm_tool_respond：按轮次落库，(turn_id, call_index) 递增，文本截断。"""
-    p = _make_plugin()
-    p.db = _FakeDB()
-    p.max_len = 10
-
-    async def fake_cid(umo):
-        return "cid_demo"
-
-    p._get_curr_cid = fake_cid
-
-    class _Tool:
-        name = "draw"
-
-    class _Result:
-        content = [types.SimpleNamespace(text="任务 x 已创建，不要再次调用")]
-        structuredContent = None
-        isError = False
-
-    event = _EventStub(extras={"chat_memory_turn_id": "turn_x",
-                               "chat_memory_cid": "cid_demo"})
-    for _ in range(2):
-        asyncio.run(p.capture_tool(event, _Tool(), {"prompt": "猫"}, _Result()))
-    assert len(p.db.inserted_tools) == 2
-    row = p.db.inserted_tools[1]
-    assert row["turn_id"] == "turn_x"
-    assert row["call_index"] == 2
-    assert row["tool_name"] == "draw"
-    # max_len=10：args 超限被替换为合法 JSON 占位；result 按字符截断
-    assert row["tool_args"] == '{"_cm_truncated": true}'
-    assert row["tool_result"] == "任务 x 已创建，不要再次调用"[:10]
-
-    # 主动消息无 turn_id：自造并复用；无 cid 时跳过
-    event2 = _EventStub(extras={})
-
-    async def fake_cid_none(umo):
-        return ""
-
-    p._get_curr_cid = fake_cid_none
-    before = len(p.db.inserted_tools)
-    asyncio.run(p.capture_tool(event2, _Tool(), None, None))
-    assert len(p.db.inserted_tools) == before
-    print("[T37] capture_tool_writes_db ✓")
-
-
-def test_takeover_replays_tool_contexts():
-    """接管/公开 API：工具段插入对应轮次内部；CM 无历史时仅工具段也返回。"""
-    p = _make_plugin()
-    p.ct_keep_tool_turns = 2
-    p.db = _FakeDB(rounds=[[
-        _rec(turn_id="turn_a"),
-        _rec(role="assistant", content="好的,正在绘制", turn_id="turn_a"),
-    ]])
-    p.db.tool_records = [
-        {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
-         "tool_args": "{}", "tool_result": "任务 x 已创建"},
-    ]
-    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    # [user, assistant(tool_calls), tool, assistant 最终回复] — 工具段在轮内
-    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
-    assert out[1]["tool_calls"][0]["id"] == "cm_tool_turn_a_0"
-    assert out[2]["tool_call_id"] == "cm_tool_turn_a_0"
-    assert "任务 x 已创建" in out[2]["content"]
-    assert "好的,正在绘制" in out[3]["content"]
-    assert p.db.tool_query_kwargs == {"umo": _UMO_GROUP, "cid": "cid_demo",
-                                      "turn_limit": 2}
-    # 输出不含私有定位键
-    assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in out)
-
-    # 工具段 turn 在历史中无匹配（如轮次已滑出窗口/主动消息自造轮次）：直接丢弃
-    p_tail = _make_plugin()
-    p_tail.db = _FakeDB(rounds=[[_rec(turn_id="turn_other"),
-                                 _rec(role="assistant", content="回复", turn_id="turn_other")]])
-    p_tail.db.tool_records = list(p.db.tool_records)
-    out_tail = asyncio.run(p_tail.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert [m["role"] for m in out_tail] == ["user", "assistant"]
-    assert not any("cm_tool" in str(m) for m in out_tail)
-
-    # CM 无历史：无轮次可跟随，工具段同样不回放
-    p2 = _make_plugin()
-    p2.db = _FakeDB(rounds=[])
-    p2.db.tool_records = list(p.db.tool_records)
-    out2 = asyncio.run(p2.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert out2 == []
-
-    # 两者都无：仍为 []
-    p3 = _make_plugin()
-    p3.db = _FakeDB(rounds=[])
-    assert asyncio.run(p3.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo")) == []
-    print("[T38] takeover_replays_tool_contexts ✓")
-
-
-def test_insert_tool_contexts_positions():
-    """_insert_tool_contexts：插到该轮 user 后；单边轮插 assistant 前；无匹配回退尾部。"""
-    p = _make_plugin()
-    f = p._insert_tool_contexts
-
-    def tool_seg(turn, name="draw"):
-        return [
-            {"role": "assistant", "content": None,
-             "tool_calls": [{"id": f"c_{turn}", "type": "function",
-                             "function": {"name": name, "arguments": "{}"}}],
-             "_cm_tool_turn": turn},
-            {"role": "tool", "tool_call_id": f"c_{turn}", "content": "ok",
-             "_cm_tool_turn": turn},
-        ]
-
-    history = [
-        {"role": "user", "content": "a", "_turn_id": "t1"},
-        {"role": "assistant", "content": "A", "_turn_id": "t1"},
-        {"role": "user", "content": "b", "_turn_id": "t2"},
-        {"role": "assistant", "content": "B", "_turn_id": "t2"},
-    ]
-    out = f(history, tool_seg("t2") + tool_seg("t1"))
-    assert [m["role"] for m in out] == [
-        "user", "assistant", "tool", "assistant",   # t1 段插在 user a 后
-        "user", "assistant", "tool", "assistant",   # t2 段插在 user b 后
-    ]
-    assert out[1]["tool_calls"][0]["id"] == "c_t1"
-    assert out[5]["tool_calls"][0]["id"] == "c_t2"
-    # 单边 assistant 轮：插在其前
-    out2 = f([{"role": "assistant", "content": "solo", "_turn_id": "t3"}],
-             tool_seg("t3"))
-    assert [m["role"] for m in out2] == ["assistant", "tool", "assistant"]
-    # 无匹配 turn：段直接丢弃（不存在的轮次不配拥有工具上下文）
-    out3 = f([{"role": "user", "content": "x", "_turn_id": "t9"}],
-             tool_seg("tX"))
-    assert [m["role"] for m in out3] == ["user"]
-    # 私有定位键全部剥除
-    for produced in (out, out2, out3):
-        assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in produced)
-    print("[T42] insert_tool_contexts_positions ✓")
-
-
-def test_keep_tool_turns_zero_disables_replay():
-    """keep_tool_turns=0：不回放工具段，也不查工具表。"""
-    p = _make_plugin()
-    p.ct_keep_tool_turns = 0
-    p.db = _FakeDB(rounds=[[_rec(turn_id="turn_a"),
-                            _rec(role="assistant", content="回复", turn_id="turn_a")]])
-    p.db.tool_records = [{"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
-                          "tool_args": "{}", "tool_result": "x"}]
-    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert [m["role"] for m in out] == ["user", "assistant"]
-    assert not p.db.tool_query_kwargs  # 未查询工具表
-    print("[T44] keep_tool_turns_zero_disables_replay ✓")
+    assert c.classify_content(_Ev())[0] == ["text"]
+    poke = Poke()
+    kind2, text2 = c.classify_assistant_chain([poke])
+    assert kind2 == ["poke"] and text2 == ""
+    print("[T16] unknown_text_and_assistant_poke ✓")
 
 
 def test_media_position_tokens_and_ids():
@@ -1196,67 +853,7 @@ def test_media_position_tokens_and_ids():
     template4, relation4 = classifier_mod.build_relation_seed(_EvPoke())
     assert template4 == ""
     assert relation4["media"][0]["id"] == "456"
-    print("[T45] media_position_tokens_and_ids ✓")
-
-
-def test_system_event_summary_and_notice_kind():
-    """notice/request 空消息归类 system_event 并生成可读摘要(不写成 text)。"""
-    c = classifier_mod
-
-    class _Obj:
-        pass
-
-    class _Ev:
-        def __init__(self, raw=None, mtype="GroupMessage"):
-            self._raw = raw
-            self.message_str = ""
-            self.message_obj = None
-            if raw is not None:
-                self.message_obj = _Obj()
-                self.message_obj.raw_message = raw
-            self._mtype = mtype
-
-        def get_messages(self):
-            return []
-
-        def get_message_type(self):
-            return types.SimpleNamespace(value=self._mtype)
-
-    ev = _Ev(raw={"post_type": "notice", "notice_type": "group_recall"})
-    assert c.system_event_summary(ev) == "[撤回消息]"
-    assert c.classify_content(ev)[0] == ["system_event"]
-    ev2 = _Ev(raw={"post_type": "request", "request_type": "friend"})
-    assert c.system_event_summary(ev2) == "[请求事件]"
-    assert c.classify_content(ev2)[0] == ["system_event"]
-    ev3 = _Ev()
-    assert c.system_event_summary(ev3) == ""
-    print("[T46] system_event_summary_and_notice_kind ✓")
-
-
-def test_unknown_text_and_assistant_poke():
-    """Unknown 组件文本提取；assistant 链识别戳一戳。"""
-    c = classifier_mod
-    Plain, Poke, Unknown = (
-        sys.modules["astrbot.api.message_components"].Plain,
-        sys.modules["astrbot.api.message_components"].Poke,
-        sys.modules["astrbot.api.message_components"].Unknown,
-    )
-    unk = Unknown(); unk.text = "平台未知段文本"
-
-    class _Ev:
-        message_str = ""
-
-        def get_messages(self):
-            return [unk]
-
-        def get_message_type(self):
-            return types.SimpleNamespace(value="GroupMessage")
-
-    assert c.classify_content(_Ev())[0] == ["text"]
-    poke = Poke()
-    kind2, text2 = c.classify_assistant_chain([poke])
-    assert kind2 == ["poke"] and text2 == ""
-    print("[T47] unknown_text_and_assistant_poke ✓")
+    print("[T17] media_position_tokens_and_ids ✓")
 
 
 def test_media_metadata_and_source_refs():
@@ -1322,7 +919,7 @@ def test_media_metadata_and_source_refs():
         types.SimpleNamespace(message_str="", get_messages=lambda: [poke2])
     )
     assert media3[0]["type"] == "126"
-    print("[T48] media_metadata_and_source_refs ✓")
+    print("[T18] media_metadata_and_source_refs ✓")
 
 
 def test_empty_chain_seed_full_returns_five_tuple():
@@ -1358,38 +955,158 @@ def test_empty_chain_seed_full_returns_five_tuple():
 
     template3, rel3 = classifier_mod.build_relation_seed(_EvStr())
     assert template3 == "你好" and rel3 is None
-    print("[T50] empty_chain_seed_full_returns_five_tuple ✓")
+    print("[T19] empty_chain_seed_full_returns_five_tuple ✓")
 
 
-def test_codec_escape_sentinel_and_truncate_fragment():
-    """单级哨兵转义：任意含 ⟦ 的输入双射；截断不残留 ⟦ 残片。"""
-    codec = sys.modules["chat_memory.relation_codec"]
+def test_system_event_summary():
+    """system_event 归类与摘要：notice/request 空消息 + 摘要增强细节。"""
+    c = classifier_mod
 
-    # 用户输入 ⟦⟧ → 哨兵对，展示侧还原回 ⟦⟧
-    escaped = codec.escape_plain_text("看⟦CM_AT:0⟧这个")
-    assert escaped == "看⦑CM_AT:0⦒这个"
-    assert codec.unescape_plain_text(escaped) == "看⟦CM_AT:0⟧这个"
+    class _Obj:
+        pass
 
-    # 任意含 ⟦/⟧ 的字面输入（含内部形态 ⟦CM_LITERAL_* 等）均双射
-    for text in (
-        "⟦CM_LITERAL_IMAGE:3⟧",
-        "x⟦CM_LITERAL2_⟧y",
-        "⟦⟧",
-        "前⟦CM_AT:0⟧后⟦CM_POKE:1⟧",
-        "只有右括号⟧",
-    ):
-        assert codec.unescape_plain_text(codec.escape_plain_text(text)) == text
+    class _Ev:
+        def __init__(self, raw=None, mtype="GroupMessage"):
+            self.message_str = ""
+            self.message_obj = None
+            if raw is not None:
+                self.message_obj = _Obj()
+                self.message_obj.raw_message = raw
+            self._mtype = mtype
 
-    # 截断落在 token 前缀中间：剥掉未闭合的 ⟦ 残片
-    template = "一二三四五⟦CM_IMAGE:0⟧尾巴"
-    assert "⟦" not in codec.truncate_content_template(template, 8)
-    assert "⟦" not in codec.truncate_content_template(template, 12)
-    assert codec.truncate_content_template(template, 8) == "一二三四五"
+        def get_messages(self):
+            return []
 
-    # 手造/损坏数据里的裸 ⟦ 不得被误剥（仅剥离疑似 token 前缀形态）
-    assert codec.truncate_content_template("⟦你好啊再见", 4) == "⟦你好啊"
-    assert codec.truncate_content_template("你好⟦世界再见啊", 7) == "你好⟦世界再见"
-    print("[T51] codec_escape_sentinel_and_truncate_fragment ✓")
+        def get_message_type(self):
+            return types.SimpleNamespace(value=self._mtype)
+
+    # 小节：notice/request 空消息归类 system_event，摘要不写成 text
+    ev = _Ev(raw={"post_type": "notice", "notice_type": "group_recall"})
+    assert c.system_event_summary(ev) == "[撤回消息]"
+    assert c.classify_content(ev)[0] == ["system_event"]
+    ev2 = _Ev(raw={"post_type": "request", "request_type": "friend"})
+    assert c.system_event_summary(ev2) == "[请求事件]"
+    assert c.classify_content(ev2)[0] == ["system_event"]
+    assert c.system_event_summary(_Ev()) == ""
+
+    # 小节：摘要增强（禁言时长/解禁/管理员/头衔/上传文件/运气王/未知）
+    def ev_raw(raw):
+        e = types.SimpleNamespace()
+        e.message_obj = _Obj()
+        e.message_obj.raw_message = raw
+        return e
+
+    n = {"post_type": "notice"}
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_ban", "duration": 600})) == "[群禁言 10分钟]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_ban", "duration": 30})) == "[群禁言 30秒]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_ban", "sub_type": "lift_ban",
+                "duration": 0})) == "[解除禁言]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_admin", "sub_type": "set"})) == "[设置群管理员]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_admin", "sub_type": "unset"})) == "[取消群管理员]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "notify", "sub_type": "title",
+                "title": " 小队长 "})) == "[设置群头衔] 小队长"
+    assert "⟦" not in c.system_event_summary(
+        ev_raw({**n, "notice_type": "notify", "sub_type": "title",
+                "title": "⟦CM_AT:0⟧"}))
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_upload",
+                "file": {"name": "报告.pdf"}})) == "[群文件上传] 报告.pdf"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "notify", "sub_type": "lucky_king"})) == "[群运气王]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "notify", "sub_type": "poke"})) == "[戳一戳]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "group_card"})) == "[群名片变更]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "offline_file"})) == "[离线文件]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "client_status"})) == "[客户端状态变更]"
+    assert c.system_event_summary(
+        ev_raw({**n, "notice_type": "notify", "sub_type": "unknown"})) == "[系统通知]"
+    print("[T20] system_event_summary ✓")
+
+
+# ── 测试用例：storage 纯函数 ─────────────────────────
+
+
+def test_storage_pure_helpers():
+    """storage 纯函数：_scope_filter 组合 / _normalize_dt / _row_to_dict。"""
+    from datetime import datetime, timezone
+
+    # 小节：_scope_filter 4 组合 + 空 user_id 边界
+    sf = storage_mod._scope_filter
+    umo, uid = "aiocqhttp:GroupMessage:g1", "u1"
+    cond, params = sf(umo, uid, False, False)
+    assert cond == "umo = :scope_umo AND user_id = :scope_uid"
+    assert params == {"scope_umo": umo, "scope_uid": uid}
+    cond, params = sf(umo, uid, True, False)
+    assert "platform_id = :scope_pid" in cond and "user_id = :scope_uid" in cond
+    cond, params = sf(umo, uid, False, True)
+    assert cond == "umo = :scope_umo" and params == {"scope_umo": umo}
+    cond, _ = sf(umo, uid, True, True)
+    assert "umo = :scope_umo" in cond and "platform_id = :scope_pid" in cond
+    assert sf(umo, "", True, False) == ("1 = 0", {})
+    cond, params = sf(umo, "", False, True)
+    assert cond == "umo = :scope_umo"
+
+    # 小节：datetime 归一化（None 透传 / naive 原样 / aware 转 UTC naive）
+    nd = storage_mod._normalize_dt
+    assert nd(None) is None
+    naive = datetime(2026, 7, 9, 2, 0, 0)
+    assert nd(naive) == naive
+    aware = datetime(2026, 7, 9, 2, 0, 0, tzinfo=timezone.utc)
+    assert nd(aware).tzinfo is None
+
+    # 小节：_row_to_dict 字段映射 + relation 渲染 + created_at UTC
+    r = (
+        "user", "⟦CM_AT:0⟧在干嘛", "u1", "m1", "p1", "llm_success",
+        '["text"]', "aiocqhttp", "cq", "GroupMessage", "g1", "s1",
+        "g1", "Alice", 0, "at1", "rep1", "fwd1", "", "2026-07-09 02:00:00",
+        "turn_1", "", None, 42,
+    )
+    rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "虾仁粽子"}],
+           "reply": None}
+    r_with_rel = list(r)
+    r_with_rel[1] = "⟦CM_AT:0⟧在干嘛"
+    r_with_rel[22] = json.dumps(rel, ensure_ascii=False)
+    d = storage_mod._row_to_dict(tuple(r_with_rel))
+    assert d["role"] == "user"
+    assert d["content"] == '<cm_mention target="虾仁粽子"/>在干嘛'
+    assert d["content_template"] == "⟦CM_AT:0⟧在干嘛"
+    assert d["user_id"] == "u1" and d["message_id"] == "m1"
+    assert d["content_kind"] == ["text"]
+    assert d["relation_data"]["v"] == 1
+    assert d["record_id"] == 42
+    d2 = storage_mod._row_to_dict(tuple(r), timezone.utc)
+    assert d2["created_at_utc"].endswith("Z")
+    print("[T21] storage_pure_helpers ✓")
+
+
+# ── 测试用例：main 指令与接管策略 ────────────────────
+
+
+class _EventStub:
+    """最小 event 桩：extras 与事件级属性，供 main 钩子方法测试。"""
+
+    def __init__(self, extras=None, umo=_UMO_GROUP, sender="u1"):
+        self._extras = dict(extras or {})
+        self.unified_msg_origin = umo
+        self._sender = sender
+
+    def get_extra(self, key, default=None):
+        return self._extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_sender_id(self):
+        return self._sender
 
 
 def test_sniff_ext_mp4_box_offset():
@@ -1401,7 +1118,260 @@ def test_sniff_ext_mp4_box_offset():
         path = Path(tmp) / "x.bin"
         path.write_bytes(b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00")
         assert archiver_mod._sniff_ext(path, "video") == "mp4"
-    print("[T52] sniff_ext_mp4_box_offset ✓")
+    print("[T22] sniff_ext_mp4_box_offset ✓")
+
+
+def test_media_archive_local_and_cleanup():
+    """MediaArchiver：本地接管落盘登记、级联删除文件、关闭时拒绝。"""
+    import tempfile
+
+    from chat_memory.media_archive import MediaArchiver
+
+    class _AsyncInsert:
+        def __init__(self):
+            self.last = None
+
+        async def __call__(self, **kw):
+            self.last = kw
+            return True
+
+    class _AsyncNone:
+        async def __call__(self, *a, **k):
+            return None
+
+    class _AsyncEmpty:
+        async def __call__(self, *a, **k):
+            return [] if k.get("limit") else {}
+
+    class _AsyncZero:
+        async def __call__(self, *a, **k):
+            return 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "voice.amr")
+        open(src, "wb").write(b"#!AMR\n\x00\x00\x00\x1c" + b"\x00" * 64)
+
+        insert = _AsyncInsert()
+        db = types.SimpleNamespace(
+            insert_media_archive=insert,
+            query_media_archive_by_ids=_AsyncEmpty(),
+            query_media_archive_for_cleanup=_AsyncEmpty(),
+            media_archive_total_size=_AsyncZero(),
+            delete_media_archive_by_ids=_AsyncZero(),
+        )
+        archiver = MediaArchiver(db, Path(tmp) / "data", enabled=True,
+                                 include_video=False, retention_days=30,
+                                 max_total_mb=64)
+        ok = asyncio.run(archiver.archive_local(
+            "aaaa" + "0" * 28, src, "umo_demo", "cid_demo", "turn_demo", "voice",
+        ))
+        assert ok
+        row = insert.last
+        assert row["kind"] == "voice" and row["ext"] == "amr"
+        assert row["mime_type"] == "audio/amr"
+        assert row["file_name"].startswith("aaaa") and row["file_name"].endswith(".amr")
+        # 文件真实落盘（按月分桶；归档行 created_at 为 UTC naive，与生产一致）
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        month_dir = archiver.media_dir / utc_now.strftime("%Y%m")
+        assert list(month_dir.glob("aaaa*"))
+        # 级联删除文件
+        deleted = asyncio.run(archiver.delete_files([{
+            "file_name": row["file_name"],
+            "created_at": utc_now,
+        }]))
+        assert deleted == 1
+        assert not list(month_dir.glob("aaaa*"))
+        # 视频开关关闭 / 归档关闭：拒绝
+        assert not archiver.allowed_kind("video")
+        off = MediaArchiver(db, Path(tmp) / "off", enabled=False,
+                            include_video=False, retention_days=30,
+                            max_total_mb=64)
+        assert not off.allowed_kind("image")
+        assert not asyncio.run(off.archive_local("b" * 32, src, "u", "c", "t", "voice"))
+        print("[T23] media_archive_local_and_cleanup ✓")
+
+
+def test_mark_llm_triggered_idempotent():
+    """同一事件多次 LLM 调用（tool loop）只升级一次 llm_status，避免重复 DB 写。"""
+    p = _make_plugin()
+    updates = []
+
+    async def fake_update(umo, cid, turn_id, status):
+        updates.append((turn_id, status))
+        return 1
+
+    p._safe_update_llm_status_by_turn = fake_update
+    event = _EventStub(extras={
+        "chat_memory_captured": True,
+        "chat_memory_cid": "cid_demo",
+        "chat_memory_turn_id": "turn_x",
+    })
+    req = types.SimpleNamespace()
+    for _ in range(3):
+        asyncio.run(p.mark_llm_triggered(event, req))
+    assert updates == [("turn_x", "llm_pending")]
+    assert event.get_extra("chat_memory_llm_triggered") is True
+    print("[T24] mark_llm_triggered_idempotent ✓")
+
+
+def test_takeover_reuses_cached_persona():
+    """filter_by_persona 复用 capture_user 缓存的 persona，不重复解析；缺失时兜底解析。"""
+    p = _make_plugin()
+    p.ct_filter_by_persona = True
+    p.ct_clear_native_history = True
+    resolved = []
+
+    async def fake_effective(umo, event, cid):
+        resolved.append(cid)
+        return "p_resolved"
+
+    p._get_effective_persona = fake_effective
+    seen = {}
+
+    async def fake_build(umo=None, user_id=None, conversation_id=None,
+                         persona_id="", exclude_turn_id=""):
+        seen["persona_id"] = persona_id
+        return [{"role": "user", "content": "x"}]
+
+    p.build_takeover_contexts = fake_build
+
+    async def fake_reset_history(umo, cid):
+        return None
+
+    p._safe_reset_history = fake_reset_history
+
+    async def fake_cid(umo):
+        return "cid_demo"
+
+    p._get_curr_cid = fake_cid
+
+    # 已缓存：不触发解析
+    event = _EventStub(extras={"chat_memory_persona_id": "p1",
+                               "chat_memory_turn_id": "turn_x"})
+    req = types.SimpleNamespace(system_prompt="", contexts=[], extra_user_content_parts=[])
+    asyncio.run(p.take_over_context(event, req))
+    assert resolved == []
+    assert seen.get("persona_id") == "p1"
+    assert req.contexts == [{"role": "user", "content": "x"}]
+    assert event.get_extra("chat_memory_takeover_applied") is True
+
+    # 未缓存：兜底解析一次
+    event2 = _EventStub(extras={"chat_memory_turn_id": "turn_y"})
+    req2 = types.SimpleNamespace(system_prompt="", contexts=[], extra_user_content_parts=[])
+    asyncio.run(p.take_over_context(event2, req2))
+    assert resolved == ["cid_demo"]
+    assert seen.get("persona_id") == "p_resolved"
+    print("[T25] takeover_reuses_cached_persona ✓")
+
+
+def test_instruction_idempotent():
+    """3 条 system 指令幂等追加：重复调用只加一次。"""
+    p = _make_plugin()
+    req = types.SimpleNamespace(system_prompt="原有")
+    for _ in range(2):
+        p._append_general_rules(req)
+        p._append_full_group_instruction(req)
+        p._append_cross_session_instruction(req)
+    assert req.system_prompt.count("ChatMemory 通用规则") == 1
+    assert req.system_prompt.count("ChatMemory 群聊历史解释规则") == 1
+    assert req.system_prompt.count("ChatMemory 跨会话来源规则") == 1
+    assert "群友视角" in req.system_prompt
+    assert "按 ChatMemory 配置筛选的群聊历史片段" in req.system_prompt
+    assert "必须按发送者" in req.system_prompt
+    assert "无 <cm_speaker> 也无 <cm_source>" in req.system_prompt
+    assert "续写角色" in req.system_prompt
+    assert "每条默认回应其前最近" in req.system_prompt
+    assert "可合并参考" in req.system_prompt
+    assert "来源标记仅供你理解" in req.system_prompt
+    assert "<cm_speaker" in req.system_prompt
+    assert "闲聊触发" in req.system_prompt
+    print("[T26] instruction_idempotent ✓")
+
+
+def test_builtin_ltm_coexist_warn_once():
+    """内置群聊上下文感知共存警告：命中一次即不再提示；开关/私聊/异常均不提示。"""
+    logger_mod = sys.modules["astrbot.api"]
+    warnings = []
+    orig_warning = logger_mod.logger.warning
+    logger_mod.logger.warning = lambda *a, **k: warnings.append(a)
+    try:
+        cfg = types.SimpleNamespace(
+            get=lambda key, default=None: (
+                {"group_icl_enable": True} if key == "provider_ltm_settings"
+                else default
+            )
+        )
+        ctx = types.SimpleNamespace(get_config=lambda umo=None: cfg)
+
+        p = _make_plugin()
+        p.context = ctx
+        assert p._warn_builtin_ltm_coexist(_EventStub()) is None
+        assert p._builtin_ltm_warned is True
+        assert len(warnings) == 1
+        assert "群聊上下文感知" in warnings[0][0]
+        p._warn_builtin_ltm_coexist(_EventStub())  # 第二次不再提示
+        assert len(warnings) == 1
+
+        p3 = _make_plugin()
+        p3.context = ctx
+        p3._warn_builtin_ltm_coexist(_EventStub(umo="aiocqhttp:FriendMessage:u9"))
+        assert len(warnings) == 1  # 私聊不提示
+
+        p4 = _make_plugin()
+        p4.context = types.SimpleNamespace(
+            get_config=lambda umo=None: (_ for _ in ()).throw(RuntimeError("x"))
+        )
+        p4._warn_builtin_ltm_coexist(_EventStub())
+        assert len(warnings) == 1  # 配置读取异常静默
+
+        p5 = _make_plugin()
+        p5.context = ctx
+        cfg_off = types.SimpleNamespace(
+            get=lambda key, default=None: (
+                {"group_icl_enable": False} if key == "provider_ltm_settings"
+                else default
+            )
+        )
+        p5.context = types.SimpleNamespace(get_config=lambda umo=None: cfg_off)
+        p5._warn_builtin_ltm_coexist(_EventStub())
+        assert len(warnings) == 1  # 内置功能未开启不提示
+    finally:
+        logger_mod.logger.warning = orig_warning
+    print("[T27] builtin_ltm_coexist_warn_once ✓")
+
+
+def test_current_turn_excluded_from_mixed():
+    """混合模式排除当前 turn_id（透传给 query_messages_raw）。"""
+    p = _make_plugin()
+    p.ct_llm_status_filter = ["llm_success", ""]  # mixed
+    p.db = _FakeDB(messages=[])
+    asyncio.run(p.build_takeover_contexts(
+        _UMO_GROUP, "u1", "cid_demo", exclude_turn_id="turn_x"))
+    assert p.db.last_kwargs.get("exclude_turn_id") == "turn_x"
+    print("[T28] current_turn_excluded_from_mixed ✓")
+
+
+def test_public_build_takeover_contexts_api():
+    """公开 API 契约：None/[]/list 语义、user_id 边界、无 history_tail 标记。"""
+    p = _make_plugin()
+
+    # 小节：关闭返回 None；空 UMO/user_id 返回 []
+    p.ct_enable = False
+    assert asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid")) is None
+    p.ct_enable = True
+    assert asyncio.run(p.build_takeover_contexts("", "u1", "cid")) == []
+    assert asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "", "cid")) == []
+
+    # 小节：正常返回 list，带 _no_save 标记，且不含 cm_history_tail
+    p.db = _FakeDB(rounds=[[_rec(content="历史尾部")]])
+    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert isinstance(out, list) and len(out) == 1
+    assert out[0]["content"].startswith(
+        "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 历史尾部"
+    )
+    assert out[0].get("_no_save") is True
+    assert not any("cm_history_tail" in str(c.get("content", "")) for c in out)
+    print("[T29] public_build_takeover_contexts_api ✓")
 
 
 def test_capture_notice_event_stores_system_event():
@@ -1467,7 +1437,7 @@ def test_capture_notice_event_stores_system_event():
     assert len(insert.rows) == 1
     assert insert.rows[0]["content"] == "[撤回消息]"
     assert insert.rows[0]["content_kind"] == ["system_event"]
-    print("[T53] capture_notice_event_stores_system_event ✓")
+    print("[T30] capture_notice_event_stores_system_event ✓")
 
 
 def test_capture_bot_muted_notice_not_self_skipped():
@@ -1564,169 +1534,270 @@ def test_capture_bot_muted_notice_not_self_skipped():
 
     assert asyncio.run(p._capture_user_internal(_EvBotEmpty())) is False
     assert len(insert.rows) == 1
-    print("[T54] capture_bot_muted_notice_not_self_skipped ✓")
+    print("[T31] capture_bot_muted_notice_not_self_skipped ✓")
 
 
-def test_media_archive_local_and_cleanup():
-    """MediaArchiver：本地接管落盘登记、级联删除文件、关闭时拒绝。"""
-    import tempfile
+def test_capture_recall_notice_with_snippet():
+    """撤回 notice：本地关联原文，摘要含发送者昵称与原文片段；未命中回落。"""
+    p = _make_plugin()
 
-    from chat_memory.media_archive import MediaArchiver
+    async def _cid(umo):
+        return "cid_demo"
 
-    class _AsyncInsert:
+    async def _persona(umo, event, cid):
+        return ""
+
+    class _InsertCapture:
         def __init__(self):
-            self.last = None
+            self.rows = []
 
-        async def __call__(self, **kw):
-            self.last = kw
+        async def __call__(self, umo, cid, user_id, role, content, **kwargs):
+            self.rows.append(content)
             return True
 
-    class _AsyncNone:
-        async def __call__(self, *a, **k):
-            return None
+    class _Db:
+        def __init__(self, row):
+            self.row = row
 
-    class _AsyncEmpty:
-        async def __call__(self, *a, **k):
-            return [] if k.get("limit") else {}
+        async def find_by_message_id(self, umo, message_id):
+            return self.row
 
-    class _AsyncZero:
-        async def __call__(self, *a, **k):
-            return 0
+    insert = _InsertCapture()
+    p._get_curr_cid = _cid
+    p._get_effective_persona = _persona
+    p._safe_insert = insert
+    p.db = _Db({
+        "content": "⟦CM_AT:0⟧你好  世界",
+        "relation_data": None,
+        "sender_nickname": "测试员B",
+    })
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "voice.amr")
-        open(src, "wb").write(b"#!AMR\n\x00\x00\x00\x1c" + b"\x00" * 64)
+    class _Obj:
+        pass
 
-        insert = _AsyncInsert()
-        db = types.SimpleNamespace(
-            insert_media_archive=insert,
-            query_media_archive_by_ids=_AsyncEmpty(),
-            query_media_archive_for_cleanup=_AsyncEmpty(),
-            media_archive_total_size=_AsyncZero(),
-            delete_media_archive_by_ids=_AsyncZero(),
-        )
-        archiver = MediaArchiver(db, Path(tmp) / "data", enabled=True,
-                                 include_video=False, retention_days=30,
-                                 max_total_mb=64)
-        ok = asyncio.run(archiver.archive_local(
-            "aaaa" + "0" * 28, src, "umo_demo", "cid_demo", "turn_demo", "voice",
-        ))
-        assert ok
-        row = insert.last
-        assert row["kind"] == "voice" and row["ext"] == "amr"
-        assert row["mime_type"] == "audio/amr"
-        assert row["file_name"].startswith("aaaa") and row["file_name"].endswith(".amr")
-        # 文件真实落盘（按月分桶；归档行 created_at 为 UTC naive，与生产一致）
-        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-        month_dir = archiver.media_dir / utc_now.strftime("%Y%m")
-        assert list(month_dir.glob("aaaa*"))
-        # 级联删除文件
-        deleted = asyncio.run(archiver.delete_files([{
-            "file_name": row["file_name"],
-            "created_at": utc_now,
-        }]))
-        assert deleted == 1
-        assert not list(month_dir.glob("aaaa*"))
-        # 视频开关关闭 / 归档关闭：拒绝
-        assert not archiver.allowed_kind("video")
-        off = MediaArchiver(db, Path(tmp) / "off", enabled=False,
-                            include_video=False, retention_days=30,
-                            max_total_mb=64)
-        assert not off.allowed_kind("image")
-        assert not asyncio.run(off.archive_local("b" * 32, src, "u", "c", "t", "voice"))
-        print("[T49] media_archive_local_and_cleanup ✓")
+    class _Ev:
+        unified_msg_origin = "aiocqhttp:GroupMessage:g1"
+        message_str = ""
 
+        def __init__(self):
+            self.extras = {}
+            self.message_obj = _Obj()
+            self.message_obj.raw_message = {
+                "post_type": "notice",
+                "notice_type": "group_recall",
+                "message_id": "m_recall",
+            }
 
-def test_log_with_bot_id_migration():
-    """log_with_bot_id 旧组迁移：顶层键优先，缺失时继承旧 log_config 值。"""
-    p = _make_plugin()
-    f = p._resolve_log_with_bot_id
-    # 顶层键显式设置（含 False）：旧组残留不影响
-    assert f({"log_with_bot_id": True, "log_config": {"log_with_bot_id": False}}) is True
-    assert f({"log_with_bot_id": False, "log_config": {"log_with_bot_id": True}}) is False
-    # 顶层键未写入：继承旧组值
-    assert f({"log_config": {"log_with_bot_id": True}}) is True
-    assert f({"log_config": {"log_with_bot_id": False}}) is False
-    # 都没有：默认关闭
-    assert f({}) is False
-    print("[T39] log_with_bot_id_migration ✓")
+        def get_sender_id(self):
+            return "10001"
+
+        def get_self_id(self):
+            return "99999"
+
+        def get_messages(self):
+            return []
+
+        def get_message_type(self):
+            return types.SimpleNamespace(value="GroupMessage")
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+    ok = asyncio.run(p._capture_user_internal(_Ev()))
+    assert ok is True
+    assert insert.rows[0] == "[撤回消息] 测试员B：你好 世界"
+
+    # 未命中：回落为纯 [撤回消息]
+    insert.rows.clear()
+    p.db = _Db(None)
+    ok2 = asyncio.run(p._capture_user_internal(_Ev()))
+    assert ok2 is True
+    assert insert.rows[0] == "[撤回消息]"
+    print("[T32] capture_recall_notice_with_snippet ✓")
 
 
-def test_migrate_log_config_writes_back_and_drops_legacy():
-    """_migrate_log_config：并入顶层、删除旧组并写回；顶层已有值只删旧组。"""
+def test_tool_context_replay():
+    """工具上下文：渲染成 OpenAI 格式、结果提取、参数截断、接管回放、插入位置。"""
     p = _make_plugin()
 
-    class _FakeConfig(dict):
-        def __init__(self, data):
-            super().__init__(data)
-            self.saved = None
-
-        def save_config(self):
-            self.saved = dict(self)
-
-    # 顶层键未写入：继承旧值并删除旧组
-    cfg = _FakeConfig({"log_config": {"log_with_bot_id": True, "debug_to_info": True}})
-    p._config = cfg
-    asyncio.run(p._migrate_log_config())
-    assert cfg.get("log_with_bot_id") is True
-    assert "log_config" not in cfg
-    assert cfg.saved is not None
-    assert cfg.saved.get("log_with_bot_id") is True
-    assert "log_config" not in cfg.saved
-
-    # 顶层键已有（含 False）：不覆盖顶层，仅删除旧组
-    cfg2 = _FakeConfig({"log_with_bot_id": False,
-                        "log_config": {"log_with_bot_id": True}})
-    p._config = cfg2
-    asyncio.run(p._migrate_log_config())
-    assert cfg2.get("log_with_bot_id") is False
-    assert "log_config" not in cfg2
-
-    # 无旧组：no-op，不触发写回
-    cfg3 = _FakeConfig({"log_with_bot_id": True})
-    p._config = cfg3
-    asyncio.run(p._migrate_log_config())
-    assert cfg3.saved is None
-    print("[T40] migrate_log_config_writes_back_and_drops_legacy ✓")
-
-
-def test_instruction_idempotent():
-    """3 条 system 指令幂等追加：重复调用只加一次。"""
-    p = _make_plugin()
-    req = types.SimpleNamespace(system_prompt="原有")
-    for _ in range(2):
-        p._append_general_rules(req)
-        p._append_full_group_instruction(req)
-        p._append_cross_session_instruction(req)
-    assert req.system_prompt.count("ChatMemory 通用规则") == 1
-    assert req.system_prompt.count("ChatMemory 群聊历史解释规则") == 1
-    assert req.system_prompt.count("ChatMemory 跨会话来源规则") == 1
-    assert "群友视角" in req.system_prompt
-    assert "按 ChatMemory 配置筛选的群聊历史片段" in req.system_prompt
-    assert "必须按发送者" in req.system_prompt
-    assert "无 <cm_speaker> 也无 <cm_source>" in req.system_prompt
-    assert "续写角色" in req.system_prompt
-    assert "每条默认回应其前最近" in req.system_prompt
-    assert "可合并参考" in req.system_prompt
-    assert "来源标记仅供你理解" in req.system_prompt
-    assert "<cm_speaker" in req.system_prompt
-    assert "闲聊触发" in req.system_prompt
-    print("[T23] instruction_idempotent ✓")
-
-
-def test_takeover_normalize_think():
-    """_takeover_normalize 注入时剥离老库已存的 think 前缀。"""
-    p = _make_plugin()
+    # 小节：工具记录渲染成 OpenAI 格式（每轮 assistant(tool_calls) + N 条 tool）
     records = [
-        _rec(content="你好"),
-        _rec(role="assistant",
-             content="[{'type': 'think', 'content': '推理', 'encrypted': None}]实际回复",
-             created_at="2026-07-09 10:00:05"),
+        {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
+         "tool_args": '{"prompt": "猫"}', "tool_result": "任务 x 已创建，不要再次调用"},
+        {"turn_id": "turn_a", "call_index": 2, "tool_name": "query",
+         "tool_args": "{}", "tool_result": "运行中：任务 x"},
+        {"turn_id": "turn_b", "call_index": 1, "tool_name": "draw",
+         "tool_args": '{"prompt": "狗"}', "tool_result": "第二任务已创建"},
     ]
-    out = p._takeover_normalize(records, _UMO_GROUP)
-    assert out[0]["content"] == "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 你好"
-    assert out[1]["content"] == "<cm_time>07/09 10:00:05</cm_time> 实际回复"
-    print("[T24] takeover_normalize_think ✓")
+    built = p._build_tool_contexts(records)
+    assert [m["role"] for m in built] == ["assistant", "tool", "tool", "assistant", "tool"]
+    assert [c["id"] for c in built[0]["tool_calls"]] == ["cm_tool_turn_a_0", "cm_tool_turn_a_1"]
+    assert [c["function"]["name"] for c in built[0]["tool_calls"]] == ["draw", "query"]
+    assert built[1]["tool_call_id"] == "cm_tool_turn_a_0"
+    assert built[2]["tool_call_id"] == "cm_tool_turn_a_1"
+    assert built[2]["content"] == "运行中：任务 x"
+    assert built[3]["tool_calls"][0]["id"] == "cm_tool_turn_b_0"
+    assert built[4]["tool_call_id"] == "cm_tool_turn_b_0"
+    assert built[0]["content"] is None
+
+    # 小节：结果提取（文本/图片占位/资源文本/structured/isError/None）+ 参数截断
+    class _Text:
+        text = "完成"
+    class _Image:
+        data = "base64secret"
+    class _ResText:
+        resource = types.SimpleNamespace(text="资源文本")
+    class _ResBlob:
+        resource = types.SimpleNamespace()
+    class _Res:
+        content = [_Text(), _Image(), _ResText(), _ResBlob()]
+        structuredContent = {"task": "x"}
+        isError = False
+    text = p._tool_result_to_text(_Res())
+    assert "完成" in text and "[image content]" in text and "资源文本" in text
+    assert "base64secret" not in text
+    assert '{"task": "x"}' in text
+    assert p._tool_result_to_text(None) == ""
+    _Res.isError = True
+    assert p._tool_result_to_text(_Res()).startswith("[error]")
+    _Res.isError = False
+    assert p._truncate_tool_args('{"a": 1}', 50) == '{"a": 1}'
+    assert p._truncate_tool_args('{"a": 1}', 3) == '{"_cm_truncated": true}'
+    assert p._truncate_tool_args("x" * 100, 0) == "x" * 100
+
+    # 小节：接管/公开 API 在轮内回放工具段；无匹配/无历史时不回放
+    p.ct_keep_tool_turns = 2
+    p.db = _FakeDB(rounds=[[
+        _rec(turn_id="turn_a"),
+        _rec(role="assistant", content="好的,正在绘制", turn_id="turn_a"),
+    ]])
+    p.db.tool_records = [
+        {"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
+         "tool_args": "{}", "tool_result": "任务 x 已创建"},
+    ]
+    ctx = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert [m["role"] for m in ctx] == ["user", "assistant", "tool", "assistant"]
+    assert ctx[1]["tool_calls"][0]["id"] == "cm_tool_turn_a_0"
+    assert ctx[2]["tool_call_id"] == "cm_tool_turn_a_0"
+    assert "任务 x 已创建" in ctx[2]["content"]
+    assert "好的,正在绘制" in ctx[3]["content"]
+    assert p.db.tool_query_kwargs == {"umo": _UMO_GROUP, "cid": "cid_demo",
+                                      "turn_limit": 2}
+    assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in ctx)
+
+    p_tail = _make_plugin()
+    p_tail.db = _FakeDB(rounds=[[_rec(turn_id="turn_other"),
+                                 _rec(role="assistant", content="回复",
+                                      turn_id="turn_other")]])
+    p_tail.db.tool_records = list(p.db.tool_records)
+    tail_ctx = asyncio.run(p_tail.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert [m["role"] for m in tail_ctx] == ["user", "assistant"]
+    assert not any("cm_tool" in str(m) for m in tail_ctx)
+
+    p_no_hist = _make_plugin()
+    p_no_hist.db = _FakeDB(rounds=[])
+    p_no_hist.db.tool_records = list(p.db.tool_records)
+    assert asyncio.run(p_no_hist.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo")) == []
+
+    p_both_none = _make_plugin()
+    p_both_none.db = _FakeDB(rounds=[])
+    assert asyncio.run(p_both_none.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo")) == []
+
+    # 小节：_insert_tool_contexts 插入位置（user 后 / solo 前 / 无匹配回退丢弃）
+    f = p._insert_tool_contexts
+
+    def tool_seg(turn, name="draw"):
+        return [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": f"c_{turn}", "type": "function",
+                             "function": {"name": name, "arguments": "{}"}}],
+             "_cm_tool_turn": turn},
+            {"role": "tool", "tool_call_id": f"c_{turn}", "content": "ok",
+             "_cm_tool_turn": turn},
+        ]
+
+    history = [
+        {"role": "user", "content": "a", "_turn_id": "t1"},
+        {"role": "assistant", "content": "A", "_turn_id": "t1"},
+        {"role": "user", "content": "b", "_turn_id": "t2"},
+        {"role": "assistant", "content": "B", "_turn_id": "t2"},
+    ]
+    pos = f(history, tool_seg("t2") + tool_seg("t1"))
+    assert [m["role"] for m in pos] == [
+        "user", "assistant", "tool", "assistant",
+        "user", "assistant", "tool", "assistant",
+    ]
+    assert pos[1]["tool_calls"][0]["id"] == "c_t1"
+    assert pos[5]["tool_calls"][0]["id"] == "c_t2"
+    pos_solo = f([{"role": "assistant", "content": "solo", "_turn_id": "t3"}],
+                 tool_seg("t3"))
+    assert [m["role"] for m in pos_solo] == ["assistant", "tool", "assistant"]
+    pos_nomatch = f([{"role": "user", "content": "x", "_turn_id": "t9"}],
+                    tool_seg("tX"))
+    assert [m["role"] for m in pos_nomatch] == ["user"]
+    for produced in (pos, pos_solo, pos_nomatch):
+        assert not any("_turn_id" in m or "_cm_tool_turn" in m for m in produced)
+    print("[T33] tool_context_replay ✓")
+
+
+def test_capture_tool_writes_db():
+    """工具捕获落库（call_index 递增、文本截断、无 cid 跳过）+ keep=0 禁用回放。"""
+    p = _make_plugin()
+    p.db = _FakeDB()
+    p.max_len = 10
+
+    async def fake_cid(umo):
+        return "cid_demo"
+
+    p._get_curr_cid = fake_cid
+
+    class _Tool:
+        name = "draw"
+
+    class _Result:
+        content = [types.SimpleNamespace(text="任务 x 已创建，不要再次调用")]
+        structuredContent = None
+        isError = False
+
+    event = _EventStub(extras={"chat_memory_turn_id": "turn_x",
+                               "chat_memory_cid": "cid_demo"})
+    for _ in range(2):
+        asyncio.run(p.capture_tool(event, _Tool(), {"prompt": "猫"}, _Result()))
+    assert len(p.db.inserted_tools) == 2
+    row = p.db.inserted_tools[1]
+    assert row["turn_id"] == "turn_x"
+    assert row["call_index"] == 2
+    assert row["tool_name"] == "draw"
+    # max_len=10：args 超限被替换为合法 JSON 占位；result 按字符截断
+    assert row["tool_args"] == '{"_cm_truncated": true}'
+    assert row["tool_result"] == "任务 x 已创建，不要再次调用"[:10]
+
+    # 小节：无 cid 时跳过写入
+    event2 = _EventStub(extras={})
+
+    async def fake_cid_none(umo):
+        return ""
+
+    p._get_curr_cid = fake_cid_none
+    before = len(p.db.inserted_tools)
+    asyncio.run(p.capture_tool(event2, _Tool(), None, None))
+    assert len(p.db.inserted_tools) == before
+
+    # 小节：keep_tool_turns=0 不回放工具段，也不查工具表
+    p2 = _make_plugin()
+    p2.ct_keep_tool_turns = 0
+    p2.db = _FakeDB(rounds=[[_rec(turn_id="turn_a"),
+                             _rec(role="assistant", content="回复",
+                                  turn_id="turn_a")]])
+    p2.db.tool_records = [{"turn_id": "turn_a", "call_index": 1, "tool_name": "draw",
+                           "tool_args": "{}", "tool_result": "x"}]
+    out = asyncio.run(p2.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert not p2.db.tool_query_kwargs
+    print("[T34] capture_tool_writes_db ✓")
 
 
 class _FakeDB:
@@ -1763,64 +1834,6 @@ class _FakeDB:
             "call_index": call_index, "tool_name": tool_name,
             "tool_args": tool_args, "tool_result": tool_result,
         })
-
-
-def test_public_build_takeover_contexts_api():
-    """公开 API：None / [] / list 语义与 user_id 边界。"""
-    p = _make_plugin()
-
-    p.ct_enable = False
-    assert asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid")) is None
-    p.ct_enable = True
-    assert asyncio.run(p.build_takeover_contexts("", "u1", "cid")) == []
-    assert asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "", "cid")) == []
-
-    p.db = _FakeDB(rounds=[[_rec()]])
-    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert isinstance(out, list) and len(out) == 1
-    assert out[0]["content"].startswith("<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 你好")
-    assert out[0].get("_no_save") is True
-    print("[T25] public_build_takeover_contexts_api ✓")
-
-
-def test_current_turn_excluded_from_mixed():
-    """混合模式排除当前 turn_id（透传给 query_messages_raw）。"""
-    p = _make_plugin()
-    p.ct_llm_status_filter = ["llm_success", ""]  # mixed
-    p.db = _FakeDB(messages=[])
-    asyncio.run(p.build_takeover_contexts(
-        _UMO_GROUP, "u1", "cid_demo", exclude_turn_id="turn_x"))
-    assert p.db.last_kwargs.get("exclude_turn_id") == "turn_x"
-    print("[T26] current_turn_excluded_from_mixed ✓")
-
-
-def test_takeover_character_budget_api():
-    """接管字符预算：跨多轮裁剪，始终保留最新完整 user 起点。"""
-    p = _make_plugin()
-    p.ct_max_context_chars = 60
-    p.db = _FakeDB(rounds=[
-        [_rec(content="长" * 30, created_at="2026-07-09 08:00:00"),
-         _rec(role="assistant", content="回1", created_at="2026-07-09 08:00:05")],
-        [_rec(content="长" * 30, nickname="Bob", created_at="2026-07-09 09:00:00"),
-         _rec(role="assistant", content="回2", created_at="2026-07-09 09:00:05")],
-        [_rec(content="最新", created_at="2026-07-09 10:00:00")],
-    ])
-    out = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert len(out) == 1
-    assert out[0]["content"].startswith("<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 最新")
-    print("[T27] takeover_character_budget_api ✓")
-
-
-def test_public_contexts_no_history_tail():
-    """公开 API 只返回历史 contexts，不含 cm_history_tail 标记。"""
-    p = _make_plugin()
-    p.db = _FakeDB(rounds=[[_rec(content="历史尾部")]])
-    contexts = asyncio.run(p.build_takeover_contexts(_UMO_GROUP, "u1", "cid_demo"))
-    assert isinstance(contexts, list) and contexts
-    assert "历史尾部" in contexts[0]["content"]
-    assert not any("cm_history_tail" in str(c.get("content", ""))
-                   for c in contexts)
-    print("[T28] public_contexts_no_history_tail ✓")
 
 
 # ── 运行 ─────────────────────────────────────────────
