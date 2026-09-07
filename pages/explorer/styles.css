@@ -211,6 +211,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .badge { max-width: 260px; padding: 3px 7px; overflow: hidden; border-radius: 6px; color: var(--text-2); background: var(--surface-3); font: 10px/1.45 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .badge.status { color: var(--accent); background: var(--accent-soft); }
 .badge.kind { color: var(--teal); background: var(--teal-soft); }
+.badge.sub { color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line-strong); }
 .record-detail-button { align-self: start; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--accent); background: var(--surface-2); font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: border-color .15s ease, background .15s ease; }
 .record-detail-button:hover { border-color: var(--accent); background: var(--accent-soft); }
 
@@ -317,12 +318,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .media-gallery { display: flex; flex-direction: column; gap: 12px; }
 .media-item { margin: 0; display: flex; flex-direction: column; gap: 6px; }
 .media-item figcaption { color: var(--text-3); font-size: 11px; }
-.media-image { max-width: 100%; border-radius: 10px; border: 1px solid var(--line); }
-.media-image.thumb { max-width: 512px; max-height: 512px; width: auto; cursor: zoom-in; }
-.media-image.full { max-width: 100%; max-height: none; cursor: zoom-out; }
-.media-image.loading { opacity: .55; }
 .media-item audio, .media-item video { max-width: 100%; border-radius: 10px; }
-.media-loading { display: flex; align-items: center; gap: 8px; padding: 18px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--text-2); font-size: 12px; }
+.media-item video.failed { opacity: .35; filter: grayscale(1); }
+.media-item video.loading { opacity: .55; }
 /* 详情媒体标签条（醒目）：类型图标 + 名称 + 状态胶囊 */
 .media-chip { display: flex; align-items: center; gap: 9px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600; }
 .media-item.plain .media-chip { border-left: 4px solid var(--teal); }
@@ -336,3 +334,24 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .media-download-button:disabled { opacity: .6; cursor: default; }
 
 .media-error { color: var(--amber); font-size: 12px; margin-top: 2px; }
+
+img.media-thumb-inline { display: inline-block; max-height: 130px; max-width: 190px; margin: 2px 4px; border-radius: 8px; border: 1px solid var(--line-strong); vertical-align: middle; cursor: zoom-in; }
+img.media-thumb-inline.loading { opacity: .55; }
+img.media-thumb-inline.failed { opacity: .45; filter: grayscale(1); }
+img.media-thumb-inline.full { max-height: none; max-width: 100%; cursor: zoom-out; }
+img.media-thumb-inline.static { cursor: default; }
+
+/* 列表语音气泡（QQ 风格）：点击即播 */
+.voice-bubble { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-3); color: var(--text-2); cursor: pointer; font-size: 12px; user-select: none; transition: border-color .15s ease, color .15s ease; }
+.voice-bubble svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.voice-bubble:hover { border-color: var(--accent); color: var(--accent); }
+.voice-bubble.disabled { opacity: .55; cursor: default; }
+.voice-bubble.disabled:hover { border-color: var(--line-strong); color: var(--text-2); }
+.voice-bubble .voice-bars { display: none; gap: 2px; align-items: flex-end; height: 14px; }
+.voice-bubble .voice-bars span { width: 3px; height: 4px; border-radius: 2px; background: var(--accent); animation: voice-wave 1s ease-in-out infinite; }
+.voice-bubble .voice-bars span:nth-child(2) { animation-delay: .2s; }
+.voice-bubble .voice-bars span:nth-child(3) { animation-delay: .4s; }
+.voice-bubble.playing { border-color: var(--accent); color: var(--accent); }
+.voice-bubble.playing .voice-bars { display: flex; }
+.voice-bubble.playing svg { display: none; }
+@keyframes voice-wave { 0%, 100% { height: 4px; } 50% { height: 14px; } }

@@ -3,7 +3,9 @@
 from html import escape as xml_escape
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+from .qq_face import face_name
 
 
 RELATION_VERSION = 1
@@ -26,13 +28,12 @@ MEDIA_TOKEN_RE = re.compile(
 )
 # kind → 上下文占位标签（与 context_builder.MEDIA_PLACEHOLDER_LABELS 保持一致）
 MEDIA_KIND_LABELS = {
-    "image": "<cm_image/>",
-    "video": "<cm_video/>",
-    "voice": "<cm_voice/>",
-    "file": "<cm_file/>",
-    "emoji": "<cm_emoji/>",
-    "forward": "<cm_forward/>",
-    "poke": "<cm_poke/>",
+    "image": '<cm_media type="image"/>',
+    "video": '<cm_media type="video"/>',
+    "voice": '<cm_media type="voice"/>',
+    "file": '<cm_media type="file"/>',
+    "emoji": '<cm_media type="emoji"/>',
+    "forward": '<cm_media type="forward"/>',
 }
 MAX_REPLY_SNAPSHOT_CHARS = 300
 
@@ -45,6 +46,85 @@ def escape_plain_text(text: str) -> str:
 def unescape_plain_text(text: str) -> str:
     """``escape_plain_text`` 的逆操作。"""
     return (text or "").replace(_SENTINEL_LEFT, "⟦").replace(_SENTINEL_RIGHT, "⟧")
+
+
+def build_event_sentence(
+    event: dict,
+    *,
+    name_format: Optional[Callable[[str], str]] = None,
+    text_format: Optional[Callable[[str], str]] = None,
+) -> str:
+    """把 system_event 的结构化字段组装成自然语言句子。
+
+    与 QQ 群聊系统消息展示一致（如「长风 被 小明 禁言了 10分钟」）。
+    ``name_format`` 用于包装昵称（上下文渲染传 <cm_nickname> 包装器，
+    UI 展示不传）；``text_format`` 用于转义正文片段（detail 用户可控，
+    上下文渲染传 XML 转义，UI 展示不传）。
+    """
+    fmt = name_format or (lambda name: name)
+    tfmt = text_format or (lambda text: text)
+    target = str(event.get("target") or "").strip()
+    operator = str(event.get("operator") or "").strip()
+    action = tfmt(str(event.get("action") or "").strip() or "系统事件")
+    detail = tfmt(str(event.get("detail") or "").strip())
+    t = fmt(target) if target else ""
+    o = fmt(operator) if operator else ""
+
+    def join(*parts: str) -> str:
+        return " ".join(part for part in parts if part)
+
+    generic = action + (f"：{detail}" if detail else "")
+    if not t and not o:
+        # 无任何角色信息（如撤回未关联/客户端状态/未知类型）：退回动作文本
+        return generic
+    if action == "群禁言":
+        base = join(t, "被", o, "禁言") if o else f"{t} 被禁言"
+        return base + (f"了 {detail}" if detail else "")
+    if action == "解除禁言":
+        return join(t, "被", o, "解除禁言") if o else f"{t} 被解除禁言"
+    if action == "设置群管理员":
+        return join(t, "被设为群管理员")
+    if action == "取消群管理员":
+        return join(t, "被取消群管理员")
+    if action == "群成员增加":
+        return join(t, "被", o, "邀请加入群聊") if o else join(t, "加入了群聊")
+    if action == "群成员减少":
+        return join(t, "被", o, "移出群聊") if o else join(t, "退出了群聊")
+    if action == "群名片变更":
+        return join(t, "修改了群名片") if t else generic
+    if action == "设置群头衔":
+        return join(t, "被授予群头衔") + (f"：{detail}" if detail else "")
+    if action == "群运气王":
+        return join(t, "成为群运气王") if t else generic
+    if action == "群荣誉变更":
+        return join(t, "获得群荣誉") if t else generic
+    if action == "撤回消息":
+        base = join(t, "的消息被", o, "撤回") if o else join(t, "的消息被撤回")
+        return base + (f"：{detail}" if detail else "")
+    if action == "群文件上传":
+        return join(o, "上传了群文件") + (f"：{detail}" if detail else "") if o else generic
+    if action == "离线文件":
+        return join(o, "发送了离线文件") + (f"：{detail}" if detail else "") if o else generic
+    if action == "戳一戳":
+        if t:
+            return join(o, "戳了戳", t)
+        return join(o, "戳一戳") if o else "戳一戳"
+    if action == "表情回应":
+        emoji = face_name(str(event.get("emoji_id") or ""))
+        if t:
+            return (
+                join(o, "用", emoji, "回应了", t, "的消息")
+                if emoji else join(o, "回应了", t, "的消息")
+            )
+        return (
+            join(o, "用", emoji, "回应了一条消息")
+            if emoji else join(o, "回应了一条消息")
+        )
+    if action == "取消表情回应":
+        if t:
+            return join(o, "取消了对", t, "消息的回应")
+        return join(o, "取消了一条消息的回应")
+    return generic
 
 
 def at_token(index: int) -> str:
@@ -100,13 +180,18 @@ def dump_relation_data(data: Optional[dict]) -> Optional[str]:
     media = data.get("media") or []
     poke_target = data.get("poke_target") or ""
     reply = data.get("reply")
-    if not mentions and not media and not poke_target and not reply:
+    event = data.get("event")
+    if not isinstance(event, dict):
+        event = None
+    if not mentions and not media and not poke_target and not reply and not event:
         return None
     payload = {"v": RELATION_VERSION, "mentions": mentions, "reply": reply}
     if media:
         payload["media"] = media
     if poke_target:
         payload["poke_target"] = poke_target
+    if event:
+        payload["event"] = event
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -117,6 +202,16 @@ def mention_label(mention: Any) -> str:
         return "全体成员"
     nickname = str(mention.get("nickname") or "").strip()
     return nickname or "未知成员"
+
+
+def _media_label_of(item: Any) -> str:
+    """单个 media 条目 → 上下文占位标签（emoji 带名称，其余走 MEDIA_KIND_LABELS）。"""
+    kind = str(item.get("kind") or "") if isinstance(item, dict) else ""
+    if kind == "emoji":
+        name = face_name(str(item.get("id") or ""))
+        if name:
+            return f'<cm_emoji>{xml_escape(name, quote=True)}</cm_emoji>'
+    return MEDIA_KIND_LABELS.get(kind, '<cm_media type="image"/>')
 
 
 def render_content_template(template: str, relation_data: Any) -> str:
@@ -135,8 +230,21 @@ def render_content_template(template: str, relation_data: Any) -> str:
 
     def media_label(index: int) -> str:
         if index >= len(media) or not isinstance(media[index], dict):
-            return "<cm_image/>"
-        return MEDIA_KIND_LABELS.get(str(media[index].get("kind") or ""), "<cm_image/>")
+            return '<cm_media type="image"/>'
+        item = media[index]
+        kind = str(item.get("kind") or "")
+        if kind == "poke":
+            # 戳一戳并入 <cm_event type="poke"> 的句子形式（混合消息里不带操作者，
+            # 由该条消息的 <cm_nickname> 承担）。
+            name = str(item.get("name") or "").strip()
+            if name:
+                return (
+                    '<cm_event type="poke">戳了戳 '
+                    f'<cm_nickname>{xml_escape(name, quote=True)}</cm_nickname>'
+                    "</cm_event>"
+                )
+            return '<cm_event type="poke">戳一戳</cm_event>'
+        return _media_label_of(item)
 
     # At 与媒体 token 可能交错出现：合并后按位置顺序渲染
     matches = [(m.start(), m.end(), "at", int(m.group(1))) for m in AT_TOKEN_RE.finditer(value)] + [
@@ -160,7 +268,7 @@ def render_content_template(template: str, relation_data: Any) -> str:
     if not result.strip() and media:
         # 纯媒体消息（正文无 token 且无文本）：按 media 数组顺序输出占位标签
         labels = [
-            MEDIA_KIND_LABELS.get(str(item.get("kind") or ""), "")
+            _media_label_of(item)
             for item in media
             if isinstance(item, dict)
         ]

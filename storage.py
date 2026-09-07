@@ -5,7 +5,7 @@ Schema 说明：
   其他取值：'llm_pending' / 'llm_success' / 'proactive' / 'orphan'。
 - ``content_kind``：消息内容形态（JSON 数组字符串，如 '["text","image"]'）。
   支持值：'text' / 'image' / 'video' / 'voice' / 'file' / 'emoji' / 'forward' / 'poke'
-  / 'system_event'。空数组 '[]' 表示 empty（如纯 @ 无文本）。
+  / 'event'（旧值 'system_event' 仅兼容读取）。空数组 '[]' 表示 empty（如纯 @ 无文本）。
 - ``at_id`` / ``reply_id`` / ``forward_id``：上下文引用 ID，仅在对应组件出现时存。
 - ``turn_id``：内部轮次 ID，新记录不依赖平台 message_id 即可配对。
 - ``send_status``：assistant 发送流程状态（prepared / send_attempted），不表示平台回执。
@@ -1131,6 +1131,27 @@ class DBManager:
                 "relation_data": row[1],
                 "sender_nickname": row[2] or "",
             }
+
+    async def latest_sender_nickname(self, umo: str, user_id: str) -> Optional[str]:
+        """按 umo+user_id 查最近一条 user 记录的真实昵称。
+
+        排除空昵称与「昵称=账号」（notice 事件的适配器兜底）；用于
+        事件（<cm_event>）的目标昵称解析。无命中返回 None。
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT sender_nickname FROM chat_memory_records "
+                    "WHERE umo = :umo AND user_id = :uid AND role = 'user' "
+                    "AND sender_nickname IS NOT NULL AND sender_nickname != '' "
+                    "AND sender_nickname != :uid "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"umo": umo, "uid": str(user_id or "")},
+            )
+            row = result.first()
+            return str(row[0] or "") if row is not None else None
 
     async def query_rounds_raw(
         self,

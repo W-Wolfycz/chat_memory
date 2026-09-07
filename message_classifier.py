@@ -346,11 +346,30 @@ def classify_content(
     if not kind and system_event_summary(event):
         kind = [K_SYSTEM]
 
+    # 挂载表情（mface）等被平台适配器丢弃的消息段：chain 为空但原始 JSON 里仍有
+    # 消息段，按 emoji 归档，避免纯挂件消息完全漏存。
+    if not kind and _raw_has_mface(event):
+        kind = [K_EMOJI]
+
     return kind, at_id, reply_id, forward_id
 
 
+def _raw_has_mface(event: AstrMessageEvent) -> bool:
+    """原始 JSON 的消息段里是否含 mface（挂载表情，适配器会丢弃该段）。"""
+    message_obj = getattr(event, "message_obj", None)
+    raw = getattr(message_obj, "raw_message", None)
+    if not isinstance(raw, dict):
+        return False
+    segments = raw.get("message")
+    if not isinstance(segments, list):
+        return False
+    return any(
+        isinstance(seg, dict) and str(seg.get("type") or "") == "mface"
+        for seg in segments
+    )
+
+
 _NOTICE_LABELS = {
-    "poke": "戳一戳",
     "group_recall": "撤回消息",
     "friend_recall": "撤回消息",
     "group_upload": "群文件上传",
@@ -358,14 +377,12 @@ _NOTICE_LABELS = {
     "group_increase": "群成员增加",
     "group_decrease": "群成员减少",
     "group_ban": "群禁言",
-    "friend_add": "好友添加",
     "group_card": "群名片变更",
     "offline_file": "离线文件",
     "client_status": "客户端状态变更",
 }
 
 _NOTIFY_SUB_LABELS = {
-    "poke": "戳一戳",
     "title": "设置群头衔",
     "lucky_king": "群运气王",
     "honor": "群荣誉变更",
@@ -398,46 +415,112 @@ def system_event_summary(event: AstrMessageEvent) -> str:
     AstrBot 把 OneBot notice/request 转成空消息，CM 据此补存系统事件；
     摘要用于落库 content（kind 仍为 system_event，不写成 text 类型）。
     """
+    parts = _system_event_parts(event)
+    return parts[0] if parts else ""
+
+
+def _system_event_parts(
+    event: AstrMessageEvent,
+) -> Optional[tuple[str, str, str, str, str, str]]:
+    """返回 ``(summary, action, detail, target_id, operator_id, event_type)``。
+
+    summary 与 ``system_event_summary`` 文本完全一致（落库/UI 展示）；
+    action/detail/target/operator/type 供 ``<cm_event>`` 上下文渲染使用。
+    target_id=被操作对象，operator_id=操作者（OneBot v11 仅部分事件提供，
+    拿不到为空串）；event_type 为事件大类（ban/member/title/recall/resource/
+    poke/system）。
+    """
     raw = None
     message_obj = getattr(event, "message_obj", None)
     if message_obj is not None:
         raw = getattr(message_obj, "raw_message", None)
     if not isinstance(raw, dict):
-        return ""
+        return None
     post_type = str(raw.get("post_type") or "")
+    if post_type == "request":
+        # 好友/加群请求类通知：取消归档（与戳一戳同策略，不入 system_event）
+        return None
     if post_type != "notice":
-        return "[请求事件]" if post_type == "request" else ""
+        return None
     notice_type = str(raw.get("notice_type") or "")
+    uid = str(raw.get("user_id") or "")
+    op = str(raw.get("operator_id") or "")
     if notice_type == "group_ban":
         if str(raw.get("sub_type") or "") == "lift_ban":
-            return "[解除禁言]"
+            return ("[解除禁言]", "解除禁言", "", uid, op, "ban")
         try:
             duration = int(raw.get("duration") or 0)
         except (TypeError, ValueError):
             duration = 0
-        return f"[群禁言 {_fmt_duration(duration)}]" if duration > 0 else "[群禁言]"
+        if duration > 0:
+            label = _fmt_duration(duration)
+            return (f"[群禁言 {label}]", "群禁言", label, uid, op, "ban")
+        return ("[群禁言]", "群禁言", "", uid, op, "ban")
     if notice_type == "group_admin":
-        return (
-            "[设置群管理员]"
-            if str(raw.get("sub_type") or "") == "set"
-            else "[取消群管理员]"
-        )
+        if str(raw.get("sub_type") or "") == "set":
+            return ("[设置群管理员]", "设置群管理员", "", uid, "", "member")
+        return ("[取消群管理员]", "取消群管理员", "", uid, "", "member")
     if notice_type == "group_upload":
+        # 上传类事件只有操作者（上传者），没有被操作对象
         file_info = raw.get("file") or {}
         name = _clean_event_text(file_info.get("name"), 40) if isinstance(
             file_info, dict
         ) else ""
-        return f"[群文件上传] {name}" if name else "[群文件上传]"
+        if name:
+            return (f"[群文件上传] {name}", "群文件上传", name, "", uid, "resource")
+        return ("[群文件上传]", "群文件上传", "", "", uid, "resource")
     if notice_type == "notify":
         sub = str(raw.get("sub_type") or "")
         if sub == "title":
             title = _clean_event_text(raw.get("title"), 50)
-            return f"[设置群头衔] {title}" if title else "[设置群头衔]"
+            if title:
+                return (f"[设置群头衔] {title}", "设置群头衔", title, uid, "", "title")
+            return ("[设置群头衔]", "设置群头衔", "", uid, "", "title")
+        if sub == "poke":
+            # 戳一戳走消息路径（适配器把带 target_id 的 poke 转成 Poke 组件），
+            # 不作为系统事件归档；无 target_id 的实现差异也一律不归档。
+            return None
         label = _NOTIFY_SUB_LABELS.get(sub)
-        return f"[{label}]" if label else "[系统通知]"
+        if label:
+            return (f"[{label}]", label, "", uid, "", "title")
+        return ("[系统通知]", "系统通知", "", uid, "", "system")
+    if notice_type == "poke":
+        # 老实现（go-cqhttp）的独立 poke notice：同样按非系统事件处理
+        return None
+    if notice_type == "group_msg_emoji_like":
+        # NapCat 扩展 notice：表情回应（给某条消息添加/取消 emoji 回应）。
+        # 被回应消息的作者由捕获侧按 message_id 本地关联补齐（同撤回）。
+        if bool(raw.get("is_add")):
+            return ("[表情回应]", "表情回应", "", "", uid, "reaction")
+        return ("[取消表情回应]", "取消表情回应", "", "", uid, "reaction")
+    if notice_type == "group_recall":
+        return ("[撤回消息]", "撤回消息", "", uid, op, "recall")
+    if notice_type == "friend_recall":
+        return ("[撤回消息]", "撤回消息", "", uid, "", "recall")
+    if notice_type in ("group_increase", "group_decrease"):
+        label = _NOTICE_LABELS.get(notice_type)
+        # v11：operator_id 为邀请者/同意者（增加）或踢人者（减少）
+        return (f"[{label}]", label, "", uid, op, "member")
+    if notice_type == "offline_file":
+        # 传输类事件只有操作者（发送者），没有被操作对象
+        file_info = raw.get("file") or {}
+        name = _clean_event_text(file_info.get("name"), 40) if isinstance(
+            file_info, dict
+        ) else ""
+        if name:
+            return (f"[离线文件] {name}", "离线文件", name, "", uid, "resource")
+        return ("[离线文件]", "离线文件", "", "", uid, "resource")
+    if notice_type == "friend_add":
+        # 好友添加通知：取消归档（好友相关通知不进 system_event）
+        return None
+    if notice_type == "client_status":
+        # 无 user_id：客户端状态变更不针对具体成员
+        return ("[客户端状态变更]", "客户端状态变更", "", "", "", "system")
     label = _NOTICE_LABELS.get(notice_type)
     # 撤回类只有 message_id，原文片段由捕获侧本地关联补齐（见 main._recall_snippet）
-    return f"[{label}]" if label else "[系统事件]"
+    if label:
+        return (f"[{label}]", label, "", uid, "", "member")
+    return ("[系统事件]", "系统事件", "", "", "", "system")
 
 
 def classify_assistant_chain(chain) -> tuple[list[str], str]:

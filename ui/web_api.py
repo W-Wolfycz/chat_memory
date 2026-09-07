@@ -58,7 +58,7 @@ class ChatMemoryUiWebApi:
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.4.1",
+                "version": "1.5.0",
                 "read_only": True,
                 "default_page_size": self.repository.default_page_size,
                 "max_page_size": self.repository.max_page_size,
@@ -141,6 +141,46 @@ class ChatMemoryUiWebApi:
         if not month.isdigit() or len(month) != 6:
             return _error("归档记录时间异常", 500)
         path = self.media_root / month / str(row.get("file_name") or "")
+        mime = str(row.get("mime_type") or "") or "application/octet-stream"
+        want_mode = str(request.args.get("as", "")).strip().lower()
+        if want_mode not in ("", "base64", "thumb", "file_token"):
+            return _error(f"未知的 as 模式：{want_mode}", 400)
+        if want_mode in ("base64", "thumb"):
+            # 先按归档记录大小拒绝，避免几十 MB 的媒体为一条 413 而整读进内存
+            if int(row.get("size_bytes") or 0) > _BASE64_MAX_BYTES:
+                return _error("媒体过大，请使用下载方式获取", 413)
+        if want_mode == "file_token":
+            # 免鉴权单次文件令牌（AstrBot /api/file/<token>，dashboard 白名单）：
+            # iframe 直连 /api/plug 媒体端点会被鉴权中间件 401（拿不到 JWT
+            # cookie/header），base64 内联又有 16MB 上限；此模式由前端 fetch
+            # 令牌地址整段获取为 blob 播放。令牌单次有效、随机不可枚举。
+            # 注意：本分支绝不整读文件（大视频 60MB+ 全量 read_bytes 会让
+            # dashboard 同进程内存暴涨、UI 卡死），只嗅探编码与登记路径。
+            size = int(row.get("size_bytes") or 0)
+            codec = ""
+            if str(row.get("kind") or "") == "video":
+                try:
+                    codec = await asyncio.to_thread(_sniff_video_codec, path)
+                except OSError:
+                    codec = ""
+            try:
+                from astrbot.core import file_token_service
+            except Exception as exc:
+                logger.warning("[ChatMemoryUI] file_token 不可用: %s", exc)
+                return _error("当前 AstrBot 版本不支持 file_token", 501)
+            try:
+                token = await file_token_service.register_file(str(path))
+            except Exception as exc:
+                logger.warning("[ChatMemoryUI] file_token 注册失败: %s", exc)
+                return _error("媒体令牌生成失败", 500)
+            return _ok({
+                "media_id": str(row.get("media_id") or ""),
+                "kind": str(row.get("kind") or ""),
+                "mime": mime,
+                "size": size,
+                "codec": codec,
+                "file_url": f"/api/file/{token}",
+            })
         try:
             data = await asyncio.to_thread(path.read_bytes)
         except OSError:
@@ -149,8 +189,6 @@ class ChatMemoryUiWebApi:
             logger.warning(
                 "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id[:8]
             )
-        mime = str(row.get("mime_type") or "") or "application/octet-stream"
-        want_mode = str(request.args.get("as", "")).strip().lower()
         if want_mode in ("base64", "thumb"):
             if len(data) > _BASE64_MAX_BYTES:
                 return _error("媒体过大，请使用下载方式获取", 413)
@@ -175,16 +213,63 @@ class ChatMemoryUiWebApi:
             from urllib.parse import quote
 
             disposition += f"; filename*=UTF-8''{quote(str(row.get('file_name') or ''))}"
-        # 元组返回：AstrBot 的 _coerce_view_result 会把它包成 Starlette Response
-        # （content-type 等头原样透传），测试环境无需安装 starlette。
+        common = {
+            "Content-Type": mime,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=86400",
+        }
+        # 视频/语音支持 HTTP Range（206）：<video>/<audio> 拖动进度与大文件流式
+        # 播放依赖分段请求；其余类型返回完整字节。
+        headers_obj = getattr(request, "headers", None)
+        range_header = (
+            str(headers_obj.get("Range") or "") if headers_obj is not None else ""
+        )
+        if range_header.startswith("bytes=") and str(row.get("kind") or "") in (
+            "video",
+            "voice",
+        ):
+            spec = range_header[len("bytes=") :].split(",", 1)[0]
+            start_s, _, end_s = spec.partition("-")
+            total = len(data)
+            try:
+                if not start_s:
+                    # 后缀范围 bytes=-N：取末尾 N 字节；N<=0 或缺失视为非法
+                    suffix_len = int(end_s) if end_s else 0
+                    if suffix_len <= 0:
+                        raise ValueError
+                    start = max(0, total - suffix_len)
+                    end = total - 1
+                else:
+                    start = int(start_s)
+                    end = int(end_s) if end_s else total - 1
+                    if start < 0 or start >= total or end < start:
+                        raise ValueError
+                    end = min(end, total - 1)
+            except (TypeError, ValueError):
+                return (
+                    {"success": False, "error": "Range 不合法"},
+                    416,
+                    {"Content-Range": f"bytes */{total}"},
+                )
+            # 元组返回：AstrBot 的 _coerce_view_result 会把它包成 Starlette Response
+            # （content-type 等头原样透传），测试环境无需安装 starlette。
+            return (
+                data[start : end + 1],
+                206,
+                {
+                    **common,
+                    "Content-Range": f"bytes {start}-{end}/{total}",
+                    "Content-Length": str(end - start + 1),
+                },
+            )
+        # 元组返回：同上。
         return (
             data,
             200,
             {
-                "Content-Type": mime,
+                **common,
                 "Content-Disposition": disposition,
                 "Content-Length": str(len(data)),
-                "Cache-Control": "private, max-age=86400",
             },
         )
 
@@ -350,6 +435,32 @@ def _downscale_image(data: bytes, max_side: int = 512):
             return buffer.getvalue(), mime
     except Exception:
         return None
+
+
+# 视频内联播放的客户端大小闸门：超过此值的视频不再整段 fetch 成 blob
+# （几十 MB 的视频会让 dashboard 页面内存暴涨卡死），直接引导下载观看。
+_INLINE_PLAYBACK_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _sniff_video_codec(path) -> str:
+    """只读视频前 512KB 嗅探编码：hevc（hvc1/hev1）/ avc1 / av01 / vp09。
+
+    moov 在文件尾部的文件可能嗅不到（返回空串，由大小闸门兜底）。
+    """
+    try:
+        with open(path, "rb") as fh:
+            probe = fh.read(512 * 1024)
+    except OSError:
+        return ""
+    if b"hvc1" in probe or b"hev1" in probe:
+        return "hevc"
+    if b"avc1" in probe:
+        return "avc1"
+    if b"av01" in probe:
+        return "av01"
+    if b"vp09" in probe:
+        return "vp09"
+    return ""
 
 
 def _ok(data: Any) -> dict[str, Any]:

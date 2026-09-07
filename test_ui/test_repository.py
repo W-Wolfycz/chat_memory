@@ -500,6 +500,176 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(len(detail["record"]["media_view"]), 1)
         self.assertFalse(detail["record"]["media_view"][0]["archived"])
 
+        # 小节：_render_content 的文件名占位与图片缩略图标记
+        from chat_memory.ui.repository import _render_content
+        rel = {"v": 1, "mentions": [], "reply": None, "media": [
+            {"kind": "file", "id": "cd" * 16, "name": "课程 表⟦x⟧.pdf"},
+            {"kind": "image", "id": media_id},
+        ]}
+        template = "看⟦CM_FILE:0⟧和⟦CM_IMAGE:1⟧"
+        assert _render_content(template, rel, ["text"]) == "看⟦课程 表x.pdf⟧和⟦图片⟧"
+        archived = {media_id: {"kind": "image"}}
+        rendered = _render_content(template, rel, ["text"], media_archive=archived)
+        assert rendered == f"看⟦课程 表x.pdf⟧和⟦CM_IMG:{media_id}⟧"
+
+        # 小节：system_event 详情内容渲染为自然语言句子（UI 纯文本、无 cm 标签）
+        from chat_memory.relation_codec import build_event_sentence
+        assert build_event_sentence({
+            "action": "群禁言", "detail": "10分钟",
+            "target": "长风", "operator": "小明",
+        }) == "长风 被 小明 禁言了 10分钟"
+        assert build_event_sentence({
+            "action": "撤回消息", "detail": "", "target": "", "operator": "",
+        }) == "撤回消息"
+        connection = sqlite3.connect(path)
+        event_relation = json.dumps({"v": 1, "mentions": [], "media": [],
+                                     "event": {"type": "ban", "action": "群禁言",
+                                               "detail": "10分钟",
+                                               "target": "长风",
+                                               "operator": "小明"}},
+                                    ensure_ascii=False)
+        connection.execute(
+            "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
+            "relation_data = ? WHERE turn_id = ?",
+            ('["event"]', "[群禁言 10分钟]", event_relation, "turn-b"),
+        )
+        connection.commit()
+        connection.close()
+        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
+                                         "page_size": 50}))
+        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
+        assert item["content"] == "长风 被 小明 禁言了 10分钟"
+        # 无 event 结构的旧记录保持原摘要文本
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "UPDATE chat_memory_records SET relation_data = NULL "
+            "WHERE turn_id = ?",
+            ("turn-b",),
+        )
+        connection.commit()
+        connection.close()
+        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
+                                         "page_size": 50}))
+        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
+        assert item["content"] == "[群禁言 10分钟]"
+
+        # 小节：纯图片消息——已归档输出缩略图标记，未归档保持 ⟦图片⟧ 占位
+        image_relation = json.dumps({"v": 1, "mentions": [], "media": [
+            {"kind": "image", "id": media_id}]}, ensure_ascii=False)
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
+            "relation_data = ? WHERE turn_id = ?",
+            ('["image"]', "[image]", image_relation, "turn-b"),
+        )
+        connection.commit()
+        connection.close()
+        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
+                                         "page_size": 50}))
+        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
+        assert item["content"] == f"⟦CM_IMG:{media_id}⟧"
+        # 未归档图片保持占位文本
+        unarchived = json.dumps({"v": 1, "mentions": [], "media": [
+            {"kind": "image", "id": "ff" * 16}]}, ensure_ascii=False)
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "UPDATE chat_memory_records SET relation_data = ? WHERE turn_id = ?",
+            (unarchived, "turn-b"),
+        )
+        connection.commit()
+        connection.close()
+        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
+                                         "page_size": 50}))
+        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
+        assert item["content"] == "⟦图片⟧"
+
+        # 小节：事件子类过滤（event_type → relation_data.event.type）
+        ban_relation = json.dumps({"v": 1, "mentions": [], "media": [],
+                                   "event": {"type": "ban", "action": "群禁言",
+                                             "detail": "10分钟",
+                                             "target": "长风",
+                                             "operator": "小明"}},
+                                  ensure_ascii=False)
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
+            "relation_data = ? WHERE turn_id = ?",
+            ('["event"]', "[群禁言 10分钟]", ban_relation, "turn-b"),
+        )
+        connection.commit()
+        connection.close()
+        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
+                                         "event_type": "ban", "page_size": 50}))
+        assert any(x["turn_id"] == "turn-b" for x in result["items"])
+        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
+                                         "event_type": "recall", "page_size": 50}))
+        assert not any(x["turn_id"] == "turn-b" for x in result["items"])
+        with self.assertRaises(ValueError):
+            asyncio.run(repo.query({"event_type": "not_a_type"}))
+        # reaction 是合法子类（NapCat 表情回应），不抛异常即可
+        asyncio.run(repo.query({"event_type": "reaction", "page_size": 50}))
+
+    def test_ui_event_sentence_poke_id_fallback(self):
+        """poke 事件 UI 句子：昵称缺失回退账号 ID（仅查询台展示）；其他事件不回退。"""
+        path = Path(self.temp_dir.name) / "poke_ui.db"
+        make_database(path)
+        repo = ChatMemoryRepository(
+            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+        )
+
+        def set_event(relation: dict, sender_nick: str, user_id: str) -> None:
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
+                "relation_data = ?, sender_nickname = ?, user_id = ? "
+                "WHERE turn_id = ?",
+                ('["event"]', "[戳一戳]", json.dumps(relation, ensure_ascii=False),
+                 sender_nick, user_id, "turn-b"),
+            )
+            connection.commit()
+            connection.close()
+
+        def rendered() -> str:
+            result = asyncio.run(repo.query({"page_size": 50}))
+            item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
+            return item["content"]
+
+        poke_media = [{"kind": "poke", "id": "10002", "type": "126",
+                       "name": "小虎"}]
+        base = {"v": 1, "mentions": [], "media": poke_media,
+                "event": {"type": "poke", "action": "戳一戳", "detail": "",
+                          "target": "", "operator": ""}}
+        # operator 缺失 + 数字昵称：回退 user_id；target 有 name 用昵称
+        set_event(base, "10001", "10001")
+        self.assertEqual(rendered(), "10001 戳了戳 小虎")
+        # 真实昵称优先于 user_id
+        set_event(base, "阿明", "10001")
+        self.assertEqual(rendered(), "阿明 戳了戳 小虎")
+        # target 无 name：回退 poke 条目 id
+        base["media"] = [{"kind": "poke", "id": "10002", "type": "126"}]
+        set_event(base, "10001", "10001")
+        self.assertEqual(rendered(), "10001 戳了戳 10002")
+        # 非 poke 事件（ban）operator 缺失：不做 ID 回退
+        ban = {"v": 1, "mentions": [], "media": [],
+               "event": {"type": "ban", "action": "群禁言", "detail": "10分钟",
+                         "target": "长风", "operator": ""}}
+        set_event(ban, "10001", "10001")
+        self.assertEqual(rendered(), "长风 被禁言了 10分钟")
+
+    def test_emoji_face_name_rendering(self):
+        """QQ 表情按 face id 渲染中文名（正文占位/媒体标签）；未知 id 回退通用占位。"""
+        from chat_memory.ui.repository import _render_content, _ui_media_label_of
+
+        rel = {"v": 1, "mentions": [], "media": [{"kind": "emoji", "id": "268"}]}
+        self.assertEqual(_render_content("哈⟦CM_EMOJI:0⟧", rel, ["text"]),
+                         "哈⟦表情:问号脸⟧")
+        self.assertEqual(_ui_media_label_of({"kind": "emoji", "id": "268"}),
+                         "⟦表情:问号脸⟧")
+        self.assertEqual(_ui_media_label_of({"kind": "emoji", "id": "99999"}),
+                         "⟦表情⟧")
+        self.assertEqual(_ui_media_label_of({"kind": "image", "id": "x"}),
+                         "⟦图片⟧")
+
     def test_pure_media_english_placeholder_localized(self):
         """纯媒体英文占位本地化：media 非空才翻，用户真输入 '[image]' 不翻。"""
         path = Path(self.temp_dir.name) / "localize.db"

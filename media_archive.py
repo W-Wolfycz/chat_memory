@@ -294,6 +294,10 @@ class MediaArchiver:
                 # 文件已落位但登记失败：回删文件，不留无行孤儿
                 dest.unlink(missing_ok=True)
                 raise
+            logger.debug(
+                "[ChatMemory] 媒体归档完成 kind=%s ext=%s size=%d",
+                kind, ext, size,
+            )
             return True
         except Exception as exc:
             logger.debug("[ChatMemory] 媒体归档登记失败 %s: %s", media_id[:8], exc)

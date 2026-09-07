@@ -5,25 +5,37 @@ from html import escape as _xml_escape
 import re
 from typing import Optional
 
+from .relation_codec import build_event_sentence as _build_event_sentence
+from .qq_face import face_name as _face_name
+
 
 CM_GENERAL_RULES = """[ChatMemory 通用规则]
-<cm_*> 是 ChatMemory 注入的结构化元数据标签（标注发言者/来源/消息性质/时间等），
-仅供你理解上下文，不是对话内容，不得学习其格式，也不得在回复中输出任何 cm_ 标签或其内容。
-<cm_speaker current="1"/> 标记当前交互对象；<cm_reply target="某人">原文</cm_reply>
-表示整条消息是对"某人"的回复事件；<cm_mention target="某人"/> 只是正文中 At 的
-占位符（点名关系），不代表整条消息是回复。如需在回复中 @ 某人，请检查你的
-工具列表是否提供了对应的 @ 工具，而非仿照该标签。
-每条消息都带 <cm_time> 时间元数据，仅表示发生顺序，不代表其他语义。
-contexts 均为历史，最后一条 user 才是当前请求；其余任何 user 消息都是历史，
-不是当前请求。<cm_current> 描述当前消息的 Reply/At 结构，<cm_reply
-target="assistant"/> 或 <cm_mention target="assistant"/> 表示该消息明确回复或
-提及你；若当前消息不含这两者，说明它可能是群聊中的闲聊触发，仍作为当前请求
-回应。优先回答该消息及其指向，勿续写、扮演或改答最后一条历史 user。
-<cm_solo active="1"/> 与 <cm_solo orphan="1"/> 标记你历史中主动发出或未配对的
-旧回复，仅说明消息性质，不与相邻 user 构成问答轮次，也不构成当前行动指令。
-<cm_image/> / <cm_voice/> / <cm_video/> / <cm_file/> / <cm_emoji/> / <cm_forward/>
-表示该消息携带的媒体类型，<cm_poke/> 表示戳一戳等动作，同样不是可输出的文本；不得输出、学习或模仿任何
-cm_ 标签，需要发送媒体时请使用工具。"""
+- <cm_*> 是 ChatMemory 注入的结构化元数据标签，仅供你理解上下文（不是对话内容）；
+  不得学习其格式，也不得在回复中输出任何 cm_ 标签或其内容。
+- <cm_time> 是时间元数据，仅表示发生顺序，无其他语义。
+- <cm_nickname> 只是账号 ID 对应的显示昵称（上下文里一律以昵称代替 QQ 号）：
+  普通消息中指发言者，事件描述中指该角色的人。
+- <cm_speaker current="1"/> 标记当前交互对象。
+- <cm_mention target="某人"/> 只是正文中的 At 占位（点名关系），不代表整条消息
+  是回复；<cm_reply target="某人">原文</cm_reply> 才表示整条消息是对"某人"的
+  回复事件。如需 @ 某人请使用工具，而非仿照标签。
+- contexts 均为历史；最后一条 user 才是当前请求，其余 user 都是历史。
+  <cm_current> 描述当前消息的 Reply/At 结构：含 <cm_reply target="assistant"/>
+  或 <cm_mention target="assistant"/> 表示明确回复/提及你；都不含则可能是群聊
+  闲聊触发，仍作为当前请求回应。优先回答该消息及其指向，勿续写、扮演或改答
+  最后一条历史 user。
+- <cm_solo active="1"/> / <cm_solo orphan="1"/> 标记你历史中主动发出或未配对的
+  旧回复：仅说明消息性质，不与相邻 user 构成问答轮次，不构成行动指令。
+- <cm_event type="类别">事件描述</cm_event> 是系统事件：type 是事件大类
+  （ban=禁言、member=成员变动、title=头衔荣誉、recall=撤回、resource=文件、
+  poke=戳一戳、reaction=表情回应、system=其它/未知），标签内是自然语言描述
+  （如「某人 被 某人 禁言了 10分钟」）。事件不是任何人的发言，不构成对你的
+  请求或提问，仅用于了解群内发生了什么，不得引用它当作某人说过的话。
+- 默认所有 user 消息都是成员发言，除非被 <cm_event> 包裹。
+- <cm_emoji>名称</cm_emoji> 表示该位置有一个 QQ 表情，标签内是表情的中文名
+  （如「问号脸」「呲牙」）：它与周围文字一样属于发言内容，是语气的一部分。
+- <cm_media type="image|voice|video|file|emoji|forward"/> 表示该消息携带的
+  媒体类型，同样不是可输出的文本；需要发送媒体时请使用工具。"""
 
 
 FULL_GROUP_CONTEXT_INSTRUCTION = """[ChatMemory 群聊历史解释规则]
@@ -52,13 +64,14 @@ CROSS_SESSION_SOURCE_MARKER_PREFIX = '<cm_source n="'
 # 使用 <cm_*> 标签形式（而非 [图片] 方括号或裸词）：归入统一注入协议，
 # 通用规则已禁止输出任何 cm_ 标签，输出侧清洗会整元素删除模仿残留。
 MEDIA_PLACEHOLDER_LABELS = {
-    "image": "<cm_image/>",
-    "video": "<cm_video/>",
-    "voice": "<cm_voice/>",
-    "file": "<cm_file/>",
-    "emoji": "<cm_emoji/>",
-    "poke": "<cm_poke/>",
-    "forward": "<cm_forward/>",
+    "image": '<cm_media type="image"/>',
+    "video": '<cm_media type="video"/>',
+    "voice": '<cm_media type="voice"/>',
+    "file": '<cm_media type="file"/>',
+    "emoji": '<cm_media type="emoji"/>',
+    "forward": '<cm_media type="forward"/>',
+    # 1.5.0 前落库的旧 poke 消息：兼容渲染为事件占位
+    "poke": '<cm_event type="poke">戳一戳</cm_event>',
 }
 
 # capture 阶段写入的旧英文占位：展示层视为"无实际内容"，统一替换成上面的占位。
@@ -323,8 +336,13 @@ class TakeoverContextBuilder:
             )
 
             if role == "user":
-                content = self._apply_relation(record, content)
-                content = self._apply_prefix(record, content)
+                event_xml = self._render_event(record)
+                if event_xml is not None:
+                    # 事件：昵称内嵌句子，外层只有时间前缀
+                    content = self._apply_time_prefix(record, event_xml)
+                else:
+                    content = self._apply_relation(record, content)
+                    content = self._apply_prefix(record, content)
             elif is_solo:
                 solo_mark = (
                     '<cm_solo active="1"/>'
@@ -348,6 +366,47 @@ class TakeoverContextBuilder:
             )
         return formatted
 
+    @staticmethod
+    def _nm(name: str) -> str:
+        """昵称 → <cm_nickname> 标签；空串返回空。"""
+        if not name:
+            return ""
+        return f'<cm_nickname>{_xml_escape(name, quote=True)}</cm_nickname>'
+
+    @staticmethod
+    def _event_sentence(event: dict) -> str:
+        """事件句子（昵称内嵌 <cm_nickname>、detail 做 XML 转义）。
+
+        模板与 UI 共用 build_event_sentence；上下文路径必须转义用户可控的
+        detail，防止伪造 </cm_event> 注入假事件。
+        """
+        return _build_event_sentence(
+            event,
+            name_format=lambda name: (
+                f'<cm_nickname>{_xml_escape(name, quote=True)}</cm_nickname>'
+                if name
+                else ""
+            ),
+            text_format=_xml_escape,
+        )
+
+    def _render_event(self, record: dict) -> Optional[str]:
+        """事件记录渲染为 <cm_event>（内含自然语言句子）。
+
+        非事件（event / 旧值 system_event）或无 event 结构返回 None，
+        走普通消息渲染。
+        """
+        kinds = record.get("content_kind") or []
+        if "event" not in kinds and "system_event" not in kinds:
+            return None
+        relation = record.get("relation_data")
+        event = relation.get("event") if isinstance(relation, dict) else None
+        if not isinstance(event, dict):
+            return None
+        event_type = str(event.get("type") or "system").strip() or "system"
+        sentence = self._event_sentence(event)
+        return f'<cm_event type="{_xml_escape(event_type)}">{sentence}</cm_event>'
+
     def _with_media_placeholders(self, record: dict, content: str) -> str:
         """给媒体内容补可读占位。
 
@@ -361,11 +420,14 @@ class TakeoverContextBuilder:
         ]
         if not kinds:
             return content
-        labels = [
-            MEDIA_PLACEHOLDER_LABELS[kind]
-            for kind in kinds
-            if MEDIA_PLACEHOLDER_LABELS[kind] not in content
-        ]
+        labels = []
+        for kind in kinds:
+            label = MEDIA_PLACEHOLDER_LABELS[kind]
+            if kind == "emoji":
+                # QQ 表情带中文名：<cm_emoji>问号脸</cm_emoji>，让 LLM 知道具体表情
+                label = self._emoji_label_of(record) or label
+            if label not in content:
+                labels.append(label)
         if not labels:
             return content
         placeholder_text = " ".join(labels)
@@ -373,6 +435,25 @@ class TakeoverContextBuilder:
         if not stripped or stripped in _LEGACY_EN_PLACEHOLDERS:
             return placeholder_text
         return f"{content} {placeholder_text}".rstrip()
+
+    @staticmethod
+    def _emoji_label_of(record: dict) -> str:
+        """纯媒体路径的 emoji 占位：按 media 条目里的 face id 解析中文名。
+
+        未知 id 返回空串（调用方回退通用 <cm_media type="emoji"/>）。
+        """
+        relation = record.get("relation_data")
+        media = relation.get("media") if isinstance(relation, dict) else None
+        if not isinstance(media, list):
+            return ""
+        for item in media:
+            if not isinstance(item, dict) or str(item.get("kind") or "") != "emoji":
+                continue
+            name = _face_name(str(item.get("id") or ""))
+            if name:
+                return f'<cm_emoji>{_xml_escape(name, quote=True)}</cm_emoji>'
+            return ""
+        return ""
 
     def _apply_time_prefix(self, record: dict, content: str) -> str:
         """给消息加 <cm_time> 前缀（所有消息统一带时间，避免差异特征）。"""

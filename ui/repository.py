@@ -1,11 +1,8 @@
 """Read-only SQLite access for ChatMemory schema v4.
 
-The repository intentionally does not import ChatMemory internals. AstrBot does not
-guarantee cross-plugin module imports, and a UI query plugin should remain usable
-while the writer plugin is temporarily disabled.
-
-Schema v4 adds the ``chat_memory_tool_records`` table for LLM tool calls; it is
-optional at read time so databases migrated from v3 and earlier remain readable.
+The repository intentionally avoids AstrBot/core internals; the only cross-module
+import is ``..relation_codec`` (pure stdlib, ships inside the same plugin), used
+for the shared system-event sentence builder.
 """
 
 from __future__ import annotations
@@ -20,6 +17,9 @@ from datetime import datetime, timedelta, timezone as dt_timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo
+
+from ..relation_codec import build_event_sentence
+from ..qq_face import face_name
 
 
 TABLE_NAME = "chat_memory_records"
@@ -48,8 +48,22 @@ VALID_KINDS = {
     "face",
     "emoji",
     "forward",
+    "event",
+    # 1.5.0 前落库的旧 kind 值：仅兼容筛选，新数据不再写入
     "system_event",
     "poke",
+}
+
+# 事件子类（event.type）——查询台「事件子类」过滤的合法值
+VALID_EVENT_TYPES = {
+    "ban",
+    "member",
+    "title",
+    "recall",
+    "resource",
+    "poke",
+    "reaction",
+    "system",
 }
 AT_TOKEN_RE = re.compile(r"⟦CM_AT:(\d+)⟧")
 # 与 chat_memory.relation_codec 对称：用户正文 ⟦/⟧ 的哨兵字符，展示侧还原
@@ -1009,6 +1023,11 @@ class ChatMemoryRepository:
                 f"THEN {alias}.content_kind ELSE '[]' END) WHERE value = :content_kind)"
             )
             params["content_kind"] = filters["content_kind"]
+        if filters.get("event_type"):
+            conditions.append(
+                f"json_extract({alias}.relation_data, '$.event.type') = :event_type"
+            )
+            params["event_type"] = filters["event_type"]
         if filters.get("keyword"):
             conditions.append(
                 "("
@@ -1075,6 +1094,11 @@ class ChatMemoryRepository:
             raise ValueError("未知 content_kind")
         normalized["content_kind"] = kind
 
+        event_type = str(raw.get("event_type", "") or "").strip()
+        if event_type and event_type not in VALID_EVENT_TYPES:
+            raise ValueError("未知事件子类")
+        normalized["event_type"] = event_type
+
         persona_raw = raw.get("persona_id", None)
         if persona_raw in (None, "__all__"):
             normalized["persona_id"] = None
@@ -1119,6 +1143,30 @@ class ChatMemoryRepository:
             .strftime("%Y-%m-%d %H:%M:%S")
         )
 
+    @staticmethod
+    def _ui_event_sentence(
+        row: sqlite3.Row, relation_data: dict, event: dict
+    ) -> str:
+        """UI 展示用事件句子：昵称缺失时回退账号 ID（仅查询台可见，账号不进上下文）。"""
+        ui_event = dict(event)
+        event_type = str(ui_event.get("type") or "")
+        if event_type == "poke":
+            if not str(ui_event.get("operator") or "").strip():
+                nick = str(row["sender_nickname"] or "").strip()
+                if nick and not nick.isdigit():
+                    ui_event["operator"] = nick
+                else:
+                    ui_event["operator"] = str(row["user_id"] or "").strip()
+            if not str(ui_event.get("target") or "").strip():
+                for item in relation_data.get("media") or []:
+                    if (not isinstance(item, dict)
+                            or str(item.get("kind") or "") != "poke"):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    ui_event["target"] = name or str(item.get("id") or "").strip()
+                    break
+        return build_event_sentence(ui_event)
+
     def _serialize_record(
         self,
         row: sqlite3.Row,
@@ -1130,7 +1178,34 @@ class ChatMemoryRepository:
         raw_content = str(row["content"] or "")
         relation_data = _parse_relation_data(_row_value(row, "relation_data"))
         content_kind = _parse_content_kind(row["content_kind"])
-        rendered_content = _render_content(raw_content, relation_data, content_kind)
+        rendered_content = _render_content(
+            raw_content, relation_data, content_kind, media_archive=media_archive
+        )
+        # 事件：有 event 结构时按自然语言句子展示（与上下文同一套模板，
+        # UI 为纯文本、无 cm 标签）；老数据无 event 结构保持原摘要文本。
+        if ("event" in content_kind or "system_event" in content_kind) and (
+            isinstance(relation_data, dict)
+        ):
+            event = relation_data.get("event")
+            if isinstance(event, dict):
+                rendered_content = self._ui_event_sentence(row, relation_data, event)
+        # 纯图片消息：正文是 ⟦图片⟧ 占位时，对已归档图片输出缩略图标记
+        # （前端据此加载内联缩略图）；未归档/旧数据保持占位文本。
+        if rendered_content.strip() and not rendered_content.replace(
+            "⟦图片⟧", ""
+        ).strip():
+            markers = []
+            if isinstance(relation_data, dict) and media_archive:
+                for item in relation_data.get("media") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("kind") or "") != "image":
+                        continue
+                    media_id = str(item.get("id") or "")
+                    if media_id in media_archive:
+                        markers.append(f"⟦CM_IMG:{media_id}⟧")
+            if markers:
+                rendered_content = " ".join(markers)
         truncated = len(rendered_content) > preview_limit
         if truncated:
             rendered_content = rendered_content[:preview_limit].rstrip() + "…"
@@ -1297,13 +1372,39 @@ def _parse_relation_data(value: Any) -> dict[str, Any] | None:
     reply = parsed.get("reply")
     if reply is not None and not isinstance(reply, dict):
         reply = None
-    return {"v": 1, "mentions": mentions, "reply": reply, "media": media}
+    event = parsed.get("event")
+    if event is not None and not isinstance(event, dict):
+        event = None
+    return {
+        "v": 1,
+        "mentions": mentions,
+        "reply": reply,
+        "media": media,
+        "event": event,
+    }
+
+
+def _clean_inline_name(value: Any) -> str:
+    """文件名进占位符的净化：去控制字符与 ⟦⟧ 结构符，限长 60。"""
+    text = "".join(ch for ch in str(value or "") if ch >= " " or ch == "\t")
+    return text.replace("⟦", "").replace("⟧", "").strip()[:60]
+
+
+def _ui_media_label_of(item: Any) -> str:
+    """单个 media 条目 → UI 占位标签（emoji 带中文名，其余走 MEDIA_KIND_LABELS）。"""
+    kind = str(item.get("kind") or "") if isinstance(item, dict) else ""
+    if kind == "emoji":
+        name = face_name(str(item.get("id") or ""))
+        if name:
+            return f"⟦表情:{name}⟧"
+    return MEDIA_KIND_LABELS.get(kind, "⟦媒体⟧")
 
 
 def _render_content(
     template: str,
     relation_data: dict[str, Any] | None,
     content_kind: list[str] | None = None,
+    media_archive: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     kinds = set(content_kind or [])
     if not relation_data:
@@ -1325,14 +1426,29 @@ def _render_content(
         index = int(match.group(1))
         if index >= len(media) or not isinstance(media[index], dict):
             return "⟦媒体⟧"
-        return MEDIA_KIND_LABELS.get(str(media[index].get("kind") or ""), "⟦媒体⟧")
+        item = media[index]
+        kind = str(item.get("kind") or "")
+        if kind == "image":
+            # 已归档的图片输出缩略图标记（⟦CM_IMG:<id>⟧），前端据此加载缩略图；
+            # 未归档保持 ⟦图片⟧ 占位。
+            media_id = str(item.get("id") or "")
+            if media_archive and media_id in media_archive:
+                return f"⟦CM_IMG:{media_id}⟧"
+        elif kind == "emoji":
+            name = face_name(str(item.get("id") or ""))
+            if name:
+                return f"⟦表情:{name}⟧"
+        elif kind == "file":
+            name = _clean_inline_name(item.get("name"))
+            return f"⟦{name}⟧" if name else MEDIA_KIND_LABELS.get(kind, "⟦媒体⟧")
+        return MEDIA_KIND_LABELS.get(kind, "⟦媒体⟧")
 
     value = AT_TOKEN_RE.sub(replace, template)
     value = MEDIA_TOKEN_RE.sub(replace_media, value)
     value = value.replace(_SENTINEL_LEFT, "⟦").replace(_SENTINEL_RIGHT, "⟧")
     if not value.strip() and media:
         labels = [
-            MEDIA_KIND_LABELS.get(str(item.get("kind") or ""), "")
+            _ui_media_label_of(item)
             for item in media
             if isinstance(item, dict)
         ]

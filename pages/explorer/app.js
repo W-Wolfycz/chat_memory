@@ -1,5 +1,7 @@
 const PLUGIN_NAME = 'chat_memory';
 const bridge = window.AstrBotPluginPage || null;
+// 前端版本标记：F12 控制台能看到这行说明页面已加载最新 JS（沙箱 base64 桥接版）
+console.info('[chat_memory] 查询台已加载（video-gate v3：base64 桥接 + 16MB/HEVC 闸门）');
 
 const state = {
   about: null,
@@ -19,6 +21,10 @@ const state = {
   toolRequestToken: 0,
   lastToolQuery: null,
   mediaObjectUrls: [],
+  listMediaUrls: [],
+  voiceAudio: null,
+  voiceUrls: [],
+  voicePlayingId: null,
 };
 
 const FACET_SELECTORS = [
@@ -29,6 +35,7 @@ const FACET_SELECTORS = [
   '#filter-role',
   '#filter-status',
   '#filter-kind',
+  '#filter-event-type',
   '#filter-platform',
   '#filter-message-type',
 ];
@@ -103,6 +110,27 @@ async function fetchMediaObjectUrl(mediaId) {
 
 const ARCHIVE_MEDIA_KINDS = new Set(['image', 'video', 'voice', 'file']);
 
+function subtypeBadges(record) {
+  // 子类徽章：完全动态——event·<type> 读 relation_data.event.type，
+  // media·<kind> 读 media_view 里实际出现的每个 kind，不写死任何清单。
+  const badges = [];
+  const eventType = record.relation_data
+    && record.relation_data.event
+    && record.relation_data.event.type;
+  if (eventType) {
+    badges.push(`<span class="badge sub">event·${escapeHtml(eventType)}</span>`);
+  }
+  const mediaKinds = new Set(
+    (Array.isArray(record.media_view) ? record.media_view : [])
+      .map((item) => (item && item.kind) || '')
+      .filter(Boolean)
+  );
+  mediaKinds.forEach((kind) => {
+    badges.push(`<span class="badge sub">media·${escapeHtml(kind)}</span>`);
+  });
+  return badges;
+}
+
 function downloadMedia(mediaId, name) {
   // 优先走 Plugin Page 原生下载（带鉴权、直接取原始字节）；
   // 无 bridge 时回退 base64 → blob → <a download>。
@@ -128,13 +156,14 @@ function mediaDetailHtml(media) {
     const okTag = '<span class="media-state-ok">已归档</span>';
     const downloadButton = `<button type="button" class="media-download-button" data-download-id="${mid}" data-download-name="${escapeHtml(media.name || media.file || media.kind)}">下载</button>`;
     if (media.kind === 'image') {
-      return `<figure class="media-item"><div class="media-loading" data-media-id="${mid}" data-kind="image"><span class="loader"></span> 缩略图加载中…</div><figcaption class="media-actions">image · ${size} ${okTag}${downloadButton}</figcaption></figure>`;
+      // 详情上方消息正文已展示内联缩略图（可双击看原图），媒体栏不再重复挂图
+      return `<figure class="media-item"><div class="media-chip"><span class="media-chip-label">image</span><span class="media-state-ok">已归档</span></div><figcaption class="media-actions">${size}${downloadButton}</figcaption></figure>`;
     }
     if (media.kind === 'voice') {
       return `<figure class="media-item"><audio controls preload="none" data-media-id="${mid}" data-kind="voice"></audio><figcaption class="media-actions">voice · ${size} ${okTag}${downloadButton}</figcaption></figure>`;
     }
     if (media.kind === 'video') {
-      return `<figure class="media-item"><video controls preload="none" data-media-id="${mid}" data-kind="video"></video><figcaption class="media-actions">video · ${size} ${okTag}${downloadButton}</figcaption></figure>`;
+      return `<figure class="media-item"><video controls preload="none" data-media-id="${mid}" data-kind="video" data-size="${escapeHtml(media.size || 0)}"></video><figcaption class="media-actions">video · ${size} ${okTag}${downloadButton}</figcaption></figure>`;
     }
     if (media.kind === 'file') {
       const name = escapeHtml(media.name || media.file || 'file');
@@ -145,7 +174,8 @@ function mediaDetailHtml(media) {
   if (media.kind === 'poke') {
     label = `poke${media.poke_label ? `·${media.poke_label}` : ''}${media.id ? ` · 目标 ${media.id}` : ''}`;
   } else if (media.kind === 'emoji' && media.id) {
-    label = `emoji #${media.id}`;
+    // 中文名已由正文占位（⟦表情:问号脸⟧）展示，chip 保持简洁
+    label = 'emoji';
   } else if (media.kind === 'forward' && media.id) {
     label = `forward #${media.id}`;
   } else if (media.kind === 'file') {
@@ -168,29 +198,95 @@ function attachDetailMedia(root) {
   root.querySelectorAll('[data-media-id]').forEach((element) => {
     const mediaId = element.dataset.mediaId;
     const kind = element.dataset.kind;
-    const as = kind === 'image' ? 'thumb' : 'base64';
-    apiGet(`media/${mediaId}`, { as })
+    if (kind === 'video') {
+      // 播放回退链：直连原始字节流（Range 流式，需同源鉴权；iframe 拿不到
+      // dashboard JWT 时会 401）→ base64 桥接播放。沙箱 iframe（sandbox 无
+      // allow-same-origin，不透明源）里直接 fetch /api/file 会被 CORS 拦截，
+      // 媒体字节统一走 bridge；file_token 仅作 8ms 的元数据探测（编码/大小）。
+      const rawUrl = `/api/plug/${PLUGIN_NAME}/media/${mediaId}`;
+      const BASE64_MAX_BYTES = 16 * 1024 * 1024;
+      const knownSize = Number(element.dataset.size || 0);
+      const playBlob = (blobUrl) => {
+        state.mediaObjectUrls.push(blobUrl);
+        element.classList.remove('loading');
+        element.src = blobUrl;
+        // 第一次点击 play 时 src 还是 401 直连源，会被 error 打断；
+        // 回退源就绪后自动续播，让“一次点击”就进入播放状态。
+        const attempt = element.play();
+        if (attempt && typeof attempt.catch === 'function') {
+          attempt.catch(() => { /* 自动播放被拦截时停在首帧，用户再点播放 */ });
+        }
+      };
+      const showPlaybackError = (hint) => {
+        if (element.dataset.failed === '1') return;
+        element.dataset.failed = '1';
+        element.classList.remove('loading');
+        element.classList.add('failed');
+        element.insertAdjacentHTML('afterend',
+          `<div class="media-error">video 无法播放（${hint}），请用下载按钮保存后本地观看</div>`);
+      };
+      const canPlayHevc = () => {
+        const probe = document.createElement('video');
+        return probe.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') !== ''
+          || probe.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"') !== '';
+      };
+      if (knownSize > BASE64_MAX_BYTES) {
+        showPlaybackError(`视频过大（${formatBytes(knownSize)}），无法内联播放`);
+        return;
+      }
+      element.addEventListener('error', () => {
+        if (element.dataset.fallback === '1') {
+          // base64 兜底也解不出来：编码不受浏览器支持
+          showPlaybackError('浏览器可能不支持该视频编码');
+          return;
+        }
+        element.dataset.fallback = '1';
+        element.classList.add('loading');
+        let blocked = false;
+        apiGet(`media/${mediaId}`, { as: 'file_token' })
+          .then((response) => unwrap(response))
+          .then((data) => {
+            if (data && data.codec === 'hevc' && !canPlayHevc()) {
+              blocked = true;
+              showPlaybackError('视频为 HEVC 编码，当前浏览器不支持');
+            } else if (Number((data && data.size) || 0) > BASE64_MAX_BYTES) {
+              blocked = true;
+              showPlaybackError(`视频过大（${formatBytes((data && data.size) || 0)}），无法内联播放`);
+            }
+          })
+          .catch((error) => {
+            console.error('[chat_memory] video 元数据探测失败：', error);
+          })
+          .then(() => {
+            if (blocked) return;
+            return apiGet(`media/${mediaId}`, { as: 'base64' })
+              .then((response) => {
+                const data = unwrap(response);
+                playBlob(base64ToObjectUrl(data.data, data.mime));
+              })
+              .catch((error) => {
+                const message = (error && error.message) ? error.message : '';
+                showPlaybackError(message.includes('过大') ? '媒体过大，无法内联播放' : '加载失败');
+              });
+          });
+      });
+      element.src = rawUrl;
+      return;
+    }
+    apiGet(`media/${mediaId}`, { as: 'base64' })
       .then((response) => {
         const data = unwrap(response);
         const url = base64ToObjectUrl(data.data, data.mime);
         state.mediaObjectUrls.push(url);
-        if (kind === 'image') {
-          element.outerHTML = `<img class="media-image thumb" src="${url}" alt="历史图片" title="双击查看原图" />`;
-          const img = root.querySelector(`img.media-image[src="${url}"]`);
-          if (img) bindImageFullView(img, mediaId, url);
-        } else if (kind === 'voice' || kind === 'video') {
+        if (kind === 'voice') {
           element.src = url;
         }
       })
       .catch((error) => {
         const message = (error && error.message) ? error.message : '';
         const hint = message.includes('过大') ? '（媒体过大，仅可下载）' : '（归档可能已清理，仍可尝试下载）';
-        if (kind === 'image') {
-          element.innerHTML = `图片加载失败${hint}`;
-        } else {
-          element.classList.add('failed');
-          element.insertAdjacentHTML('afterend', `<div class="media-error">${kind} 加载失败${hint}</div>`);
-        }
+        element.classList.add('failed');
+        element.insertAdjacentHTML('afterend', `<div class="media-error">${kind} 加载失败${hint}</div>`);
       });
   });
   root.querySelectorAll('[data-download-id]').forEach((button) => {
@@ -202,6 +298,63 @@ function attachDetailMedia(root) {
       downloadMedia(mediaId, name)
         .then(() => { button.disabled = false; button.textContent = '下载'; })
         .catch(() => { button.disabled = false; button.textContent = '下载失败'; });
+    });
+  });
+}
+
+function hydrateInlineThumbs(root, urlStore, allowFullView) {
+  // ⟦CM_IMG:<id>⟧ → 内联缩略图：先替换文本标记，再逐个经 thumb 接口加载。
+  // urlStore 由调用方提供：列表用 listMediaUrls（重渲染前撤销），详情用
+  // mediaObjectUrls（closeDetail 撤销），避免交叉撤销导致列表坏图/泄漏。
+  // allowFullView：详情内允许双击切原图；列表缩略图只作预览，不允许查看原图。
+  root.querySelectorAll('.record-content, .detail-message').forEach((container) => {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    while (walker.nextNode()) {
+      if (/⟦CM_IMG:[0-9a-f]{32}⟧/.test(walker.currentNode.textContent)) {
+        textNodes.push(walker.currentNode);
+      }
+    }
+    textNodes.forEach((node) => {
+      const fragment = document.createDocumentFragment();
+      const text = node.textContent;
+      const pattern = /⟦CM_IMG:([0-9a-f]{32})⟧/g;
+      let last = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index > last) {
+          fragment.appendChild(document.createTextNode(text.slice(last, match.index)));
+        }
+        const img = document.createElement('img');
+        img.className = 'media-thumb-inline';
+        img.alt = '历史图片';
+        img.dataset.inlineImg = match[1];
+        fragment.appendChild(img);
+        last = match.index + match[0].length;
+      }
+      if (last < text.length) {
+        fragment.appendChild(document.createTextNode(text.slice(last)));
+      }
+      node.replaceWith(fragment);
+    });
+    container.querySelectorAll('img[data-inline-img]').forEach((img) => {
+      apiGet(`media/${img.dataset.inlineImg}`, { as: 'thumb' })
+        .then((response) => {
+          const data = unwrap(response);
+          const url = base64ToObjectUrl(data.data, data.mime);
+          urlStore.push(url);
+          img.src = url;
+          if (allowFullView) {
+            img.title = '双击查看原图';
+            bindImageFullView(img, img.dataset.inlineImg, url);
+          } else {
+            img.classList.add('static');
+          }
+        })
+        .catch(() => {
+          img.alt = '图片加载失败';
+          img.classList.add('failed');
+        });
     });
   });
 }
@@ -229,6 +382,78 @@ function bindImageFullView(img, mediaId, thumbUrl) {
         img.classList.remove('loading');
       })
       .catch(() => img.classList.remove('loading'));
+  });
+}
+
+const VOICE_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>';
+
+function stopVoicePlaying() {
+  // 停止列表语音气泡播放并回收资源（列表重渲染前必须调用）
+  if (state.voiceAudio) {
+    state.voiceAudio.pause();
+    try { state.voiceAudio.src = ''; } catch (error) { /* ignore */ }
+    state.voiceAudio = null;
+  }
+  state.voicePlayingId = null;
+  state.voiceUrls.forEach((url) => {
+    try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
+  });
+  state.voiceUrls = [];
+  document.querySelectorAll('[data-voice-id]').forEach((bubble) => {
+    bubble.classList.remove('playing');
+    bubble.dataset.playing = '';
+    bubble.dataset.url = '';
+  });
+}
+
+function bindVoiceBubbles(root) {
+  // QQ 风格语音气泡：点击即播（file_token → blob → Audio）。
+  // voice 一定是独立消息，正文位置直接渲染气泡，无需考虑混合消息。
+  root.querySelectorAll('[data-voice-id]').forEach((bubble) => {
+    bubble.addEventListener('click', () => {
+      const voiceId = bubble.dataset.voiceId;
+      if (bubble.dataset.playing === '1') {
+        stopVoicePlaying();
+        return;
+      }
+      stopVoicePlaying();
+      bubble.classList.add('playing');
+      bubble.dataset.playing = '1';
+      state.voicePlayingId = voiceId;
+      const playUrl = (url) => {
+        const audio = new Audio(url);
+        state.voiceAudio = audio;
+        audio.onended = () => stopVoicePlaying();
+        audio.onerror = () => {
+          stopVoicePlaying();
+          showToast('语音播放失败', 'error');
+        };
+        audio.play().catch(() => {
+          stopVoicePlaying();
+          showToast('语音播放失败', 'error');
+        });
+      };
+      if (bubble.dataset.url) {
+        playUrl(bubble.dataset.url);
+        return;
+      }
+      // 沙箱 iframe（sandbox 无 allow-same-origin，不透明源）里直接 fetch
+      // /api/file 会被 CORS 拦截；语音文件小，字节统一走 bridge 的 base64 通道。
+      apiGet(`media/${voiceId}`, { as: 'base64' })
+        .then((response) => unwrap(response))
+        .then((data) => {
+          if (!data || !data.data) throw new Error('语音数据缺失');
+          const url = base64ToObjectUrl(data.data, data.mime);
+          state.voiceUrls.push(url);
+          bubble.dataset.url = url;
+          playUrl(url);
+        })
+        .catch((error) => {
+          console.error('[chat_memory] voice 加载失败：', error);
+          stopVoicePlaying();
+          showToast('语音加载失败', 'error');
+        });
+    });
   });
 }
 
@@ -423,6 +648,7 @@ function resetDataSourceState() {
   $('#filter-role').value = '';
   $('#filter-status').value = '__all__';
   $('#filter-kind').value = '';
+  $('#filter-event-type').value = '';
   $('#filter-platform').value = '';
   $('#filter-message-type').value = '';
   $('#filter-page-size').value = '50';
@@ -500,6 +726,7 @@ function populateFacets(data) {
     role: $('#filter-role').value,
     status: $('#filter-status').value,
     kind: $('#filter-kind').value,
+    event_type: $('#filter-event-type').value,
     platform: $('#filter-platform').value,
     messageType: $('#filter-message-type').value,
   };
@@ -647,6 +874,7 @@ function renderRecords(items, keyword) {
     $('#records-list').innerHTML = '<div class="empty-state"><strong>没有匹配记录</strong><p>尝试减少筛选条件或扩大时间范围</p></div>';
     return;
   }
+  stopVoicePlaying();
   $('#records-list').innerHTML = items.map((record) => {
     const assistant = record.role === 'assistant';
     const sender = assistant ? 'Assistant' : (record.sender_nickname || record.user_id || 'User');
@@ -655,6 +883,7 @@ function renderRecords(items, keyword) {
     const badges = [
       `<span class="badge status">${escapeHtml(status)}</span>`,
       ...kinds.map((kind) => `<span class="badge kind">${escapeHtml(kind)}</span>`),
+      ...subtypeBadges(record),
       record.persona_id ? `<span class="badge">persona:${escapeHtml(record.persona_id)}</span>` : '',
       `<span class="badge" title="${escapeHtml(record.umo)}">${escapeHtml(compactId(record.umo, 44))}</span>`,
     ].filter(Boolean).join('');
@@ -662,17 +891,36 @@ function renderRecords(items, keyword) {
     const replyBlock = replyView
       ? `<div class="reply-quote" title="回复关系（resolution=${escapeHtml(replyView.resolution)}）">↩ 回复 <strong>${escapeHtml(replyView.target)}</strong>${replyView.text ? `：${escapeHtml(replyView.text)}` : ''}</div>`
       : '';
+    // 事件正文展示与上下文一致的自然语言句子（后端已组装，见 _ui_event_sentence）；
+    // 纯语音消息：正文位置直接渲染 QQ 风格语音气泡（voice 一定是独立消息）。
+    const voiceEntry = Array.isArray(record.media_view)
+      ? record.media_view.find((item) => item && item.kind === 'voice')
+      : null;
+    const isPureVoice = kinds.length === 1 && kinds[0] === 'voice';
+    let contentBlock;
+    if (isPureVoice && voiceEntry && voiceEntry.archived && voiceEntry.media_id) {
+      contentBlock = `<div class="record-content"><span class="voice-bubble" data-voice-id="${escapeHtml(voiceEntry.media_id)}">${VOICE_ICON}<span class="voice-bars" aria-hidden="true"><span></span><span></span><span></span></span><span class="voice-label">语音</span></span></div>`;
+    } else if (isPureVoice) {
+      contentBlock = '<div class="record-content"><span class="voice-bubble disabled">' + VOICE_ICON + '<span class="voice-label">语音（未归档）</span></span></div>';
+    } else {
+      contentBlock = `<div class="record-content">${highlight(record.content || '(空消息)', keyword)}${record.content_truncated ? '\n… 列表预览已截断，打开详情查看完整内容' : ''}</div>`;
+    }
     return `<article class="record-card ${assistant ? 'assistant' : 'user'}">
       <div class="role-avatar">${assistant ? 'AI' : 'U'}</div>
       <div class="record-main">
         <div class="record-header"><span class="record-sender" title="${escapeHtml(sender)}">${escapeHtml(sender)}</span><span class="record-time">${escapeHtml(record.created_at || record.created_at_utc || '—')}</span></div>
         ${replyBlock}
-        <div class="record-content">${highlight(record.content || '(空消息)', keyword)}${record.content_truncated ? '\n… 列表预览已截断，打开详情查看完整内容' : ''}</div>
+        ${contentBlock}
         <div class="record-meta">${badges}</div>
       </div>
       <button class="record-detail-button" data-record-id="${record.record_id}">详情 #${record.record_id} ›</button>
     </article>`;
   }).join('');
+  // 撤销上一批列表缩略图的 objectURL，避免反复查询累积泄漏
+  state.listMediaUrls.forEach((url) => { try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ } });
+  state.listMediaUrls = [];
+  hydrateInlineThumbs($('#records-list'), state.listMediaUrls, false);
+  bindVoiceBubbles($('#records-list'));
   document.querySelectorAll('[data-record-id]').forEach((button) => {
     button.addEventListener('click', () => openDetail(button.dataset.recordId));
   });
@@ -720,14 +968,19 @@ function renderDetail(record) {
     mentions.length ? `<section class="detail-section"><h3>提及（At）</h3><div class="detail-grid">${mentions.map((mention) => `
       <div class="detail-item"><div class="detail-key">${mention.all ? '全体成员' : (mention.nickname || '未知成员')}</div><div class="detail-value">${escapeHtml(mention.all ? '@全体' : `@${mention.nickname || '未知成员'}`)}</div></div>`).join('')}</div></section>` : '',
   ].filter(Boolean).join('');
+  const kindBadges = (Array.isArray(record.content_kind) ? record.content_kind : [])
+    .map((kind) => `<span class="badge kind">${escapeHtml(kind)}</span>`);
+  const detailBadges = [...kindBadges, ...subtypeBadges(record)].join('');
   $('#detail-content').innerHTML = `
     <div class="detail-message">${escapeHtml(record.content || '(空消息)')}</div>
+    ${detailBadges ? `<div class="record-meta">${detailBadges}</div>` : ''}
     ${relationBlocks}
     <section class="detail-section"><h3>字段</h3><div class="detail-grid">${fields.map(([key, value]) => `
       <div class="detail-item"><div class="detail-key">${escapeHtml(key)}</div><div class="detail-value">${escapeHtml(Array.isArray(value) ? value.join(', ') : value ?? 'null')}</div></div>`).join('')}</div></section>
     <section class="detail-section"><h3>原始 content_template</h3><pre class="detail-json">${escapeHtml(record.content_template || '')}</pre></section>
     <section class="detail-section"><h3>relation_data</h3><pre class="detail-json">${escapeHtml(relation)}</pre></section>`;
   attachDetailMedia($('#detail-content'));
+  hydrateInlineThumbs($('#detail-content'), state.mediaObjectUrls, true);
 }
 
 function collectToolQuery(page = state.toolPage) {

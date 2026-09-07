@@ -47,6 +47,7 @@ from .message_classifier import (
     build_relation_seed_full as _build_relation_seed_full_impl,
     extract_text as _extract_text_impl,
     system_event_summary as _system_event_summary_fn,
+    _system_event_parts as _system_event_parts_fn,
 )
 from .context_builder import (
     CM_GENERAL_RULES,
@@ -82,6 +83,13 @@ from .relation_codec import (
 
 _TAKEOVER_APPLIED_EXTRA = "chat_memory_takeover_applied"
 _CURRENT_FOCUS_INJECTED_EXTRA = "chat_memory_current_focus_injected"
+# 配置白名单大类：media 细类（file/forward 已独立成大类）；event 子类全集
+_MEDIA_KIND_OPTIONS = frozenset({"image", "video", "voice", "emoji"})
+# 配置细类前缀值 → 实际 content_kind（audio 是配置侧叫法，存储侧叫 voice）
+_MEDIA_DETAIL_MAP = {"image": "image", "video": "video", "audio": "voice", "emoji": "emoji"}
+_ALL_EVENT_TYPES = frozenset(
+    {"ban", "member", "title", "recall", "resource", "poke", "reaction", "system"}
+)
 
 class ChatMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -95,6 +103,8 @@ class ChatMemoryPlugin(Star):
         self.log_with_bot_id = self._resolve_log_with_bot_id(config)
         # 与 AstrBot 内置「群聊上下文感知」共存警告（1.4.1）：始终启用，进程内只提示一次。
         self._builtin_ltm_warned = False
+        # 未知 notice 类型的 WARNING 去重（按 post_type/notice_type/sub_type）
+        self._warned_unknown_notices: set[tuple[str, str, str]] = set()
 
         ct_conf = config.get("context_takeover", {}) or {}
         self.ct_enable = bool(ct_conf.get("enable", False))
@@ -113,8 +123,33 @@ class ChatMemoryPlugin(Star):
         # "no_llm" 是 UI 占位符，DB 实际值是空串 ""
         ct_status_list = list(ct_status) if ct_status else ["llm_success"]
         self.ct_llm_status_filter = ["" if s == "no_llm" else s for s in ct_status_list]
-        # Kind 白名单：选中=需要；默认 ["text"]；空集合 = 不过滤（全部进入）
-        self.ct_include_kinds: set[str] = set(ct_conf.get("include_content_kinds", ["text"]) or [])
+        # Kind 白名单：选中=需要；默认 ["text"]；空集合 = 不过滤（全部进入）。
+        # 配置面向大类：text / media / file / forward / event。
+        # 细粒度控制开启时，media 与 event 按 detail_kinds 的勾选展开
+        # （media-* 前缀映射到媒体 kind，event-* 前缀映射到事件子类）。
+        self.ct_detail_control = bool(ct_conf.get("detail_control", False))
+        detail_raw = ct_conf.get("detail_kinds") or []
+        self.ct_media_detail_kinds: set[str] = {
+            _MEDIA_DETAIL_MAP.get(value[len("media-") :], "")
+            for value in detail_raw
+            if isinstance(value, str) and value.startswith("media-")
+        }
+        self.ct_media_detail_kinds.discard("")
+        self.ct_event_detail_types: set[str] = {
+            value[len("event-") :]
+            for value in detail_raw
+            if isinstance(value, str) and value.startswith("event-")
+        }
+        media_kinds = (
+            self.ct_media_detail_kinds
+            if self.ct_detail_control
+            else set(_MEDIA_KIND_OPTIONS)
+        )
+        self.ct_include_kinds: set[str] = {
+            kind
+            for raw in (ct_conf.get("include_content_kinds", ["text"]) or [])
+            for kind in (media_kinds if raw == "media" else {raw})
+        }
         # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
         self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
         # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时跳过（兜底）
@@ -524,6 +559,11 @@ class ChatMemoryPlugin(Star):
     def _system_event_summary_impl(event: AstrMessageEvent) -> str:
         return _system_event_summary_fn(event)
 
+    @staticmethod
+    def _system_event_parts_impl(event: AstrMessageEvent):
+        """(summary, action, detail, target_id, operator_id, event_type) 或 None。"""
+        return _system_event_parts_fn(event)
+
     async def _recall_snippet(self, umo: str, event: AstrMessageEvent) -> str:
         """撤回 notice：用 message_id 本地关联被撤回的 user 记录，返回可读摘要。
 
@@ -550,6 +590,58 @@ class ChatMemoryPlugin(Star):
         nickname = str(row.get("sender_nickname") or "").strip()
         head = f"{nickname}：" if nickname else ""
         return f"[撤回消息] {_escape_plain_text(head + text[:60])}"
+
+    async def _resolve_event_target(self, umo: str, user_id: str) -> str:
+        """system_event 的目标昵称：按 umo+user_id 查最近一条真实昵称。
+
+        排除适配器兜底写入的 QQ 号（纯数字）与空值——账号绝不进上下文；
+        失败/未命中返回空串（<cm_event> 不带 target 属性）。
+        """
+        if not umo or not user_id:
+            return ""
+        try:
+            nickname = await self.db.latest_sender_nickname(umo, user_id)
+        except Exception:
+            return ""
+        nickname = str(nickname or "").strip()
+        if not nickname or nickname.isdigit():
+            return ""
+        return nickname
+
+    async def _reaction_target_nickname(self, umo: str, message_id: str) -> str:
+        """表情回应 notice：按 message_id 查被回应消息的作者昵称；无则空串。
+
+        与 _resolve_event_target 同规则：纯数字（QQ 号兜底）不进上下文。
+        """
+        if not umo or not message_id:
+            return ""
+        try:
+            row = await self.db.find_by_message_id(umo, message_id)
+        except Exception:
+            return ""
+        if not row:
+            return ""
+        nickname = str(row.get("sender_nickname") or "").strip()
+        if not nickname or nickname.isdigit():
+            return ""
+        return nickname
+
+    async def _annotate_poke_targets(self, relation_data: dict, umo: str) -> None:
+        """poke 条目补 target 昵称（name 字段）：上下文渲染 <cm_event type="poke" target="…"/>。
+
+        失败/未命中静默：无 name 时渲染无属性形态，账号绝不进上下文。
+        """
+        media = relation_data.get("media")
+        if not isinstance(media, list):
+            return
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("kind") or "") != "poke" or item.get("name"):
+                continue
+            nickname = await self._resolve_event_target(umo, str(item.get("id") or ""))
+            if nickname:
+                item["name"] = nickname
 
     async def _get_curr_cid(self, umo: str) -> str:
         try:
@@ -715,19 +807,126 @@ class ChatMemoryPlugin(Star):
         user_template, relation_data, media_entries, media_refs = (
             self._build_relation_seed_full(event)
         )
+        if "poke" in kind:
+            # 戳一戳并入事件协议（1.5.0）：kind 归一为 event，event 结构随
+            # relation 落库；target 取 poke 条目已解析的昵称，operator 取发言者。
+            if relation_data:
+                await self._annotate_poke_targets(relation_data, umo)
+                poke_name = ""
+                for item in relation_data.get("media") or []:
+                    if (isinstance(item, dict)
+                            and str(item.get("kind") or "") == "poke"):
+                        poke_name = str(item.get("name") or "").strip()
+                        break
+            else:
+                poke_name = ""
+            sender_nick = str(self._get_sender_nickname(event) or "").strip()
+            if sender_nick.isdigit():
+                sender_nick = ""
+            if not isinstance(relation_data, dict):
+                relation_data = {"v": 1, "mentions": [], "media": [], "reply": None}
+            relation_data["event"] = {
+                "type": "poke",
+                "action": "戳一戳",
+                "detail": "",
+                "target": poke_name,
+                "operator": sender_nick,
+            }
+            kind = [_K_SYSTEM]
+            poke_event = True
+        else:
+            poke_event = False
         user_text = user_template or self._extract_text(event)
 
         # content 决定：有文本用文本；否则用占位；empty（[] + 无引用字段）用空串。
-        # system_event 优先使用 notice/request 事件的可读摘要（如 [撤回消息]），
-        # kind 保持 system_event，不写成 text 类型。
+        # 事件优先使用 notice/request 事件的可读摘要（如 [撤回消息]），
+        # kind 保持 event，不写成 text 类型。
         if user_text:
             content = user_text
+        elif kind == [_K_SYSTEM] and poke_event:
+            # 戳一戳事件：无 notice 摘要，UI 显示 [戳一戳]
+            content = "[戳一戳]"
         elif kind == [_K_SYSTEM]:
-            content = self._system_event_summary_impl(event) or self._content_placeholder(kind)
+            summary = self._system_event_summary_impl(event) or self._content_placeholder(kind)
+            parts = self._system_event_parts_impl(event)
+            action = parts[1] if parts else ""
+            detail = parts[2] if parts else ""
+            target_uid = parts[3] if parts else ""
+            operator_uid = parts[4] if parts else ""
+            event_type = parts[5] if parts else "system"
+            content = summary
             if content == "[撤回消息]":
                 snippet = await self._recall_snippet(umo, event)
                 if snippet:
                     content = snippet
+                    action = "撤回消息"
+                    detail = snippet[len("[撤回消息] ") :]
+                    if "：" in detail:
+                        detail = detail.split("：", 1)[1]
+            if content in ("[系统事件]", "[系统通知]"):
+                # 未知 notice 类型（1.5.0）：兜底已落库（type=system）；每个
+                # (post_type, notice_type, sub_type) 组合首次出现打 WARNING
+                # （带原始 JSON 截断 400 字符，可能含 QQ 号，仅运行时诊断、
+                # 不入库不进上下文），重复出现降为 DEBUG 防刷屏。
+                raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+                if isinstance(raw, dict):
+                    type_key = (
+                        str(raw.get("post_type") or ""),
+                        str(raw.get("notice_type") or ""),
+                        str(raw.get("sub_type") or ""),
+                    )
+                    first_seen = type_key not in self._warned_unknown_notices
+                    if first_seen:
+                        self._warned_unknown_notices.add(type_key)
+                    log_fn = logger.warning if first_seen else logger.debug
+                    log_fn(
+                        f"{self._log_prefix(event)} 未知 notice 类型: "
+                        f"post_type={raw.get('post_type')!r} "
+                        f"notice_type={raw.get('notice_type')!r} "
+                        f"sub_type={raw.get('sub_type')!r} "
+                        f"raw={str(raw)[:400]!r}"
+                    )
+            if action:
+                # <cm_event> 结构：target=被操作对象、operator=操作者（仅部分
+                # 事件平台提供），昵称按 umo+user_id 本地解析，QQ 号不进上下文。
+                if not isinstance(relation_data, dict):
+                    relation_data = {"v": 1, "mentions": [], "media": [], "reply": None}
+                # target 与 operator 按事件类型分别解析：只有操作者的事件
+                # （上传/好友添加/请求）target_uid 为空，只解析 operator。
+                target = await self._resolve_event_target(umo, target_uid)
+                operator = ""
+                if operator_uid and operator_uid != target_uid:
+                    operator = await self._resolve_event_target(umo, operator_uid)
+                event_data = {
+                    "action": action,
+                    "detail": detail or "",
+                    "target": target or "",
+                    "operator": operator or "",
+                    "type": event_type,
+                }
+                if action == "撤回消息":
+                    raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+                    if isinstance(raw, dict):
+                        event_data["message_id"] = str(raw.get("message_id") or "")
+                if event_type == "reaction":
+                    # 表情回应：按 message_id 关联被回应消息的作者昵称（同撤回）；
+                    # 附带 emoji_id 供查询台查看。
+                    raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+                    if isinstance(raw, dict):
+                        target_msg_id = str(raw.get("message_id") or "")
+                        event_data["message_id"] = target_msg_id
+                        likes = raw.get("likes")
+                        if (isinstance(likes, list) and likes
+                                and isinstance(likes[0], dict)):
+                            event_data["emoji_id"] = str(
+                                likes[0].get("emoji_id") or ""
+                            )
+                        author = await self._reaction_target_nickname(
+                            umo, target_msg_id
+                        )
+                        if author:
+                            event_data["target"] = author
+                relation_data["event"] = event_data
         elif kind:
             content = self._content_placeholder(kind)
         else:
@@ -1291,7 +1490,34 @@ class ChatMemoryPlugin(Star):
             logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
             return []
 
+        # 事件子类过滤（细粒度控制）：kind 白名单只能到 "event" 大类，
+        # 子类（ban/member/…）记录在 relation_data.event.type，查询后过滤。
+        allowed_event_types = (
+            self.ct_event_detail_types
+            if self.ct_detail_control
+            else set(_ALL_EVENT_TYPES)
+        )
+        if allowed_event_types != set(_ALL_EVENT_TYPES):
+            records = [
+                record
+                for record in records
+                if not self._is_event_record(record)
+                or self._event_type_of(record) in allowed_event_types
+            ]
         return records
+
+    @staticmethod
+    def _is_event_record(record: dict) -> bool:
+        kinds = record.get("content_kind") or []
+        return "event" in kinds or "system_event" in kinds
+
+    @staticmethod
+    def _event_type_of(record: dict) -> str:
+        relation = record.get("relation_data")
+        event = relation.get("event") if isinstance(relation, dict) else None
+        if not isinstance(event, dict):
+            return "system"
+        return str(event.get("type") or "system").strip() or "system"
 
     def _takeover_normalize(
         self,

@@ -21,7 +21,9 @@ K_FILE = "file"
 K_EMOJI = "emoji"
 K_POKE = "poke"
 K_FORWARD = "forward"
-K_SYSTEM = "system_event"
+K_SYSTEM = "event"
+# 1.5.0 前落库的旧 kind 值：渲染/筛选时兼容，新数据一律写 "event"
+K_SYSTEM_LEGACY = "system_event"
 
 MEDIA_KINDS = {K_IMAGE, K_VIDEO, K_VOICE, K_FILE, K_EMOJI, K_FORWARD, K_POKE}
 

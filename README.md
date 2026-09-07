@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.4.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=5`。
+当前发布版本：`1.5.0`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=5`。
 
 ## 特性
 
@@ -31,7 +31,7 @@
 | | `llm_success` | LLM 路径且 assistant 成功回复 |
 | | `proactive` | 主动消息（assistant 单边，含 cron） |
 | | `orphan` | user 漏存（DB 写入失败） |
-| `content_kind` | `text` / `image` / `video` / `voice` / `file` / `emoji` / `forward` / `system_event` / `poke` | JSON 数组，可多值 |
+| `content_kind` | `text` / `image` / `video` / `voice` / `file` / `emoji` / `forward` / `event` | JSON 数组，可多值；`system_event` / `poke` 为 1.5.0 前旧值，仅兼容读取 |
 | | `[]` 空数组 | empty（如纯 @BOT 无文字、纯 Reply 无文字） |
 
 `at` / `reply` 不入 `content_kind`。`reply_id` 保留平台引用 ID；`at_id` 已弃用但在
@@ -187,7 +187,7 @@ cm = _resolve_chat_memory(context)
 ### 群聊 At / Reply 关系
 
 - At 按 MessageChain 原始位置写成 `⟦CM_AT:0⟧` 等带索引模板；`relation_data.mentions` 按出现顺序保存参数，重复 At 不去重，AtAll 使用 `{"all": true}`。
-- 统一规则：凡与文字同时出现的媒体/动作组件，一律按原始位置写成类型化 token（`⟦CM_IMAGE:n⟧` / `⟦CM_VIDEO:n⟧` / `⟦CM_FILE:n⟧` / `⟦CM_POKE:n⟧` 等，n 为 `relation_data.media` 数组下标），`media` 附带元信息（表情 `id`、戳一戳目标）；查询返回的 `content` 渲染为 `<cm_image/>` 等占位标签，保持正文中的原始位置。纯媒体/纯动作消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存英文占位（`[image]` 等），元信息仍在 `media` 数组。
+- 统一规则：凡与文字同时出现的媒体/动作组件，一律按原始位置写成类型化 token（`⟦CM_IMAGE:n⟧` / `⟦CM_VIDEO:n⟧` / `⟦CM_FILE:n⟧` / `⟦CM_POKE:n⟧` 等，n 为 `relation_data.media` 数组下标），`media` 附带元信息（表情 `id`、戳一戳目标）；查询返回的 `content` 渲染为 `<cm_media type="…"/>` 等占位标签，保持正文中的原始位置。纯媒体/纯动作消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存英文占位（`[image]` 等），元信息仍在 `media` 数组。
 - 普通成员 Reply 只用同一平台实例、同一 UMO 下唯一的 `reply_id → user.message_id` 精确解析为 `target_turn_id`；零命中或多命中都不猜测。
 - 引用 Bot/assistant 时不做时间或内容启发式匹配，直接保存 AstrBot Reply 组件提供的昵称与最多 300 字符文本快照；其他无法精确解析的 Reply 同样降级为快照。
 - 跨会话历史中的 Reply 仍按该消息原本所在的 UMO 查询 `target_turn_id`，不会拿当前请求所在群替代，也不会跨群猜测引用关系。
@@ -438,7 +438,7 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 - **ALL + `["text","image"]`**：精确限定为这两种 kind
 - **清空**：不过滤，全量进入
 
-**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_image/>` / `<cm_voice/>` / `<cm_video/>` / `<cm_file/>` / `<cm_emoji/>` / `<cm_forward/>`，戳一戳为 `<cm_poke/>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_image/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
+**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_media type="image|voice|video|file|emoji|forward"/>`，QQ 表情带中文名渲染为 `<cm_emoji>名称</cm_emoji>`，如「问号脸」；戳一戳并入事件协议为 `<cm_event type="poke">戳一戳</cm_event>`，表情回应为 `<cm_event type="reaction">阿明 用 问号脸 回应了 小虎 的消息</cm_event>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_media type="image"/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
 
 ### persona 隔离（filter_by_persona）
 

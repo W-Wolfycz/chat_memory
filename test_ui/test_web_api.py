@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 if "astrbot.api" not in sys.modules:
@@ -25,12 +26,13 @@ if "astrbot.api" not in sys.modules:
     sys.modules["astrbot.api"] = api
 
 
-def load_module(*, body=None, args=None):
+def load_module(*, body=None, args=None, headers=None):
     quart = types.ModuleType("quart")
 
     class Request:
         def __init__(self):
             self.args = args or {}
+            self.headers = headers or {}
 
         async def get_json(self):
             return body
@@ -241,6 +243,127 @@ class WebApiTestCase(unittest.TestCase):
             self.assertEqual(response2[1], 200)
             self.assertEqual(response2[0], payload)
             self.assertEqual(response2[2]["Content-Type"], "image/png")
+
+        # 小节：video/voice 的 Range 分段请求（206）
+        video_id = "cd" * 16
+        video_payload = bytes(range(100))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "202608").mkdir()
+            (root / "202608" / f"{video_id}.mp4").write_bytes(video_payload)
+
+            class VideoRepository(Repository):
+                async def media_file(self, media_id):
+                    return {
+                        "media_id": media_id,
+                        "kind": "video",
+                        "file_name": f"{media_id}.mp4",
+                        "ext": "mp4",
+                        "mime_type": "video/mp4",
+                        "size_bytes": len(video_payload),
+                        "created_at": "2026-08-11 02:00:00",
+                    }
+
+            module = load_module(headers={"Range": "bytes=10-29"})
+            controller = module.ChatMemoryUiWebApi(
+                Context(), VideoRepository(), media_root=root
+            )
+            response = asyncio.run(controller.media(video_id))
+            self.assertEqual(response[1], 206)
+            self.assertEqual(response[0], video_payload[10:30])
+            self.assertEqual(response[2]["Content-Range"], "bytes 10-29/100")
+            self.assertEqual(response[2]["Accept-Ranges"], "bytes")
+
+            # 后缀范围 bytes=-N：取末尾 N 字节
+            module_suffix = load_module(headers={"Range": "bytes=-20"})
+            controller_suffix = module_suffix.ChatMemoryUiWebApi(
+                Context(), VideoRepository(), media_root=root
+            )
+            suffix = asyncio.run(controller_suffix.media(video_id))
+            self.assertEqual(suffix[1], 206)
+            self.assertEqual(suffix[0], video_payload[-20:])
+            self.assertEqual(suffix[2]["Content-Range"], "bytes 80-99/100")
+
+            module_bad = load_module(headers={"Range": "bytes=999-"})
+            controller_bad = module_bad.ChatMemoryUiWebApi(
+                Context(), VideoRepository(), media_root=root
+            )
+            bad = asyncio.run(controller_bad.media(video_id))
+            self.assertEqual(bad[1], 416)
+            self.assertFalse(bad[0]["success"])
+            self.assertEqual(bad[2]["Content-Range"], "bytes */100")
+
+        # 小节：as=file_token（免鉴权单次令牌，不受 base64 16MB 上限约束）
+        video_id = "cd" * 16
+        video_payload = bytes(range(100))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "202608").mkdir()
+            (root / "202608" / f"{video_id}.mp4").write_bytes(video_payload)
+
+            class VideoRepository(Repository):
+                async def media_file(self, media_id):
+                    return {
+                        "media_id": media_id,
+                        "kind": "video",
+                        "file_name": f"{media_id}.mp4",
+                        "ext": "mp4",
+                        "mime_type": "video/mp4",
+                        "size_bytes": len(video_payload),
+                        "created_at": "2026-08-11 02:00:00",
+                    }
+
+            # 无 astrbot.core（老版本）：501 降级
+            sys.modules.pop("astrbot.core", None)
+            module_none = load_module(args={"as": "file_token"})
+            controller_none = module_none.ChatMemoryUiWebApi(
+                Context(), VideoRepository(), media_root=root
+            )
+            response = asyncio.run(controller_none.media(video_id))
+            self.assertEqual(response[1], 501)
+            self.assertFalse(response[0]["success"])
+
+            # 正常路径：注册令牌成功，返回免鉴权 file_url，且绝不整读文件
+            core = types.ModuleType("astrbot.core")
+
+            class FileTokenService:
+                def __init__(self):
+                    self.registered = []
+
+                async def register_file(self, path, timeout=None):
+                    self.registered.append((path, timeout))
+                    return "tok-1234"
+
+            core.file_token_service = FileTokenService()
+            sys.modules["astrbot.core"] = core
+            try:
+                module = load_module(args={"as": "file_token"})
+                controller = module.ChatMemoryUiWebApi(
+                    Context(), VideoRepository(), media_root=root
+                )
+                # 大视频卡死根因回归：file_token 分支只嗅探编码，不能全量 read_bytes
+                with patch.object(Path, "read_bytes",
+                                  side_effect=AssertionError("file_token 不得整读文件")):
+                    response = asyncio.run(controller.media(video_id))
+                self.assertTrue(response["success"])
+                self.assertEqual(response["data"]["file_url"], "/api/file/tok-1234")
+                self.assertEqual(response["data"]["kind"], "video")
+                self.assertEqual(response["data"]["size"], len(video_payload))
+                self.assertEqual(response["data"]["codec"], "")
+                self.assertEqual(len(core.file_token_service.registered), 1)
+            finally:
+                sys.modules.pop("astrbot.core", None)
+
+            # 小节：_sniff_video_codec（只读前 512KB；moov 在尾部时返回空串）
+            hvc = root / "202608" / "hvc.mp4"
+            hvc.write_bytes(b"\x00" * 8 + b"ftyp" + b"\x00" * 16 + b"hvc1" + b"\x00" * 8)
+            avc = root / "202608" / "avc.mp4"
+            avc.write_bytes(b"\x00" * 8 + b"ftyp" + b"\x00" * 16 + b"avc1" + b"\x00" * 8)
+            plain = root / "202608" / "plain.mp4"
+            plain.write_bytes(bytes(range(64)))
+            self.assertEqual(module._sniff_video_codec(hvc), "hevc")
+            self.assertEqual(module._sniff_video_codec(avc), "avc1")
+            self.assertEqual(module._sniff_video_codec(plain), "")
 
         # 小节：file 类 raw 下载带 attachment + filename*
         media_id = "ef" * 16

@@ -4,6 +4,38 @@ ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开
 
 > 下方各版本记录的是该版本发布时的实际格式。旧条目中的 `[当前发言者]`、`<cm s="N"/>`、`<cm_history_tail/>` 等均为已经退役的历史协议，不代表当前版本仍会生成或接受这些标签；当前格式以最新版本条目和 README 为准。
 
+## 1.5.0 — 2026-09-07
+
+### 新增
+
+- **system_event 未知类型诊断日志**：泛化兜底（`[系统事件]`/`[系统通知]`）落库时输出 DEBUG 日志，附 post_type/notice_type/sub_type，用于识别 NapCat/Lagrange 等实现的扩展 notice 类型；默认 INFO 下不显示，需在 WebUI 插件详情页把日志等级调为 DEBUG 后可见。
+- **媒体播放与占位增强**：媒体端点支持 HTTP Range（206），查询台视频改直连流式播放（支持拖动、不受 base64 16MB 上限，失败自动回退 base64）；正文中的已归档图片占位改为内联缩略图（双击看原图），文件占位直接显示净化后的文件名。
+- **纯挂载表情消息漏存修复**：mface（表情挂件）被平台适配器丢弃成空链导致整条消息漏存；现在按 emoji 归档（content 为 `[emoji]`），不再丢失。
+- **上下文协议收敛（`<cm_event>` / `<cm_media>`）**：系统事件与动作统一为单一事件标签 `<cm_event type="大类">自然语言事件描述</cm_event>`（type 枚举 ban/member/title/recall/resource/poke/reaction/system，附时间元数据），描述按 QQ 群聊系统消息风格组装（如「长风 被 小明 禁言了 10分钟」），角色昵称内嵌 `<cm_nickname>`（账号 ID 的显示昵称，QQ 号不进上下文）；撤回同时落存原始 message_id 供查询台查看；好友添加/请求类通知取消归档；媒体占位统一为 `<cm_media type="image|voice|video|file|emoji|forward"/>`；未知 notice 类型兜底 type=system 并打诊断日志（每种组合首次 WARNING 带原始 JSON 截断，重复 DEBUG 防刷屏）；通用规则（默认 user 均为成员发言、仅 cm_event 包裹为事件）与输出清洗同步覆盖。
+- **内容大类重构**：`include_content_kinds` 收敛为 `text` / `media`（视听媒体：image/video/voice/emoji）/ `file`（文件附件）/ `forward`（转发消息）/ `event` 五类。
+- **细粒度控制**：`detail_control` 开启后显示单项「细类」配置（`detail_kinds`，`media-*` 与 `event-*` 前缀项，默认全选，随开关条件显隐），media 与 event 按勾选放行；关闭时均为整个大类。
+- **查询台事件子类过滤**：新增「事件子类」下拉（ban/member/title/recall/resource/poke/reaction/system），按 `relation_data.event.type` 过滤记录。
+- **事件句子列表展示与子类徽章**：event 类记录在列表直接展示与上下文一致的自然语言句子（不再只显示 chip）；媒体/事件记录显示子类徽章（`event·poke`、`media·image` 等，完全动态读取无硬编码清单），详情页同步展示。
+- **表情回应事件（reaction）**：识别 NapCat 扩展 notice `group_msg_emoji_like` 并归档为事件子类 `reaction`（添加/取消表情回应），按 message_id 关联被回应消息的作者昵称；配置细类、查询台「事件子类」过滤与徽章同步支持。
+- **QQ 表情中文名（`<cm_emoji>`）**：内置 NapCat 官方 face 表（329 条），正文里的 QQ 表情在上下文中渲染为 `<cm_emoji>名称</cm_emoji>`（如「问号脸」，未知 id 回退 `<cm_media type="emoji"/>`），表情回应句子带表情名（如「阿明 用 问号脸 回应了 小虎 的消息」）；查询台正文占位同步显示中文名（`⟦表情:问号脸⟧`，媒体栏 chip 保持简洁的 emoji），LLM 规则补充 cm_emoji 语义。
+- **列表语音气泡**：纯语音消息在列表正文位置显示 QQ 风格语音气泡，点击即播（bridge base64 通道 → blob → Audio，带播放动画，再次点击停止），未归档显示「语音（未归档）」。
+
+### 修复
+
+- **纯图片消息列表不显示缩略图**：纯图片消息的正文是 `⟦图片⟧` 占位，现在对已归档图片输出缩略图标记，列表与详情均可内联预览（未归档/旧数据保持占位文本）。
+- **媒体图展示去重**：详情页媒体栏不再重复挂图（原先有拉伸），看图统一走正文内联缩略图（详情内可双击看原图）；列表缩略图仅作预览，不再支持打开原图。
+- **视频播放失败可见化**：直连 Range 与 base64 兜底都失败时，播放器旁显示原因提示（编码不支持/媒体过大）并引导下载本地观看，不再静默黑屏；媒体归档完成时输出 DEBUG 日志（kind/ext/size）。
+- **视频播放鉴权回退链**：查询台 iframe 直连媒体端点会被 dashboard 鉴权中间件 401（拿不到 JWT cookie/header）；且页面 iframe 是不透明源（sandbox 无 allow-same-origin），直接 fetch `/api/file` 会被 CORS 拦截——媒体字节统一走 bridge 的 base64 通道，file_token 仅作 8ms 的编码/大小元数据探测；带 HEVC/16MB 闸门，超限直接提示下载，不再整段拉取（几十 MB 视频会让页面内存暴涨卡死）；token 模式后端不整读文件（只嗅探编码，实测 35MB 视频响应 8ms），base64 模式按归档大小先拒（不再为一条 413 整读大文件）、未知 as 模式返回 400。
+- **poke 事件 UI 身份回退**：操作者/目标昵称缺失时查询台回退显示账号 ID（如「10001 戳了戳 10002」），仅查询台展示，上下文协议仍不含账号。
+
+### 变更
+
+- **事件 kind 更名为 `event`**：新数据 `content_kind` 写 `event`（旧值 `system_event` 仅兼容读取/筛选/渲染）。
+- **事件大类 `resource`**：群文件上传/离线文件的 type 由 `media` 更名为 `resource`（与媒体大类区分）。
+- **戳一戳并入事件协议**：user 戳一戳捕获时归一为 `event`（type=poke，operator=发言者昵称、target=被戳者昵称），旧 poke 数据兼容渲染为事件占位。
+
+测试：行为级 37 项 + UI 17 项 + 存储集成。
+
 ## 1.4.1 — 2026-09-04
 
 ### 新增
