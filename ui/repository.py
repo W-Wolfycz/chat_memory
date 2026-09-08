@@ -44,8 +44,6 @@ VALID_KINDS = {
     "video",
     "voice",
     "file",
-    # face 已更名为 emoji(1.2.5 数据迁移);保留 face 以兼容未迁移的旧库
-    "face",
     "emoji",
     "forward",
     "event",
@@ -177,11 +175,11 @@ class ChatMemoryRepository:
         return await asyncio.to_thread(self._run_read, self._overview_query)
 
     async def facets(self, filters: dict[str, Any] | None = None) -> dict[str, Any]:
-        normalized = self._normalize_filters(filters or {}, allow_query_fields=True)
+        normalized = self._normalize_filters(filters or {})
         return await asyncio.to_thread(self._run_read, self._facets_query, normalized)
 
     async def query(self, payload: dict[str, Any]) -> dict[str, Any]:
-        normalized = self._normalize_filters(payload, allow_query_fields=True)
+        normalized = self._normalize_filters(payload)
         return await asyncio.to_thread(self._run_read, self._records_query, normalized)
 
     async def record(self, record_id: int) -> dict[str, Any]:
@@ -354,14 +352,18 @@ class ChatMemoryRepository:
                 """
             )
         )
+        # created_at 存 UTC naive；按插件时区偏移分桶，避免日界与展示口径不一致
+        tz_offset = self.timezone.utcoffset(datetime.now(self.timezone))
+        offset_seconds = int((tz_offset or timedelta(0)).total_seconds())
         daily_rows = connection.execute(
             f"""
-            SELECT date(created_at) AS day, COUNT(*) AS amount
+            SELECT date(created_at, :tz_offset) AS day, COUNT(*) AS amount
             FROM {TABLE_NAME}
             WHERE created_at >= datetime('now', '-29 days')
-            GROUP BY date(created_at)
+            GROUP BY day
             ORDER BY day ASC
-            """
+            """,
+            {"tz_offset": f"{offset_seconds} seconds"},
         ).fetchall()
         tools = self._tools_overview(connection)
         media = self._media_overview(connection)
@@ -736,8 +738,9 @@ class ChatMemoryRepository:
         if not present:
             return {}
         result: dict[str, dict[str, Any]] = {}
-        for chunk_start in range(0, len(wanted), 400):
-            chunk = sorted(wanted)[chunk_start : chunk_start + 400]
+        ordered = sorted(wanted)
+        for chunk_start in range(0, len(ordered), 400):
+            chunk = ordered[chunk_start : chunk_start + 400]
             placeholders = ", ".join("?" * len(chunk))
             try:
                 archive_rows = connection.execute(
@@ -764,7 +767,10 @@ class ChatMemoryRepository:
         """用 SQLite backup API 把当前库导出为一致快照文件。
 
         WAL 模式下备份走读事务，源库的读写均不阻塞；返回快照字节数。
+        库文件不存在时抛 DatabaseUnavailableError（与查询路径 503 语义一致）。
         """
+        if not self.db_path.is_file():
+            raise DatabaseUnavailableError(f"数据库不存在：{self.db_path}")
         with closing(self._connect(immutable=False)) as source:
             dest_conn = sqlite3.connect(str(dest))
             try:
@@ -839,7 +845,9 @@ class ChatMemoryRepository:
                 rel = _parse_relation_data(_row_value(target, "relation_data"))
                 kinds = _parse_content_kind(_row_value(target, "content_kind"))
                 targets[(umo, str(target["turn_id"]))] = {
-                    "sender_nickname": str(target["sender_nickname"] or ""),
+                    "sender_nickname": str(
+                        _row_value(target, "sender_nickname") or ""
+                    ),
                     "content": _render_content(raw, rel, kinds),
                 }
         return targets
@@ -1048,9 +1056,7 @@ class ChatMemoryRepository:
             params["until"] = filters["until"]
         return conditions, params
 
-    def _normalize_filters(
-        self, raw: dict[str, Any], *, allow_query_fields: bool
-    ) -> dict[str, Any]:
+    def _normalize_filters(self, raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
             raise ValueError("查询参数必须是对象")
         normalized: dict[str, Any] = {}
@@ -1066,9 +1072,6 @@ class ChatMemoryRepository:
             if len(value) > limit:
                 raise ValueError(f"{key} 过长")
             normalized[key] = value
-
-        if not allow_query_fields:
-            return normalized
 
         keyword = str(raw.get("keyword", "") or "").strip()
         if len(keyword) > 200:
@@ -1152,7 +1155,7 @@ class ChatMemoryRepository:
         event_type = str(ui_event.get("type") or "")
         if event_type == "poke":
             if not str(ui_event.get("operator") or "").strip():
-                nick = str(row["sender_nickname"] or "").strip()
+                nick = str(_row_value(row, "sender_nickname") or "").strip()
                 if nick and not nick.isdigit():
                     ui_event["operator"] = nick
                 else:
@@ -1233,6 +1236,7 @@ class ChatMemoryRepository:
                         "text": str(reply.get("fallback_text") or "")[:300],
                     }
         media_view = self._media_view(relation_data, media_archive)
+        recalled_at_raw = _row_value(row, "recalled_at")
         return {
             "record_id": int(row["id"]),
             "role": str(row["role"]),
@@ -1246,6 +1250,8 @@ class ChatMemoryRepository:
             "pair_id": _optional_str(_row_value(row, "pair_id")),
             "turn_id": _optional_str(_row_value(row, "turn_id")),
             "llm_status": str(row["llm_status"] or ""),
+            "recalled": bool(str(recalled_at_raw or "").strip()),
+            "recalled_at": self._time_pair(recalled_at_raw)[1] if recalled_at_raw else "",
             "content_kind": content_kind,
             "platform_id": _optional_str(_row_value(row, "platform_id")),
             "platform_name": _optional_str(_row_value(row, "platform_name")),

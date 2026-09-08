@@ -336,7 +336,8 @@ def classify_content(
     try:
         message_type = event.get_message_type()
         message_type_value = getattr(message_type, "value", str(message_type))
-        if message_type_value == "OtherMessage":
+        if message_type_value == "OtherMessage" and not kind:
+            # 仅在未识别出任何内容时兜底为事件，避免丢弃同链已识别的 text/image
             kind = [K_SYSTEM]
     except Exception:
         pass
@@ -556,6 +557,16 @@ def classify_assistant_chain(chain) -> tuple[list[str], str]:
             push(K_POKE)
         elif isinstance(comp, Forward):
             push(K_FORWARD)
+        elif isinstance(comp, Reply):
+            # 纯引用回复（无 Plain/媒体）也要落库：用引用携带的原文兜底为 text
+            snapshot = str(
+                getattr(comp, "message_str", None)
+                or getattr(comp, "text", None)
+                or ""
+            ).strip()
+            if snapshot:
+                push(K_TEXT)
+                parts.append(snapshot)
     return kind, "".join(parts).strip()
 
 

@@ -58,7 +58,7 @@ class ChatMemoryUiWebApi:
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.5.0",
+                "version": "1.5.1",
                 "read_only": True,
                 "default_page_size": self.repository.default_page_size,
                 "max_page_size": self.repository.max_page_size,
@@ -140,7 +140,11 @@ class ChatMemoryUiWebApi:
         month = created_at[:7].replace("-", "")
         if not month.isdigit() or len(month) != 6:
             return _error("归档记录时间异常", 500)
-        path = self.media_root / month / str(row.get("file_name") or "")
+        file_name = str(row.get("file_name") or "")
+        # 纵深防御：归档写入侧已限定 <media_id>.<ext>，读侧仍拒绝路径分隔符/穿越
+        if not file_name or Path(file_name).name != file_name:
+            return _error("归档记录文件名异常", 500)
+        path = self.media_root / month / file_name
         mime = str(row.get("mime_type") or "") or "application/octet-stream"
         want_mode = str(request.args.get("as", "")).strip().lower()
         if want_mode not in ("", "base64", "thumb", "file_token"):
@@ -157,17 +161,17 @@ class ChatMemoryUiWebApi:
             # 注意：本分支绝不整读文件（大视频 60MB+ 全量 read_bytes 会让
             # dashboard 同进程内存暴涨、UI 卡死），只嗅探编码与登记路径。
             size = int(row.get("size_bytes") or 0)
+            try:
+                from astrbot.core import file_token_service
+            except Exception as exc:
+                logger.warning("[ChatMemoryUI] file_token 不可用: %s", exc)
+                return _error("当前 AstrBot 版本不支持 file_token", 501)
             codec = ""
             if str(row.get("kind") or "") == "video":
                 try:
                     codec = await asyncio.to_thread(_sniff_video_codec, path)
                 except OSError:
                     codec = ""
-            try:
-                from astrbot.core import file_token_service
-            except Exception as exc:
-                logger.warning("[ChatMemoryUI] file_token 不可用: %s", exc)
-                return _error("当前 AstrBot 版本不支持 file_token", 501)
             try:
                 token = await file_token_service.register_file(str(path))
             except Exception as exc:
@@ -181,15 +185,15 @@ class ChatMemoryUiWebApi:
                 "codec": codec,
                 "file_url": f"/api/file/{token}",
             })
-        try:
-            data = await asyncio.to_thread(path.read_bytes)
-        except OSError:
-            return _error("媒体文件已缺失", 404)
-        if len(data) != int(row.get("size_bytes") or 0):
-            logger.warning(
-                "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id[:8]
-            )
         if want_mode in ("base64", "thumb"):
+            try:
+                data = await asyncio.to_thread(path.read_bytes)
+            except OSError:
+                return _error("媒体文件已缺失", 404)
+            if len(data) != int(row.get("size_bytes") or 0):
+                logger.warning(
+                    "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id[:8]
+                )
             if len(data) > _BASE64_MAX_BYTES:
                 return _error("媒体过大，请使用下载方式获取", 413)
             payload = {
@@ -208,8 +212,9 @@ class ChatMemoryUiWebApi:
                          "data": base64.b64encode(thumb_data).decode("ascii")}
                     )
             return _ok(payload)
-        disposition = "attachment" if str(row.get("kind") or "") == "file" else "inline"
-        if str(row.get("kind") or "") == "file":
+        kind = str(row.get("kind") or "")
+        disposition = "attachment" if kind == "file" else "inline"
+        if kind == "file":
             from urllib.parse import quote
 
             disposition += f"; filename*=UTF-8''{quote(str(row.get('file_name') or ''))}"
@@ -218,19 +223,18 @@ class ChatMemoryUiWebApi:
             "Accept-Ranges": "bytes",
             "Cache-Control": "private, max-age=86400",
         }
-        # 视频/语音支持 HTTP Range（206）：<video>/<audio> 拖动进度与大文件流式
-        # 播放依赖分段请求；其余类型返回完整字节。
+        # 视频/语音支持 HTTP Range（206）：只读请求区间，不整读文件（几十 MB
+        # 视频每次拖动都整读会把 dashboard 同进程内存拉满）。
+        total = await asyncio.to_thread(_file_size, path)
+        if total <= 0:
+            return _error("媒体文件已缺失", 404)
         headers_obj = getattr(request, "headers", None)
         range_header = (
             str(headers_obj.get("Range") or "") if headers_obj is not None else ""
         )
-        if range_header.startswith("bytes=") and str(row.get("kind") or "") in (
-            "video",
-            "voice",
-        ):
+        if range_header.startswith("bytes=") and kind in ("video", "voice"):
             spec = range_header[len("bytes=") :].split(",", 1)[0]
             start_s, _, end_s = spec.partition("-")
-            total = len(data)
             try:
                 if not start_s:
                     # 后缀范围 bytes=-N：取末尾 N 字节；N<=0 或缺失视为非法
@@ -251,18 +255,30 @@ class ChatMemoryUiWebApi:
                     416,
                     {"Content-Range": f"bytes */{total}"},
                 )
+            chunk = await asyncio.to_thread(_read_range, path, start, end - start + 1)
+            if chunk is None:
+                return _error("媒体文件已缺失", 404)
             # 元组返回：AstrBot 的 _coerce_view_result 会把它包成 Starlette Response
             # （content-type 等头原样透传），测试环境无需安装 starlette。
             return (
-                data[start : end + 1],
+                chunk,
                 206,
                 {
                     **common,
                     "Content-Range": f"bytes {start}-{end}/{total}",
-                    "Content-Length": str(end - start + 1),
+                    "Content-Length": str(len(chunk)),
                 },
             )
-        # 元组返回：同上。
+        # 非 Range（整文件下载/直连）：AstrBot 的响应封装要求 bytes，无法流式返回，
+        # 因此这里整读一次；大媒体播放请走 Range，下载请走 bridge.download。
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError:
+            return _error("媒体文件已缺失", 404)
+        if len(data) != int(row.get("size_bytes") or 0):
+            logger.warning(
+                "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id[:8]
+            )
         return (
             data,
             200,
@@ -461,6 +477,24 @@ def _sniff_video_codec(path) -> str:
     if b"vp09" in probe:
         return "vp09"
     return ""
+
+
+def _file_size(path) -> int:
+    """文件字节数；不存在/不可读返回 0。"""
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _read_range(path, start: int, length: int):
+    """只读 ``[start, start+length)`` 区间；失败返回 None（不整读文件）。"""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            return fh.read(length)
+    except OSError:
+        return None
 
 
 def _ok(data: Any) -> dict[str, Any]:

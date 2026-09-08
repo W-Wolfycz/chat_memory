@@ -34,6 +34,23 @@ class AssetsTestCase(unittest.TestCase):
         self.assertIn("apiPost('settings'", javascript)
         self.assertNotIn("delete", javascript.lower())
 
+        # 小节：事件子类过滤必须随查询发出（防「下拉失效」回归）
+        import re as _re
+
+        collect = _re.search(r"function collectQuery\b[\s\S]*?\n}", javascript)
+        self.assertIsNotNone(collect, "collectQuery 未找到")
+        self.assertIn("event_type", collect.group(0))
+
+        # 小节：查询台 about 版本与 metadata.yaml 一致（防双处漂移）
+        import re as _re
+
+        meta = (PLUGIN_ROOT / "metadata.yaml").read_text(encoding="utf-8")
+        version_match = _re.search(r"^version:\s*(\S+)\s*$", meta, _re.M)
+        self.assertIsNotNone(version_match, "metadata.yaml 缺少 version")
+        version = version_match.group(1)
+        web_api = (PLUGIN_ROOT / "ui" / "web_api.py").read_text(encoding="utf-8")
+        self.assertIn(f'"version": "{version}"', web_api, "about 版本与 metadata 不一致")
+
         # 小节：配置 schema 为合法 JSON
         import json
 

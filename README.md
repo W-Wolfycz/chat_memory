@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.5.0`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=5`。
+当前发布版本：`1.5.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=6`。
 
 ## 特性
 
@@ -130,13 +130,14 @@ user 侧媒体落盘到 `data/plugin_data/chat_memory/media/<YYYYMM>/<media_id>.
 >
 > **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（**UTC naive 存储**，与 schema default `CURRENT_TIMESTAMP` 对齐；**查询返回时按 AstrBot `timezone` 配置转成配置时区 naive 字符串**）。
 >
-> **测试版数据库升级**：启动时使用 `PRAGMA user_version` + 实际列检查。已有 `llm_status` 的数据库会增量补 `persona_id` / `turn_id` / `send_status` / `relation_data`；更早、缺少 `llm_status` 的表不会猜测字段语义，而是先 RENAME 为 `chat_memory_records_backup_<ts>` 再建立当前主表。迁移后会校验索引绑定，并将数据库 schema version 写为 5（1.3.0 起另建媒体归档表）。
+> **数据库升级**：启动时使用 `PRAGMA table_info` 校验必需列。**1.4.0 之前的旧 schema 不再自动迁移**（市场首发 1.4.0）：缺列时直接抛出可诊断错误（列出缺失列，提示先用 1.4.0 升级或移走旧库），不会静默补列或重建表。1.5.0 起 schema v5 新增媒体归档表；1.5.1 起 schema v6 主表新增 `recalled_at`（可空，非空=该消息已被撤回），升级时按需 `ALTER TABLE ADD COLUMN`。
 
 > **turn_id 与发送状态**：1.0.0 的实时写入和状态升级统一使用内部 `turn_id`；历史记录查询仍保留 `message_id` / `pair_id` 回退，确保现有数据库中的旧轮次可读。`send_status=prepared` 表示 assistant 已写入、准备发送；`send_attempted` 仅表示 AstrBot 发送流程结束/已尝试，不等价于平台送达回执。
 
 ### 升级与备份
 
-- 已有 schema v2 数据库可直接启动 1.2.0；首次迁移仅增加 nullable `relation_data`。1.2.2 起 schema v4 新增独立工具表 `chat_memory_tool_records`，1.3.0 起 schema v5 新增媒体归档表 `chat_memory_media_archive`；升级只建新表、不改主表结构，既有记录零迁移。结构化标签与当前轮焦点锚都只改变请求时展示，不修改表结构或既有记录。
+- 支持范围：**1.4.0 及以后**的数据库（schema ≥ v4）。1.4.0 之前的旧库不会被自动迁移，插件启动时会给出明确错误提示。
+- schema 演进：1.2.2 起 v4 新增独立工具表 `chat_memory_tool_records`；1.5.0 起 v5 新增媒体归档表 `chat_memory_media_archive`；1.5.1 起 v6 主表新增 `recalled_at`（撤回标记）。v5 → v6 仅补一列，既有记录零迁移；结构化标签与当前轮焦点锚只改变请求时展示，不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -417,6 +418,7 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 | `llm_status_filter` | chip | `["llm_success"]` | 状态多选 |
 | `include_content_kinds` | chip | `["text"]` | 内容白名单（清空=不过滤） |
 | `include_all_match` | bool | false | ALL 模式开关（默认 ANY） |
+| `recall_skip_context` | bool | false | 撤回消息跳过上下文：开启后被撤回的原消息与撤回事件都不进上下文 |
 | `clear_native_history` | bool | true | 每轮清空 native history |
 | `fallback_to_native_on_empty` | bool | false | CM 空结果时是否保留 AstrBot 原生 contexts；默认 false=严格接管 |
 | `filter_by_persona` | bool | false | 按 persona 隔离 takeover 查询 |

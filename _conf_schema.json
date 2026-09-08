@@ -124,6 +124,12 @@
           "detail_control": true
         }
       },
+      "recall_skip_context": {
+        "description": "撤回消息跳过上下文",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后：被撤回的消息与被撤回事件（<cm_event type=\"recall\">）都不再进入 LLM 上下文；查询台仍可查看（标记「已撤回」）。"
+      },
       "include_all_match": {
         "description": "全部命中（ALL 模式）",
         "type": "bool",

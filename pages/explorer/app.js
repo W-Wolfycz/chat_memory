@@ -25,6 +25,7 @@ const state = {
   voiceAudio: null,
   voiceUrls: [],
   voicePlayingId: null,
+  detailRequestToken: 0,
 };
 
 const FACET_SELECTORS = [
@@ -361,14 +362,19 @@ function hydrateInlineThumbs(root, urlStore, allowFullView) {
 
 function bindImageFullView(img, mediaId, thumbUrl) {
   let fullUrl = null;
+  const dropFullUrl = () => {
+    if (!fullUrl) return;
+    // 只在这里撤销：同时从详情资源表移除，避免 closeDetail 二次撤销
+    try { URL.revokeObjectURL(fullUrl); } catch (error) { /* ignore */ }
+    state.mediaObjectUrls = state.mediaObjectUrls.filter((url) => url !== fullUrl);
+    fullUrl = null;
+  };
   img.addEventListener('dblclick', () => {
     if (fullUrl) {
       img.src = thumbUrl;
       img.classList.add('thumb');
       img.classList.remove('full');
-      // 切回缩略图后释放原图 objectURL，防反复切换泄漏
-      try { URL.revokeObjectURL(fullUrl); } catch (error) { /* ignore */ }
-      fullUrl = null;
+      dropFullUrl();
       return;
     }
     img.classList.add('loading');
@@ -381,7 +387,10 @@ function bindImageFullView(img, mediaId, thumbUrl) {
         img.classList.add('full');
         img.classList.remove('loading');
       })
-      .catch(() => img.classList.remove('loading'));
+      .catch(() => {
+        img.classList.remove('loading');
+        img.title = '原图加载失败（可能过大或编码不支持）';
+      });
   });
 }
 
@@ -628,6 +637,11 @@ function setSettingsMessage(message = '', type = '') {
 }
 
 function resetDataSourceState() {
+  stopVoicePlaying();
+  state.listMediaUrls.forEach((url) => {
+    try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
+  });
+  state.listMediaUrls = [];
   state.requestToken += 1;
   state.facetRequestToken += 1;
   state.toolRequestToken += 1;
@@ -829,6 +843,7 @@ function collectQuery(page = state.page) {
     role: $('#filter-role').value,
     llm_status: $('#filter-status').value,
     content_kind: $('#filter-kind').value,
+    event_type: $('#filter-event-type').value,
     platform_name: $('#filter-platform').value,
     message_type: $('#filter-message-type').value,
     since: $('#filter-since').value,
@@ -870,11 +885,16 @@ async function runQuery(page = 1) {
 }
 
 function renderRecords(items, keyword) {
+  // 无论结果是否为空，都先回收上一批列表资源（语音播放、缩略图 objectURL）
+  stopVoicePlaying();
+  state.listMediaUrls.forEach((url) => {
+    try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
+  });
+  state.listMediaUrls = [];
   if (!items.length) {
     $('#records-list').innerHTML = '<div class="empty-state"><strong>没有匹配记录</strong><p>尝试减少筛选条件或扩大时间范围</p></div>';
     return;
   }
-  stopVoicePlaying();
   $('#records-list').innerHTML = items.map((record) => {
     const assistant = record.role === 'assistant';
     const sender = assistant ? 'Assistant' : (record.sender_nickname || record.user_id || 'User');
@@ -884,6 +904,7 @@ function renderRecords(items, keyword) {
       `<span class="badge status">${escapeHtml(status)}</span>`,
       ...kinds.map((kind) => `<span class="badge kind">${escapeHtml(kind)}</span>`),
       ...subtypeBadges(record),
+      record.recalled ? '<span class="badge recalled">已撤回</span>' : '',
       record.persona_id ? `<span class="badge">persona:${escapeHtml(record.persona_id)}</span>` : '',
       `<span class="badge" title="${escapeHtml(record.umo)}">${escapeHtml(compactId(record.umo, 44))}</span>`,
     ].filter(Boolean).join('');
@@ -916,9 +937,6 @@ function renderRecords(items, keyword) {
       <button class="record-detail-button" data-record-id="${record.record_id}">详情 #${record.record_id} ›</button>
     </article>`;
   }).join('');
-  // 撤销上一批列表缩略图的 objectURL，避免反复查询累积泄漏
-  state.listMediaUrls.forEach((url) => { try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ } });
-  state.listMediaUrls = [];
   hydrateInlineThumbs($('#records-list'), state.listMediaUrls, false);
   bindVoiceBubbles($('#records-list'));
   document.querySelectorAll('[data-record-id]').forEach((button) => {
@@ -940,13 +958,17 @@ function renderPagination() {
 
 async function openDetail(id) {
   const modal = $('#detail-modal');
+  // 详情也有竞态：慢响应可能在关闭/换记录之后到达，用 token 丢弃过期结果
+  const token = ++state.detailRequestToken;
   modal.classList.remove('hidden');
   $('#detail-content').innerHTML = '<div class="empty-state compact"><span class="loader"></span></div>';
   try {
     const data = unwrap(await apiGet('record', { id }));
+    if (token !== state.detailRequestToken) return;
     renderDetail(data.record);
     setDatabaseState(data.database);
   } catch (error) {
+    if (token !== state.detailRequestToken) return;
     $('#detail-content').innerHTML = `<div class="empty-state compact"><strong>详情加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
   }
 }
@@ -966,11 +988,15 @@ function renderDetail(record) {
     </section>` : '',
     mediaView.length ? `<section class="detail-section"><h3>媒体（${mediaView.length}）</h3><div class="media-gallery">${mediaView.map((media) => mediaDetailHtml(media)).join('')}</div></section>` : '',
     mentions.length ? `<section class="detail-section"><h3>提及（At）</h3><div class="detail-grid">${mentions.map((mention) => `
-      <div class="detail-item"><div class="detail-key">${mention.all ? '全体成员' : (mention.nickname || '未知成员')}</div><div class="detail-value">${escapeHtml(mention.all ? '@全体' : `@${mention.nickname || '未知成员'}`)}</div></div>`).join('')}</div></section>` : '',
+      <div class="detail-item"><div class="detail-key">${escapeHtml(mention.all ? '全体成员' : (mention.nickname || '未知成员'))}</div><div class="detail-value">${escapeHtml(mention.all ? '@全体' : `@${mention.nickname || '未知成员'}`)}</div></div>`).join('')}</div></section>` : '',
   ].filter(Boolean).join('');
   const kindBadges = (Array.isArray(record.content_kind) ? record.content_kind : [])
     .map((kind) => `<span class="badge kind">${escapeHtml(kind)}</span>`);
-  const detailBadges = [...kindBadges, ...subtypeBadges(record)].join('');
+  const detailBadges = [
+    ...kindBadges,
+    ...subtypeBadges(record),
+    record.recalled ? '<span class="badge recalled">已撤回</span>' : '',
+  ].join('');
   $('#detail-content').innerHTML = `
     <div class="detail-message">${escapeHtml(record.content || '(空消息)')}</div>
     ${detailBadges ? `<div class="record-meta">${detailBadges}</div>` : ''}
@@ -1066,6 +1092,7 @@ function resetToolFilters() {
 }
 
 function closeDetail() {
+  state.detailRequestToken += 1;  // 丢弃仍在途的详情响应
   state.mediaObjectUrls.forEach((url) => {
     try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
   });

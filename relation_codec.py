@@ -39,7 +39,12 @@ MAX_REPLY_SNAPSHOT_CHARS = 300
 
 
 def escape_plain_text(text: str) -> str:
-    """把用户文本里的每个 ``⟦``/``⟧`` 换成哨兵字符，杜绝伪造内部 At / 媒体 token。"""
+    """把用户文本里的每个 ``⟦``/``⟧`` 换成哨兵字符，杜绝伪造内部 At / 媒体 token。
+
+    保证范围：含 ``⟦``/``⟧`` 的输入往返双射；字面哨兵字符 ``⦑``/``⦒`` 本身
+    不参与转义（它们只会在展示层被还原成 ⟦/⟧，不会被解析成内部 token，
+    因此不构成注入，但往返不等价）。
+    """
     return (text or "").replace("⟦", _SENTINEL_LEFT).replace("⟧", _SENTINEL_RIGHT)
 
 
@@ -205,8 +210,11 @@ def mention_label(mention: Any) -> str:
 
 
 def _media_label_of(item: Any) -> str:
-    """单个 media 条目 → 上下文占位标签（emoji 带名称，其余走 MEDIA_KIND_LABELS）。"""
+    """单个 media 条目 → 上下文占位标签（emoji 带名称、poke 走事件占位）。"""
     kind = str(item.get("kind") or "") if isinstance(item, dict) else ""
+    if kind == "poke":
+        # 与 context_builder.MEDIA_PLACEHOLDER_LABELS 保持一致：poke 不是媒体
+        return '<cm_event type="poke">戳一戳</cm_event>'
     if kind == "emoji":
         name = face_name(str(item.get("id") or ""))
         if name:

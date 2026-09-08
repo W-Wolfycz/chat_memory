@@ -39,7 +39,8 @@ CREATE TABLE chat_memory_records (
     persona_id TEXT,
     turn_id TEXT,
     send_status TEXT NOT NULL DEFAULT '',
-    relation_data TEXT
+    relation_data TEXT,
+    recalled_at DATETIME
 )
 """
 
@@ -62,7 +63,7 @@ CREATE TABLE chat_memory_tool_records (
 def make_database(path: Path, include_tools: bool = True) -> None:
     connection = sqlite3.connect(path)
     connection.execute(SCHEMA)
-    connection.execute(f"PRAGMA user_version = {4 if include_tools else 3}")
+    connection.execute(f"PRAGMA user_version = {6 if include_tools else 3}")
     rows = [
         (
             "bot:FriendMessage:u1", "cid-a", "u1", "user",
@@ -149,7 +150,7 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(overview["summary"]["total_records"], 4)
         self.assertEqual(overview["summary"]["total_conversations"], 2)
         self.assertEqual(overview["summary"]["total_users"], 2)
-        self.assertEqual(overview["database"]["user_version"], 4)
+        self.assertEqual(overview["database"]["user_version"], 6)
         self.assertEqual(overview["database"]["mode"], "wal_aware")
         self.assertTrue(overview["database"]["tool_table_present"])
         self.assertTrue(overview["tools"]["present"])
@@ -655,6 +656,27 @@ class RepositoryTestCase(unittest.TestCase):
                          "target": "长风", "operator": ""}}
         set_event(ban, "10001", "10001")
         self.assertEqual(rendered(), "长风 被禁言了 10分钟")
+
+    def test_recalled_serialization(self):
+        """撤回标记：recalled_at 非空 → recalled=True 且带本地时间；未标记为 False。"""
+        path = Path(self.temp_dir.name) / "recalled.db"
+        make_database(path)
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "UPDATE chat_memory_records SET recalled_at = ? WHERE turn_id = ?",
+            ("2026-09-07 02:00:05", "turn-b"),
+        )
+        connection.commit()
+        connection.close()
+        repo = ChatMemoryRepository(
+            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+        )
+        result = asyncio.run(repo.query({"page_size": 50}))
+        by_turn = {item["turn_id"]: item for item in result["items"]}
+        self.assertTrue(by_turn["turn-b"]["recalled"])
+        self.assertEqual(by_turn["turn-b"]["recalled_at"], "2026-09-07 10:00:05")
+        self.assertFalse(by_turn["turn-a"]["recalled"])
+        self.assertEqual(by_turn["turn-a"]["recalled_at"], "")
 
     def test_emoji_face_name_rendering(self):
         """QQ 表情按 face id 渲染中文名（正文占位/媒体标签）；未知 id 回退通用占位。"""

@@ -1,4 +1,4 @@
-"""chat_memory — 异步 SQLite 存储层（schema v3）。
+"""chat_memory — 异步 SQLite 存储层（schema v6）。
 
 Schema 说明：
 - ``llm_status``：LLM 配对状态（单值）。'' = 默认（未走 LLM），
@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS chat_memory_records (
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     turn_id         TEXT,
     send_status     TEXT NOT NULL DEFAULT '',
-    relation_data   TEXT
+    relation_data   TEXT,
+    recalled_at     DATETIME
 )"""
 
 # 工具调用独立存档（schema v4）：不回放进主表的 user/assistant 配对，
@@ -105,7 +106,14 @@ _MEDIA_ARCHIVE_INDEX_DEFINITIONS = {
     ),
 }
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
+
+# 现有库必须已具备的列：缺失说明是 1.4.0 之前的 schema，不再自动迁移
+_REQUIRED_COLUMNS = {
+    "id", "umo", "conversation_id", "user_id", "role", "content", "llm_status",
+    "content_kind", "created_at", "persona_id", "turn_id", "send_status",
+    "relation_data",
+}
 
 _INDEX_DEFINITIONS = {
     "ix_cm_umo_cid_user": (
@@ -127,6 +135,11 @@ _INDEX_DEFINITIONS = {
     "ix_cm_platform_user_time": (
         "CREATE INDEX IF NOT EXISTS ix_cm_platform_user_time "
         "ON chat_memory_records (platform_id, user_id, created_at)"
+    ),
+    # 撤回/表情回应的 message_id 本地关联（此前无索引，每条通知全表扫描）
+    "ix_cm_umo_message_id": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_umo_message_id "
+        "ON chat_memory_records (umo, message_id)"
     ),
     "ix_cm_llm_status": (
         "CREATE INDEX IF NOT EXISTS ix_cm_llm_status "
@@ -198,43 +211,24 @@ class DBManager:
             if self._initialized:
                 return
             async with self.engine.begin() as conn:
-                # 缺 llm_status 的早期 schema → RENAME 备份后重建；
-                # 已有 llm_status 的测试版 schema 采用增量迁移。
-                # 不直接 DROP，给用户事后手动恢复的机会（备份表保留在同一个 .db 文件里）
+                # 1.4.0 之前的旧 schema 不再迁移（市场首发 1.4.0）：
+                # 缺列时直接给出可诊断的失败，而不是静默增量迁移。
                 result = await conn.execute(text("PRAGMA table_info(chat_memory_records)"))
                 existing_cols = {row[1] for row in result.fetchall()}
-                if existing_cols and "llm_status" not in existing_cols:
-                    import time as _time
-                    backup_name = f"chat_memory_records_backup_{int(_time.time())}"
+                missing = (
+                    sorted(_REQUIRED_COLUMNS - existing_cols) if existing_cols else []
+                )
+                if missing:
+                    raise RuntimeError(
+                        "检测到 1.4.0 之前的旧数据库 schema（缺少列："
+                        + ", ".join(missing)
+                        + "）。请先用 1.4.0 升级该数据库，或移走旧库文件后重启。"
+                    )
+                if existing_cols and "recalled_at" not in existing_cols:
+                    # v5 → v6：撤回感知需要标记被撤回的原消息（NULL=未撤回）
                     await conn.execute(text(
-                        f"ALTER TABLE chat_memory_records RENAME TO {backup_name}"
+                        "ALTER TABLE chat_memory_records ADD COLUMN recalled_at DATETIME"
                     ))
-                    # SQLite RENAME TABLE 会把旧索引继续绑定到备份表，但索引名称不变。
-                    # 若不释放这些名称，下面 CREATE INDEX IF NOT EXISTS 会误以为索引已存在，
-                    # 导致新 chat_memory_records 实际没有任何同名索引。
-                    # 仅删除 ChatMemory 自己管理的已知索引；备份数据本身完整保留。
-                    for index_name in _INDEX_DEFINITIONS:
-                        await conn.execute(text(f'DROP INDEX IF EXISTS "{index_name}"'))
-                    existing_cols = set()  # 触发下面 CREATE 新表
-                elif existing_cols:
-                    # 现有库采用增量迁移：每个新增列独立补齐，避免 elif 只执行一列。
-                    if "persona_id" not in existing_cols:
-                        await conn.execute(text(
-                            "ALTER TABLE chat_memory_records ADD COLUMN persona_id TEXT"
-                        ))
-                    if "turn_id" not in existing_cols:
-                        await conn.execute(text(
-                            "ALTER TABLE chat_memory_records ADD COLUMN turn_id TEXT"
-                        ))
-                    if "send_status" not in existing_cols:
-                        await conn.execute(text(
-                            "ALTER TABLE chat_memory_records "
-                            "ADD COLUMN send_status TEXT NOT NULL DEFAULT ''"
-                        ))
-                    if "relation_data" not in existing_cols:
-                        await conn.execute(text(
-                            "ALTER TABLE chat_memory_records ADD COLUMN relation_data TEXT"
-                        ))
                 await conn.execute(text(_CREATE_TABLE_SQL))
                 for idx_sql in _INDEX_DEFINITIONS.values():
                     await conn.execute(text(idx_sql))
@@ -266,22 +260,6 @@ class DBManager:
                         raise RuntimeError(
                             f"ChatMemory index {index_name} 未绑定到 {table_name}"
                         )
-                # 1.2.5 起 kind 值 face 更名为 emoji：一次性数据迁移（幂等，按行更新）。
-                # content_kind 是 JSON 数组字符串，'"face"' 精确替换不会误伤正文。
-                face_rows = await conn.execute(
-                    text(
-                        "SELECT COUNT(*) FROM chat_memory_records "
-                        "WHERE content_kind LIKE '%\"face\"%'"
-                    )
-                )
-                if int(face_rows.scalar() or 0) > 0:
-                    await conn.execute(
-                        text(
-                            "UPDATE chat_memory_records "
-                            "SET content_kind = REPLACE(content_kind, '\"face\"', '\"emoji\"') "
-                            "WHERE content_kind LIKE '%\"face\"%'"
-                        )
-                    )
                 await conn.execute(text(f"PRAGMA user_version = {_SCHEMA_VERSION}"))
             self._initialized = True
 
@@ -1132,6 +1110,32 @@ class DBManager:
                 "sender_nickname": row[2] or "",
             }
 
+    async def mark_recalled(self, umo: str, message_id: str) -> int:
+        """把被撤回的 user 记录标记为已撤回（``recalled_at``，幂等）。
+
+        只标记 role='user' 且尚未标记的行；未命中返回 0。assistant 记录没有
+        message_id，天然不会被误标。
+        """
+        mid = str(message_id or "").strip()
+        if not umo or not mid:
+            return 0
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE chat_memory_records SET recalled_at = :now "
+                    "WHERE umo = :umo AND message_id = :mid AND role = 'user' "
+                    "AND recalled_at IS NULL"
+                ),
+                {
+                    "now": datetime.now(timezone.utc).replace(tzinfo=None),
+                    "umo": umo,
+                    "mid": mid,
+                },
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
     async def latest_sender_nickname(self, umo: str, user_id: str) -> Optional[str]:
         """按 umo+user_id 查最近一条 user 记录的真实昵称。
 
@@ -1165,6 +1169,7 @@ class DBManager:
         full_group: bool = False,
         persona_id: Optional[str] = None,
         filter_by_persona: bool = False,
+        skip_recalled: bool = False,
     ) -> list[list[dict]]:
         """内部方法：配对模式查询（takeover 专用）。
 
@@ -1216,6 +1221,8 @@ class DBManager:
                 "role = 'user'",
                 " ".join(exists_parts),
             ]
+            if skip_recalled:
+                conditions.append("recalled_at IS NULL")
             params: dict = {**scope_param, "lim": limit_rounds}
             expanding_binds: list[str] = []
 
@@ -1330,6 +1337,7 @@ class DBManager:
         persona_id: Optional[str] = None,
         filter_by_persona: bool = False,
         exclude_turn_id: Optional[str] = None,
+        skip_recalled: bool = False,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
@@ -1359,6 +1367,8 @@ class DBManager:
                 scope_cond,
                 "role IN ('user', 'assistant')",
             ]
+            if skip_recalled:
+                conditions.append("recalled_at IS NULL")
             params: dict = {**scope_param, "lim": limit_messages}
             expanding_binds: list[str] = []
 
@@ -1483,7 +1493,7 @@ _SELECT_COLS = (
     "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
     "platform_id, platform_name, message_type, session_id, self_id, "
     "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, "
-    "persona_id, created_at, turn_id, send_status, relation_data, id"
+    "persona_id, created_at, turn_id, send_status, relation_data, id, recalled_at"
 )
 
 # 列位置索引（与 _SELECT_COLS 一一对应）
@@ -1550,4 +1560,6 @@ def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
         "send_status": r[21],
         "relation_data": relation_data,
         "record_id": int(r[23]),
+        # 撤回感知：非空表示该消息已被撤回（NULL=未撤回）
+        "recalled_at": r[24] if len(r) > 24 else None,
     }

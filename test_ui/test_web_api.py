@@ -268,7 +268,10 @@ class WebApiTestCase(unittest.TestCase):
             controller = module.ChatMemoryUiWebApi(
                 Context(), VideoRepository(), media_root=root
             )
-            response = asyncio.run(controller.media(video_id))
+            # 大文件卡死根因回归：Range 分支必须只读请求区间，不能整读文件
+            with patch.object(Path, "read_bytes",
+                              side_effect=AssertionError("Range 不得整读文件")):
+                response = asyncio.run(controller.media(video_id))
             self.assertEqual(response[1], 206)
             self.assertEqual(response[0], video_payload[10:30])
             self.assertEqual(response[2]["Content-Range"], "bytes 10-29/100")

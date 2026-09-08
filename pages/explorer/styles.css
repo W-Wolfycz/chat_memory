@@ -212,6 +212,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .badge.status { color: var(--accent); background: var(--accent-soft); }
 .badge.kind { color: var(--teal); background: var(--teal-soft); }
 .badge.sub { color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line-strong); }
+.badge.recalled { color: #fff; background: var(--amber); font-weight: 720; }
 .record-detail-button { align-self: start; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--accent); background: var(--surface-2); font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: border-color .15s ease, background .15s ease; }
 .record-detail-button:hover { border-color: var(--accent); background: var(--accent-soft); }
 

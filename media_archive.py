@@ -122,20 +122,6 @@ def _sniff_ext(path: Path, kind: str) -> str:
     return ""
 
 
-def _file_uri_to_path(uri: str) -> str:
-    try:
-        parsed = urlparse(uri)
-        if parsed.scheme != "file":
-            return ""
-        path = unquote(parsed.path)
-        # file:///C:/... 在 posix 端解析为 /C:/...，剥掉前导斜杠
-        if re.match(r"^/[A-Za-z]:", path):
-            path = path[1:]
-        return path
-    except Exception:
-        return ""
-
-
 class MediaArchiver:
     """媒体归档器：负责落盘与登记，不参与消息正文逻辑。"""
 
@@ -228,7 +214,10 @@ class MediaArchiver:
                 media_id, tmp, umo, conversation_id, turn_id, kind, name
             )
         except Exception as exc:
-            logger.debug("[ChatMemory] 本地媒体接管失败 kind=%s: %s", kind, exc)
+            # 只记异常类型：异常串可能含源/目标绝对路径，日志不落路径
+            logger.debug(
+                "[ChatMemory] 本地媒体接管失败 kind=%s: %s", kind, type(exc).__name__
+            )
             return False
 
     async def archive_bytes(
@@ -300,7 +289,10 @@ class MediaArchiver:
             )
             return True
         except Exception as exc:
-            logger.debug("[ChatMemory] 媒体归档登记失败 %s: %s", media_id[:8], exc)
+            logger.debug(
+                "[ChatMemory] 媒体归档登记失败 %s: %s",
+                media_id[:8], type(exc).__name__,
+            )
             tmp.unlink(missing_ok=True)
             return False
 

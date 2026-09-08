@@ -76,7 +76,7 @@ MEDIA_PLACEHOLDER_LABELS = {
 
 # capture 阶段写入的旧英文占位：展示层视为"无实际内容"，统一替换成上面的占位。
 _LEGACY_EN_PLACEHOLDERS = {
-    "[image]", "[video]", "[voice]", "[file]", "[face]", "[emoji]",
+    "[image]", "[video]", "[voice]", "[file]", "[emoji]",
     "[forward]", "[poke]",
 }
 
@@ -93,7 +93,6 @@ _BRACKET_PLACEHOLDER_TO_BARE = {
     "[video]": "视频",
     "[voice]": "语音",
     "[file]": "文件",
-    "[face]": "表情",
     "[forward]": "转发消息",
 }
 
@@ -212,13 +211,6 @@ def extract_time_str(created_at) -> str:
     if len(value) >= 19 and value[10] in (" ", "T"):
         return value[5:19].replace("-", "/").replace("T", " ")
     return value
-
-
-def is_pure_media(record: dict, media_kinds: set[str]) -> bool:
-    kinds = record.get("content_kind") or []
-    if not kinds:
-        return False
-    return all(kind in media_kinds for kind in kinds)
 
 
 class TakeoverContextBuilder:
@@ -365,13 +357,6 @@ class TakeoverContextBuilder:
                 }
             )
         return formatted
-
-    @staticmethod
-    def _nm(name: str) -> str:
-        """昵称 → <cm_nickname> 标签；空串返回空。"""
-        if not name:
-            return ""
-        return f'<cm_nickname>{_xml_escape(name, quote=True)}</cm_nickname>'
 
     @staticmethod
     def _event_sentence(event: dict) -> str:

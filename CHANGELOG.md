@@ -1,8 +1,30 @@
 # Changelog
 
-ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前为 `5`。
+ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开发历史的重新压缩，不对应旧仓库曾使用的版本号；数据库 schema 版本独立维护，当前为 `6`。
 
 > 下方各版本记录的是该版本发布时的实际格式。旧条目中的 `[当前发言者]`、`<cm s="N"/>`、`<cm_history_tail/>` 等均为已经退役的历史协议，不代表当前版本仍会生成或接受这些标签；当前格式以最新版本条目和 README 为准。
+
+## 1.5.1 — 2026-09-08
+
+### 修复
+
+- **查询台事件子类过滤失效**：前端 `collectQuery` 未发送 `event_type`，选了子类查询结果无变化（后端与测试早已支持），现补上并加回归断言。
+- **详情提及昵称 XSS**：`mention.nickname` 未转义即拼入 DOM，现统一转义；详情抽屉加请求 token，避免慢响应覆盖新打开的记录。
+- **媒体端点 Range 整读大文件**：Range 分支改为只读请求区间（回归测试锁定「不得整读」），补归档文件名 basename 校验；`file_token` 分支先判依赖再嗅探编码。
+- **不兼容旧库异常**：`sender_nickname` 改安全取值、`export_snapshot` 缺库抛 `DatabaseUnavailableError`（与查询 503 语义一致）；概览每日趋势按插件时区分桶。
+- **事件与分类边界**：纯 poke 回退渲染为事件占位（不再出现幽灵 `<cm_media type="image"/>`）；`OtherMessage` 仅在未识别出内容时兜底；纯引用回复的 assistant 消息不再漏存；reset/new 改词边界匹配（`renew`/`news` 不再误判）；媒体归档日志不再落绝对路径。
+- **前端资源回收**：列表空结果与切换数据源时停止语音播放并回收 objectURL；原图加载失败给出提示、撤销职责单一化。
+
+### 变更
+
+- **移除 1.4.0 之前的兼容代码**：删除 `face→emoji` 一次性数据迁移与旧 schema 增量迁移/重建路径（市场首发 1.4.0）；打开 1.4.0 之前的旧库时 `init_db` 直接给出可诊断的失败提示（列出缺失列，引导先用 1.4.0 升级或移走旧库），不再静默迁移。`system_event`/`poke` 等 1.5.0 才改名的旧值读兼容保留（1.4.x 市场用户数据仍需要）。
+
+### 新增
+
+- **撤回消息跳过上下文（`recall_skip_context`）**：撤回 notice 命中本地记录时标记 `recalled_at`（schema v6 主表新增列，幂等，另补 `(umo, message_id)` 索引）；配置开启后被撤回的原消息与撤回事件（`<cm_event type="recall">`）都不再进入 LLM 上下文，查询台仍可见并显示「已撤回」徽章。默认关闭。
+- **assistant 侧入口测试**：补 `capture_bot` 四态（proactive/orphan/llm_success/default + cm 标签清洗）、`mark_send_attempted`、`inject_current_turn_focus`、reset/new 词边界共 3 项行为级测试；测试夹具中的疑似真实 QQ 号替换为虚构占位。
+
+测试：行为级 41 项 + UI 18 项 + 存储集成。
 
 ## 1.5.0 — 2026-09-07
 

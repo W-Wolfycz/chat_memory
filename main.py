@@ -21,6 +21,7 @@ assistant 配对：新记录优先用内部 ``turn_id``；旧记录用 ``pair_id
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
@@ -152,6 +153,8 @@ class ChatMemoryPlugin(Star):
         }
         # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
         self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
+        # 撤回消息跳过上下文：开启后被撤回的原消息与撤回事件都不进 LLM 上下文
+        self.ct_recall_skip_context = bool(ct_conf.get("recall_skip_context", False))
         # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时跳过（兜底）
         # 与 cross_session=T 协同可获完整 persona 隔离体验（切 persona + /new + 切回仍可见旧数据）
         self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
@@ -907,7 +910,11 @@ class ChatMemoryPlugin(Star):
                 if action == "撤回消息":
                     raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
                     if isinstance(raw, dict):
-                        event_data["message_id"] = str(raw.get("message_id") or "")
+                        recalled_mid = str(raw.get("message_id") or "")
+                        event_data["message_id"] = recalled_mid
+                        # 标记原消息（与配置无关，始终落库；是否进上下文由配置决定）
+                        if recalled_mid:
+                            await self.db.mark_recalled(umo, recalled_mid)
                 if event_type == "reaction":
                     # 表情回应：按 message_id 关联被回应消息的作者昵称（同撤回）；
                     # 附带 emoji_id 供查询台查看。
@@ -1270,7 +1277,11 @@ class ChatMemoryPlugin(Star):
             return
         turn_id = event.get_extra("chat_memory_turn_id") or uuid.uuid4().hex
         event.set_extra("chat_memory_turn_id", turn_id)
-        call_index = int(event.get_extra("chat_memory_tool_seq") or 0) + 1
+        try:
+            seq = int(event.get_extra("chat_memory_tool_seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        call_index = seq + 1
         event.set_extra("chat_memory_tool_seq", call_index)
         args_json = (
             json.dumps(tool_args, ensure_ascii=False, default=str)
@@ -1474,6 +1485,7 @@ class ChatMemoryPlugin(Star):
                     umo, target_cid, user_id, limit, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
+                    skip_recalled=self.ct_recall_skip_context,
                 )
                 records: list[dict] = [msg for rnd in rounds for msg in rnd]
             else:
@@ -1485,6 +1497,7 @@ class ChatMemoryPlugin(Star):
                     cross_umo=cross_umo, full_group=effective_full_group,
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
                     exclude_turn_id=exclude_turn_id or None,
+                    skip_recalled=self.ct_recall_skip_context,
                 )
         except Exception as e:
             logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
@@ -1503,6 +1516,18 @@ class ChatMemoryPlugin(Star):
                 for record in records
                 if not self._is_event_record(record)
                 or self._event_type_of(record) in allowed_event_types
+            ]
+        # 撤回感知（方案 A）：开启后撤回痕迹完全不出现在上下文——被撤回的原消息
+        # （recalled_at 非空，已在 SQL 层过滤，这里兜底）与撤回事件都丢弃。
+        if self.ct_recall_skip_context:
+            records = [
+                record
+                for record in records
+                if not str(record.get("recalled_at") or "").strip()
+                and not (
+                    self._is_event_record(record)
+                    and self._event_type_of(record) == "recall"
+                )
             ]
         return records
 
@@ -1806,9 +1831,10 @@ class ChatMemoryPlugin(Star):
         except Exception:
             message = getattr(event, "message_str", "")
         message = str(message or "").lower()
-        if "reset" in message:
+        # 词边界匹配：避免 renew / news / preset 之类的子串误判
+        if re.search(r"(?:^|[\s/])reset(?:$|[\s])", message):
             return "reset"
-        if "new" in message:
+        if re.search(r"(?:^|[\s/])new(?:$|[\s])", message):
             return "new"
         return ""
 
