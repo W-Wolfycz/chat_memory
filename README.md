@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.5.1`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=6`。
+当前发布版本：`1.5.2`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=6`。
 
 ## 特性
 
@@ -188,7 +188,7 @@ cm = _resolve_chat_memory(context)
 ### 群聊 At / Reply 关系
 
 - At 按 MessageChain 原始位置写成 `⟦CM_AT:0⟧` 等带索引模板；`relation_data.mentions` 按出现顺序保存参数，重复 At 不去重，AtAll 使用 `{"all": true}`。
-- 统一规则：凡与文字同时出现的媒体/动作组件，一律按原始位置写成类型化 token（`⟦CM_IMAGE:n⟧` / `⟦CM_VIDEO:n⟧` / `⟦CM_FILE:n⟧` / `⟦CM_POKE:n⟧` 等，n 为 `relation_data.media` 数组下标），`media` 附带元信息（表情 `id`、戳一戳目标）；查询返回的 `content` 渲染为 `<cm_media type="…"/>` 等占位标签，保持正文中的原始位置。纯媒体/纯动作消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存英文占位（`[image]` 等），元信息仍在 `media` 数组。
+- 统一规则：凡与文字同时出现的媒体/动作组件，一律按原始位置写成类型化 token（`⟦CM_IMAGE:n⟧` / `⟦CM_VIDEO:n⟧` / `⟦CM_FILE:n⟧` / `⟦CM_POKE:n⟧` 等，n 为 `relation_data.media` 数组下标），`media` 附带元信息（表情 `id`、戳一戳目标）；查询返回的 `content` 渲染为 `<cm_image/>` / `<cm_file/>` 等类型化占位标签（标签名即媒体类型），保持正文中的原始位置。纯媒体/纯动作消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存英文占位（`[image]` 等），元信息仍在 `media` 数组。
 - 普通成员 Reply 只用同一平台实例、同一 UMO 下唯一的 `reply_id → user.message_id` 精确解析为 `target_turn_id`；零命中或多命中都不猜测。
 - 引用 Bot/assistant 时不做时间或内容启发式匹配，直接保存 AstrBot Reply 组件提供的昵称与最多 300 字符文本快照；其他无法精确解析的 Reply 同样降级为快照。
 - 跨会话历史中的 Reply 仍按该消息原本所在的 UMO 查询 `target_turn_id`，不会拿当前请求所在群替代，也不会跨群猜测引用关系。
@@ -416,7 +416,8 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 | `limit_rounds` | int | 30 | 注入轮数或消息数；最小按 1 处理，不限制上限（含义随状态过滤变化，见上） |
 | `max_context_chars` | int | 0 | 规整后字符预算，超出从最旧完整 user 起点裁剪；0=关闭 |
 | `llm_status_filter` | chip | `["llm_success"]` | 状态多选 |
-| `include_content_kinds` | chip | `["text"]` | 内容白名单（清空=不过滤） |
+| `include_content_kinds` | chip | `["text"]` | 内容白名单，取值与存储 `content_kind` 一一对应（清空=不过滤） |
+| `event_kinds` | chip | 全部 | 事件子类过滤（仅白名单含 `event` 时生效；清空=全部放行） |
 | `include_all_match` | bool | false | ALL 模式开关（默认 ANY） |
 | `recall_skip_context` | bool | false | 撤回消息跳过上下文：开启后被撤回的原消息与撤回事件都不进上下文 |
 | `clear_native_history` | bool | true | 每轮清空 native history |
@@ -428,7 +429,7 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 
 **只影响 takeover**，capture 照常入库。
 
-`include_content_kinds` 是白名单：选中=需要进入上下文的 kind。空集合 = 不过滤（全部进入）。配合 `include_all_match` 切换 ANY / ALL 两种语义：
+`include_content_kinds` 是白名单：选中=需要进入上下文的 kind，取值与存储的 `content_kind` 一一对应（`text` / `image` / `video` / `voice` / `emoji` / `file` / `forward` / `event`）。空集合 = 不过滤（全部进入）。配合 `include_all_match` 切换 ANY / ALL 两种语义：
 
 | `include_all_match` | 语义 | 保留条件 | 例子（白名单 `["text"]`） |
 |---|---|---|---|
@@ -440,7 +441,9 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 - **ALL + `["text","image"]`**：精确限定为这两种 kind
 - **清空**：不过滤，全量进入
 
-**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_media type="image|voice|video|file|emoji|forward"/>`，QQ 表情带中文名渲染为 `<cm_emoji>名称</cm_emoji>`，如「问号脸」；戳一戳并入事件协议为 `<cm_event type="poke">戳一戳</cm_event>`，表情回应为 `<cm_event type="reaction">阿明 用 问号脸 回应了 小虎 的消息</cm_event>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_media type="image"/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
+**事件子类（event_kinds）**：`event` 的细分类别（`relation_data.event.type`）不在 `content_kind` 里，用独立键控制：`ban` / `member` / `title` / `recall` / `resource` / `poke` / `reaction` / `system`，默认全选；清空 = 不按子类过滤。白名单放行 `event` 时生效（白名单为空=不过滤时同样生效）。
+
+**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_image/>` / `<cm_video/>` / `<cm_voice/>` / `<cm_file/>` / `<cm_forward/>`，标签名即媒体类型，`<cm_file>` 附带文件名（如 `<cm_file name="报告.pdf"/>`），无法识别时用 `<cm_unknown/>`；QQ 表情带中文名渲染为 `<cm_emoji>名称</cm_emoji>`，如「问号脸」；戳一戳并入事件协议为 `<cm_event type="poke">戳一戳</cm_event>`，表情回应为 `<cm_event type="reaction">阿明 用 问号脸 回应了 小虎 的消息</cm_event>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_image/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
 
 ### persona 隔离（filter_by_persona）
 
@@ -459,7 +462,7 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 
 **设计说明**：
 - cid **不会自动**随 persona 切换——同一 cid 下可能累积多个 persona 的数据，按 `persona_id` 列区分
-- 旧测试版数据库启动时自动 `ALTER TABLE ADD COLUMN persona_id TEXT` 补列，旧行 `persona_id` 为 NULL
+- 1.4.0 之前的旧库不再自动补列（启动直接报错）；`persona_id` 为空时按 `IS NULL OR ''` 处理旧行
 - 入库时 `persona_id` 取自 `_get_effective_persona`（走 `persona_manager.resolve_selected_persona`，与 LLM 实际生效 persona 同源）
 
 ## 存档语义

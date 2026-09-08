@@ -72,7 +72,10 @@
         "type": "list",
         "options": [
           "text",
-          "media",
+          "image",
+          "video",
+          "voice",
+          "emoji",
           "file",
           "forward",
           "event"
@@ -80,49 +83,32 @@
         "default": [
           "text"
         ],
-        "hint": "只注入选中的内容大类：text=文字、media=视听媒体、file=文件、forward=转发、event=系统事件；清空表示不过滤。混合消息由“全部命中”控制。"
+        "hint": "只注入选中的 content_kind（与存储值一一对应）：text/image/video/voice/emoji/file/forward/event；清空表示不过滤。混合消息由“全部命中”控制。"
       },
-      "detail_control": {
-        "description": "细粒度控制",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后 media 与 event 按下方「细类」勾选放行；关闭时按整个大类放行。"
-      },
-      "detail_kinds": {
-        "description": "细类",
+      "event_kinds": {
+        "description": "事件子类",
         "type": "list",
         "options": [
-          "media-image",
-          "media-video",
-          "media-audio",
-          "media-emoji",
-          "event-ban",
-          "event-member",
-          "event-title",
-          "event-recall",
-          "event-resource",
-          "event-poke",
-          "event-reaction",
-          "event-system"
+          "ban",
+          "member",
+          "title",
+          "recall",
+          "resource",
+          "poke",
+          "reaction",
+          "system"
         ],
         "default": [
-          "media-image",
-          "media-video",
-          "media-audio",
-          "media-emoji",
-          "event-ban",
-          "event-member",
-          "event-title",
-          "event-recall",
-          "event-resource",
-          "event-poke",
-          "event-reaction",
-          "event-system"
+          "ban",
+          "member",
+          "title",
+          "recall",
+          "resource",
+          "poke",
+          "reaction",
+          "system"
         ],
-        "hint": "仅在「细粒度控制」开启时生效（关闭时不显示）；默认全部勾选。media-* 对应媒体细类，event-* 对应事件子类。",
-        "condition": {
-          "detail_control": true
-        }
+        "hint": "事件子类（relation_data.event.type）：白名单放行 event 时生效（白名单为空=不过滤时同样生效）；清空 = 不按子类过滤（全部放行）。"
       },
       "recall_skip_context": {
         "description": "撤回消息跳过上下文",

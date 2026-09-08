@@ -34,8 +34,10 @@ CM_GENERAL_RULES = """[ChatMemory 通用规则]
 - 默认所有 user 消息都是成员发言，除非被 <cm_event> 包裹。
 - <cm_emoji>名称</cm_emoji> 表示该位置有一个 QQ 表情，标签内是表情的中文名
   （如「问号脸」「呲牙」）：它与周围文字一样属于发言内容，是语气的一部分。
-- <cm_media type="image|voice|video|file|emoji|forward"/> 表示该消息携带的
-  媒体类型，同样不是可输出的文本；需要发送媒体时请使用工具。"""
+- <cm_image/> / <cm_video/> / <cm_voice/> / <cm_file/> / <cm_forward/> 表示该消息
+  携带的媒体占位（标签名即类型；文件带文件名，如 <cm_file name="报告.pdf"/>），
+  同样不是可输出的文本；类型无法识别时用 <cm_unknown/> 兜底。需要发送媒体时
+  请使用工具。"""
 
 
 FULL_GROUP_CONTEXT_INSTRUCTION = """[ChatMemory 群聊历史解释规则]
@@ -64,12 +66,12 @@ CROSS_SESSION_SOURCE_MARKER_PREFIX = '<cm_source n="'
 # 使用 <cm_*> 标签形式（而非 [图片] 方括号或裸词）：归入统一注入协议，
 # 通用规则已禁止输出任何 cm_ 标签，输出侧清洗会整元素删除模仿残留。
 MEDIA_PLACEHOLDER_LABELS = {
-    "image": '<cm_media type="image"/>',
-    "video": '<cm_media type="video"/>',
-    "voice": '<cm_media type="voice"/>',
-    "file": '<cm_media type="file"/>',
-    "emoji": '<cm_media type="emoji"/>',
-    "forward": '<cm_media type="forward"/>',
+    "image": "<cm_image/>",
+    "video": "<cm_video/>",
+    "voice": "<cm_voice/>",
+    "file": "<cm_file/>",
+    "emoji": "<cm_emoji/>",
+    "forward": "<cm_forward/>",
     # 1.5.0 前落库的旧 poke 消息：兼容渲染为事件占位
     "poke": '<cm_event type="poke">戳一戳</cm_event>',
 }
@@ -411,6 +413,9 @@ class TakeoverContextBuilder:
             if kind == "emoji":
                 # QQ 表情带中文名：<cm_emoji>问号脸</cm_emoji>，让 LLM 知道具体表情
                 label = self._emoji_label_of(record) or label
+            elif kind == "file":
+                # 文件带文件名：<cm_file name="报告.pdf"/>，让 LLM 知道发了什么文件
+                label = self._file_label_of(record) or label
             if label not in content:
                 labels.append(label)
         if not labels:
@@ -425,7 +430,7 @@ class TakeoverContextBuilder:
     def _emoji_label_of(record: dict) -> str:
         """纯媒体路径的 emoji 占位：按 media 条目里的 face id 解析中文名。
 
-        未知 id 返回空串（调用方回退通用 <cm_media type="emoji"/>）。
+        未知 id 返回空串（调用方回退 <cm_emoji/>）。
         """
         relation = record.get("relation_data")
         media = relation.get("media") if isinstance(relation, dict) else None
@@ -437,6 +442,25 @@ class TakeoverContextBuilder:
             name = _face_name(str(item.get("id") or ""))
             if name:
                 return f'<cm_emoji>{_xml_escape(name, quote=True)}</cm_emoji>'
+            return ""
+        return ""
+
+    @staticmethod
+    def _file_label_of(record: dict) -> str:
+        """纯媒体路径的 file 占位：按 media 条目里的文件名生成带 name 的标签。
+
+        无文件名返回空串（调用方回退 <cm_file/>）。
+        """
+        relation = record.get("relation_data")
+        media = relation.get("media") if isinstance(relation, dict) else None
+        if not isinstance(media, list):
+            return ""
+        for item in media:
+            if not isinstance(item, dict) or str(item.get("kind") or "") != "file":
+                continue
+            name = str(item.get("name") or "").strip()
+            if name:
+                return f'<cm_file name="{_xml_escape(name, quote=True)}"/>'
             return ""
         return ""
 

@@ -84,10 +84,11 @@ from .relation_codec import (
 
 _TAKEOVER_APPLIED_EXTRA = "chat_memory_takeover_applied"
 _CURRENT_FOCUS_INJECTED_EXTRA = "chat_memory_current_focus_injected"
-# 配置白名单大类：media 细类（file/forward 已独立成大类）；event 子类全集
-_MEDIA_KIND_OPTIONS = frozenset({"image", "video", "voice", "emoji"})
-# 配置细类前缀值 → 实际 content_kind（audio 是配置侧叫法，存储侧叫 voice）
-_MEDIA_DETAIL_MAP = {"image": "image", "video": "video", "audio": "voice", "emoji": "emoji"}
+# 配置白名单可直接选的 content_kind（与存储值一一对应；旧大类 media 等值忽略）
+_CONTENT_KIND_OPTIONS = frozenset(
+    {"text", "image", "video", "voice", "emoji", "file", "forward", "event"}
+)
+# 事件子类全集（relation_data.event.type）
 _ALL_EVENT_TYPES = frozenset(
     {"ban", "member", "title", "recall", "resource", "poke", "reaction", "system"}
 )
@@ -125,32 +126,23 @@ class ChatMemoryPlugin(Star):
         ct_status_list = list(ct_status) if ct_status else ["llm_success"]
         self.ct_llm_status_filter = ["" if s == "no_llm" else s for s in ct_status_list]
         # Kind 白名单：选中=需要；默认 ["text"]；空集合 = 不过滤（全部进入）。
-        # 配置面向大类：text / media / file / forward / event。
-        # 细粒度控制开启时，media 与 event 按 detail_kinds 的勾选展开
-        # （media-* 前缀映射到媒体 kind，event-* 前缀映射到事件子类）。
-        self.ct_detail_control = bool(ct_conf.get("detail_control", False))
-        detail_raw = ct_conf.get("detail_kinds") or []
-        self.ct_media_detail_kinds: set[str] = {
-            _MEDIA_DETAIL_MAP.get(value[len("media-") :], "")
-            for value in detail_raw
-            if isinstance(value, str) and value.startswith("media-")
-        }
-        self.ct_media_detail_kinds.discard("")
-        self.ct_event_detail_types: set[str] = {
-            value[len("event-") :]
-            for value in detail_raw
-            if isinstance(value, str) and value.startswith("event-")
-        }
-        media_kinds = (
-            self.ct_media_detail_kinds
-            if self.ct_detail_control
-            else set(_MEDIA_KIND_OPTIONS)
-        )
+        # 配置值直接对应存储的 content_kind 细粒度取值；未知/旧值（如 1.5.x 的 media）
+        # 一律忽略——不做兼容映射，用户需重新勾选具体类型。
+        # 类型守卫：配置被手改成非列表时回落到默认 ["text"]（否则会退化成"不过滤"）。
+        include_raw = ct_conf.get("include_content_kinds", ["text"])
+        if not isinstance(include_raw, list):
+            include_raw = ["text"]
         self.ct_include_kinds: set[str] = {
-            kind
-            for raw in (ct_conf.get("include_content_kinds", ["text"]) or [])
-            for kind in (media_kinds if raw == "media" else {raw})
+            value
+            for value in include_raw
+            if isinstance(value, str) and value in _CONTENT_KIND_OPTIONS
         }
+        # 事件子类（relation_data.event.type）：空 = 不按子类过滤（全部放行）
+        self.ct_event_kinds: set[str] = {
+            value
+            for value in (ct_conf.get("event_kinds") or [])
+            if isinstance(value, str) and value in _ALL_EVENT_TYPES
+        } or set(_ALL_EVENT_TYPES)
         # ALL 模式：content_kind 必须 ⊆ 白名单（且非空）；False = ANY（任一交集即进）
         self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
         # 撤回消息跳过上下文：开启后被撤回的原消息与撤回事件都不进 LLM 上下文
@@ -1503,13 +1495,9 @@ class ChatMemoryPlugin(Star):
             logger.warning(f"{self._log_prefix()} 接管查询失败: {e}")
             return []
 
-        # 事件子类过滤（细粒度控制）：kind 白名单只能到 "event" 大类，
-        # 子类（ban/member/…）记录在 relation_data.event.type，查询后过滤。
-        allowed_event_types = (
-            self.ct_event_detail_types
-            if self.ct_detail_control
-            else set(_ALL_EVENT_TYPES)
-        )
+        # 事件子类过滤：kind 白名单只能到 event，子类（ban/member/…）
+        # 记录在 relation_data.event.type，查询后过滤。
+        allowed_event_types = self.ct_event_kinds
         if allowed_event_types != set(_ALL_EVENT_TYPES):
             records = [
                 record

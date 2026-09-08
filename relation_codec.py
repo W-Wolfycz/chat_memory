@@ -26,14 +26,15 @@ _MEDIA_PREFIXES = ("IMAGE", "VIDEO", "VOICE", "FILE", "EMOJI", "FORWARD", "POKE"
 MEDIA_TOKEN_RE = re.compile(
     r"⟦CM_(?:IMAGE|VIDEO|VOICE|FILE|EMOJI|FORWARD|POKE):(\d+)⟧"
 )
-# kind → 上下文占位标签（与 context_builder.MEDIA_PLACEHOLDER_LABELS 保持一致）
+# kind → 上下文占位标签（poke/emoji/file 由 _media_label_of 特判，
+# 其余与 context_builder.MEDIA_PLACEHOLDER_LABELS 同名）
 MEDIA_KIND_LABELS = {
-    "image": '<cm_media type="image"/>',
-    "video": '<cm_media type="video"/>',
-    "voice": '<cm_media type="voice"/>',
-    "file": '<cm_media type="file"/>',
-    "emoji": '<cm_media type="emoji"/>',
-    "forward": '<cm_media type="forward"/>',
+    "image": "<cm_image/>",
+    "video": "<cm_video/>",
+    "voice": "<cm_voice/>",
+    "file": "<cm_file/>",
+    "emoji": "<cm_emoji/>",
+    "forward": "<cm_forward/>",
 }
 MAX_REPLY_SNAPSHOT_CHARS = 300
 
@@ -210,16 +211,27 @@ def mention_label(mention: Any) -> str:
 
 
 def _media_label_of(item: Any) -> str:
-    """单个 media 条目 → 上下文占位标签（emoji 带名称、poke 走事件占位）。"""
+    """单个 media 条目 → 上下文占位标签（emoji 带名称、file 带文件名、poke 走事件）。"""
     kind = str(item.get("kind") or "") if isinstance(item, dict) else ""
     if kind == "poke":
-        # 与 context_builder.MEDIA_PLACEHOLDER_LABELS 保持一致：poke 不是媒体
+        # 戳一戳并入事件协议；有已解析的目标昵称时带上（无操作者，由该条消息的
+        # <cm_nickname> 承担发言者身份）
+        name = str(item.get("name") or "").strip()
+        if name:
+            return (
+                '<cm_event type="poke">戳了戳 '
+                f'<cm_nickname>{xml_escape(name, quote=True)}</cm_nickname></cm_event>'
+            )
         return '<cm_event type="poke">戳一戳</cm_event>'
     if kind == "emoji":
         name = face_name(str(item.get("id") or ""))
         if name:
             return f'<cm_emoji>{xml_escape(name, quote=True)}</cm_emoji>'
-    return MEDIA_KIND_LABELS.get(kind, '<cm_media type="image"/>')
+    if kind == "file":
+        name = str(item.get("name") or "").strip()
+        if name:
+            return f'<cm_file name="{xml_escape(name, quote=True)}"/>'
+    return MEDIA_KIND_LABELS.get(kind, "<cm_unknown/>")
 
 
 def render_content_template(template: str, relation_data: Any) -> str:
@@ -238,21 +250,8 @@ def render_content_template(template: str, relation_data: Any) -> str:
 
     def media_label(index: int) -> str:
         if index >= len(media) or not isinstance(media[index], dict):
-            return '<cm_media type="image"/>'
-        item = media[index]
-        kind = str(item.get("kind") or "")
-        if kind == "poke":
-            # 戳一戳并入 <cm_event type="poke"> 的句子形式（混合消息里不带操作者，
-            # 由该条消息的 <cm_nickname> 承担）。
-            name = str(item.get("name") or "").strip()
-            if name:
-                return (
-                    '<cm_event type="poke">戳了戳 '
-                    f'<cm_nickname>{xml_escape(name, quote=True)}</cm_nickname>'
-                    "</cm_event>"
-                )
-            return '<cm_event type="poke">戳一戳</cm_event>'
-        return _media_label_of(item)
+            return "<cm_unknown/>"
+        return _media_label_of(media[index])
 
     # At 与媒体 token 可能交错出现：合并后按位置顺序渲染
     matches = [(m.start(), m.end(), "at", int(m.group(1))) for m in AT_TOKEN_RE.finditer(value)] + [

@@ -58,7 +58,7 @@ class ChatMemoryUiWebApi:
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.5.1",
+                "version": "1.5.2",
                 "read_only": True,
                 "default_page_size": self.repository.default_page_size,
                 "max_page_size": self.repository.max_page_size,

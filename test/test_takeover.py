@@ -227,10 +227,8 @@ def _make_plugin():
     p.log_with_bot_id = False
     p.max_len = 0
     p.ct_keep_tool_turns = 2
-    p.ct_detail_control = False
     p.ct_recall_skip_context = False
-    p.ct_media_detail_kinds = set()
-    p.ct_event_detail_types = set()
+    p.ct_event_kinds = set(_mod_ns["_ALL_EVENT_TYPES"])
     p._builtin_ltm_warned = False
     p._warned_unknown_notices = set()
     return p
@@ -268,8 +266,8 @@ def test_strip_cm_xml_tags():
     assert f('<cm_nickname>Bob</cm_nickname> 说：你好') == "说：你好"
     assert f('<cm_reply target="Alice">引用原文</cm_reply> 好的') == "好的"
     # 媒体占位标签同样整元素删除（防 LLM 模仿输出 cm_ 媒体标签）
-    assert f('好的 <cm_media type="image"/> 请查收') == "好的 请查收"
-    assert f('<cm_media type="image">xxx</cm_media>正文') == "正文"
+    assert f('好的 <cm_image/> 请查收') == "好的 请查收"
+    assert f('<cm_image>xxx</cm_image>正文') == "正文"
     assert f('<code>&lt;cm_source/&gt;</code>') == '<code>&lt;cm_source/&gt;</code>'
     assert f("普通回复") == "普通回复"
     print("[T01] strip_cm_xml_tags ✓")
@@ -571,8 +569,8 @@ def test_media_placeholder_render_and_cleanup():
     ]
     out = p._takeover_normalize(records, _UMO_GROUP)
     assert len(out) == 2
-    assert out[0]["content"].endswith('<cm_media type="image"/>')
-    assert '带图文字 <cm_media type="image"/>' in out[1]["content"]
+    assert out[0]["content"].endswith('<cm_image/>')
+    assert '带图文字 <cm_image/>' in out[1]["content"]
 
     # 小节：占位细节（solo 纯图 / 多 kind / 旧英文占位 / 已含标签不重复 / 无媒体原样）
     records2 = [
@@ -580,17 +578,17 @@ def test_media_placeholder_render_and_cleanup():
              kinds=["image"], created_at="2026-08-18 04:04:02"),
         _rec(content="", kinds=["image", "voice"], created_at="2026-08-18 04:05:00"),
         _rec(content="[poke]", kinds=["poke"], created_at="2026-08-18 04:05:30"),
-        _rec(content='看图 <cm_media type="image"/>', kinds=["text", "image"],
+        _rec(content='看图 <cm_image/>', kinds=["text", "image"],
              created_at="2026-08-18 04:06:00"),
         _rec(content="普通文本", kinds=["text"], created_at="2026-08-18 04:07:00"),
     ]
     out2 = p._takeover_normalize(records2, _UMO_GROUP)
     joined = "\n".join(c["content"] for c in out2)
-    assert '<cm_solo active="1"/> <cm_media type="image"/>' in joined
-    assert '<cm_media type="image"/> <cm_media type="voice"/>' in joined
+    assert '<cm_solo active="1"/> <cm_image/>' in joined
+    assert '<cm_image/> <cm_voice/>' in joined
     assert '<cm_event type="poke">戳一戳</cm_event>' in joined
-    assert '看图 <cm_media type="image"/>' in joined
-    assert '看图 <cm_media type="image"/> <cm_media type="image"/>' not in joined
+    assert '看图 <cm_image/>' in joined
+    assert '看图 <cm_image/> <cm_image/>' not in joined
     assert "普通文本" in joined
     assert "普通文本 <cm_" not in joined
 
@@ -621,6 +619,9 @@ def test_media_placeholder_render_and_cleanup():
     assert relation_codec_mod.render_content_template(
         "戳⟦CM_POKE:0⟧", poke_rel) == \
         '戳<cm_event type="poke">戳了戳 <cm_nickname>小明</cm_nickname></cm_event>'
+    # 纯媒体路径（无 token）与 token 路径一致：poke 同样带目标昵称
+    assert relation_codec_mod.render_content_template("", poke_rel) == \
+        '<cm_event type="poke">戳了戳 <cm_nickname>小明</cm_nickname></cm_event>'
 
     # 小节：LLM 回复中模仿的方括号占位字面清洗为裸词
     f = context_builder_mod.strip_bracket_media_placeholders
@@ -974,8 +975,8 @@ def test_media_position_tokens_and_ids():
     assert [m["kind"] for m in media] == ["image", "emoji"]
     assert media[1]["id"] == "123"
     rendered = relation_codec_mod.render_content_template(template, relation)
-    assert rendered == '看 <cm_media type="image"/> 和 <cm_emoji>NO</cm_emoji>'
-    assert rendered.index('<cm_media type="image"/>') < \
+    assert rendered == '看 <cm_image/> 和 <cm_emoji>NO</cm_emoji>'
+    assert rendered.index('<cm_image/>') < \
         rendered.index('<cm_emoji>NO</cm_emoji>')
 
     # 全类型统一：视频/文件/戳一戳与文字同现时同样走 token
@@ -992,8 +993,15 @@ def test_media_position_tokens_and_ids():
     assert [m["kind"] for m in relation2["media"]] == ["video", "file", "poke"]
     assert relation2["media"][2]["id"] == "456"
     rendered2 = relation_codec_mod.render_content_template(template2, relation2)
-    assert rendered2 == '先<cm_media type="video"/> 再<cm_media type="file"/> ' \
+    assert rendered2 == '先<cm_video/> 再<cm_file/> ' \
         '然后<cm_event type="poke">戳一戳</cm_event>'
+    # file 条目带 name 时占位附文件名（XML 转义）
+    named_file = relation_codec_mod.render_content_template(
+        "⟦CM_FILE:0⟧",
+        {"v": 1, "mentions": [], "media": [
+            {"kind": "file", "id": "f" * 32, "name": '报告 & "终"版.pdf'}]},
+    )
+    assert named_file == '<cm_file name="报告 &amp; &quot;终&quot;版.pdf"/>'
 
     # 纯媒体/纯动作：token 清空（正文走占位符），media 数组保留元信息
     class _EvPure:
@@ -1007,13 +1015,23 @@ def test_media_position_tokens_and_ids():
     assert template3 == ""
     assert [m["kind"] for m in relation3["media"]] == ["image", "emoji"]
     rendered3 = relation_codec_mod.render_content_template(template3, relation3)
-    assert rendered3 == '<cm_media type="image"/> <cm_emoji>NO</cm_emoji>'
-    # 未知 face id 回退通用 <cm_media type="emoji"/>
+    assert rendered3 == '<cm_image/> <cm_emoji>NO</cm_emoji>'
+    # 未知 face id 回退通用 <cm_emoji/>
     unknown_face = relation_codec_mod.render_content_template(
         "⟦CM_EMOJI:0⟧",
         {"v": 1, "mentions": [], "media": [{"kind": "emoji", "id": "99999"}]},
     )
-    assert unknown_face == '<cm_media type="emoji"/>'
+    assert unknown_face == '<cm_emoji/>'
+    # 未知媒体 kind 与越界 token 一律中性 unknown，不得谎报成 image
+    unknown_kind = relation_codec_mod.render_content_template(
+        "⟦CM_IMAGE:0⟧",
+        {"v": 1, "mentions": [], "media": [{"kind": "weird_kind", "id": "1"}]},
+    )
+    assert unknown_kind == '<cm_unknown/>'
+    assert relation_codec_mod.render_content_template(
+        "⟦CM_IMAGE:9⟧越界",
+        {"v": 1, "mentions": [], "media": [{"kind": "image", "id": "1"}]},
+    ) == '<cm_unknown/>越界'
 
     class _EvPoke:
         def __init__(self):
@@ -2190,8 +2208,7 @@ class _FakeDB:
 def test_takeover_event_type_filter():
     """细粒度控制开启时，_takeover_query 按事件子类过滤（非事件记录不受影响）。"""
     p = _make_plugin()
-    p.ct_detail_control = True
-    p.ct_event_detail_types = {"ban"}
+    p.ct_event_kinds = {"ban"}
     p.ct_include_kinds = {"event"}
 
     class _Db:
@@ -2567,6 +2584,32 @@ def test_takeover_recall_skip_context():
     records = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
     assert [r["content"] for r in records] == ["正常消息"]
     print("[T64] takeover_recall_skip_context ✓")
+
+
+
+def test_file_placeholder_carries_name_in_context():
+    """文件占位带文件名：纯文件与混合消息都渲染 <cm_file name="…"/>，且不重复补占位。"""
+    p = _make_plugin()
+    file_rel = {"v": 1, "mentions": [], "media": [
+        {"kind": "file", "id": "f" * 32, "name": "报告.pdf"}]}
+
+    pure = _rec(content="[file]", kinds=["file"], relation=file_rel)
+    out = p._takeover_normalize([pure], _UMO_GROUP)
+    assert out[0]["content"].endswith('<cm_file name="报告.pdf"/>')
+    assert out[0]["content"].count("<cm_file") == 1
+
+    mixed = _rec(content="看 ⟦CM_FILE:0⟧", kinds=["text", "file"], relation=file_rel)
+    out2 = p._takeover_normalize([mixed], _UMO_GROUP)
+    assert '<cm_file name="报告.pdf"/>' in out2[0]["content"]
+    assert out2[0]["content"].count("<cm_file") == 1
+
+    # 无文件名回退裸标签
+    unnamed = _rec(content="[file]", kinds=["file"],
+                   relation={"v": 1, "mentions": [], "media": [
+                       {"kind": "file", "id": "f" * 32}]})
+    out3 = p._takeover_normalize([unnamed], _UMO_GROUP)
+    assert out3[0]["content"].endswith("<cm_file/>")
+    print("[T65] file_placeholder_carries_name_in_context ✓")
 
 
 # ── 运行 ─────────────────────────────────────────────

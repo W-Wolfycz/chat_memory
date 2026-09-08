@@ -4,6 +4,22 @@ ChatMemory 在 `1.0.0` 前均视为内部测试版。以下版本号是对原开
 
 > 下方各版本记录的是该版本发布时的实际格式。旧条目中的 `[当前发言者]`、`<cm s="N"/>`、`<cm_history_tail/>` 等均为已经退役的历史协议，不代表当前版本仍会生成或接受这些标签；当前格式以最新版本条目和 README 为准。
 
+## 1.5.2 — 2026-09-09
+
+### 变更
+
+- **内容白名单拆回细粒度**：`include_content_kinds` 取值改为与存储 `content_kind` 一一对应的 `text/image/video/voice/emoji/file/forward/event`，删除 `media` 大类与 `detail_control`/`detail_kinds` 两层间接（配置与存储/查询台/徽章口径一致）。旧配置里的 `media`、`media-*`、`event-*` 值**不做兼容映射、直接忽略**，升级后请重新勾选具体类型。
+- **事件子类独立配置**：新增 `event_kinds`（ban/member/title/recall/resource/poke/reaction/system，默认全选，不再用开关隐藏），仅当白名单含 `event` 时生效，清空 = 全部放行。
+- **上下文媒体标签按类型拆分**：`<cm_media type="…"/>` 拆为与 `content_kind` 同名的 `<cm_image/>` / `<cm_video/>` / `<cm_voice/>` / `<cm_file/>` / `<cm_forward/>`（`<cm_emoji>名称</cm_emoji>` 不变），类型无法识别时用 `<cm_unknown/>` 兜底——配置取值、存储 `content_kind`、查询台筛选、上下文标签四处统一为同一套词汇。
+- **文件占位带文件名**：`<cm_file name="报告.pdf"/>`（XML 转义，无文件名回退 `<cm_file/>`），让 LLM 知道发送了什么文件。
+
+### 修复
+
+- **未知媒体类型不再谎报图片**：未知 `kind` 或 token 越界的占位由 `<cm_media type="image"/>` 改为 `<cm_unknown/>`，LLM 规则与 README 同步。
+- **旧 poke 占位对齐**：纯媒体路径的戳一戳占位与混合消息路径统一，带目标昵称（旧 `kind=["poke"]` 数据兜底）。
+
+测试：行为级 42 项 + UI 18 项 + 存储集成。
+
 ## 1.5.1 — 2026-09-08
 
 ### 修复
