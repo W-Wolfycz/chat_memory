@@ -58,8 +58,12 @@ class ChatMemoryUiWebApi:
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.5.2",
+                "version": "1.5.3",
                 "read_only": True,
+                # 查询台仍只读；软删除/恢复是唯一写入口（单条记录，仅插件实时库）
+                "write_enabled": bool(self.repository.writable),
+                # 数据源切换会重建 repository，前端刷新用（_settings_payload 不含此项）
+                "writable_path": str(self.repository.writable_path or ""),
                 "default_page_size": self.repository.default_page_size,
                 "max_page_size": self.repository.max_page_size,
                 "timezone": str(self.repository.timezone),
@@ -105,6 +109,7 @@ class ChatMemoryUiWebApi:
                 "content_kind",
                 "platform_name",
                 "message_type",
+                "deleted_state",
             )
         }
         return await self._call(self.repository.facets, filters)
@@ -124,6 +129,31 @@ class ChatMemoryUiWebApi:
     async def record_detail(self):
         raw_id = request.args.get("id", "")
         return await self._call(self.repository.record, raw_id)
+
+    async def soft_delete_record(self):
+        """软删除单条记录/工具调用（写入口之一；仅插件实时库开放）。
+
+        ``target`` 省略或为 ``record`` 时作用于主表，``tool`` 作用于工具调用表。
+        """
+        payload = await _json_body()
+        if payload is None:
+            return _error("请求体必须是 JSON 对象", 400)
+        return await self._call(
+            self.repository.soft_delete_record,
+            payload.get("id"),
+            payload.get("target") or "record",
+        )
+
+    async def restore_record(self):
+        """恢复一条被软删除的记录/工具调用（写入口之一；仅插件实时库开放）。"""
+        payload = await _json_body()
+        if payload is None:
+            return _error("请求体必须是 JSON 对象", 400)
+        return await self._call(
+            self.repository.restore_record,
+            payload.get("id"),
+            payload.get("target") or "record",
+        )
 
     async def media(self, media_id):
         """媒体二进制端点：默认返回原始字节；``?as=base64`` 返回内联 JSON。"""
@@ -192,7 +222,7 @@ class ChatMemoryUiWebApi:
                 return _error("媒体文件已缺失", 404)
             if len(data) != int(row.get("size_bytes") or 0):
                 logger.warning(
-                    "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id[:8]
+                    "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id
                 )
             if len(data) > _BASE64_MAX_BYTES:
                 return _error("媒体过大，请使用下载方式获取", 413)
@@ -277,7 +307,7 @@ class ChatMemoryUiWebApi:
             return _error("媒体文件已缺失", 404)
         if len(data) != int(row.get("size_bytes") or 0):
             logger.warning(
-                "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id[:8]
+                "[ChatMemoryUI] 媒体文件大小与归档记录不一致：%s", media_id
             )
         return (
             data,
@@ -377,6 +407,8 @@ class ChatMemoryUiWebApi:
             return _ok(await operation(*args))
         except ValueError as exc:
             return _error(str(exc), 400)
+        except PermissionError as exc:
+            return _error(str(exc), 403)
         except DatabaseUnavailableError as exc:
             logger.warning("[ChatMemoryUI] %s", exc)
             return _error(str(exc), 503)
@@ -399,6 +431,18 @@ class ChatMemoryUiWebApi:
             ("facets", self.facets, ["GET"], "ChatMemory query facets"),
             ("query", self.query_records, ["POST"], "Query ChatMemory records"),
             ("record", self.record_detail, ["GET"], "ChatMemory record detail"),
+            (
+                "soft-delete",
+                self.soft_delete_record,
+                ["POST"],
+                "Soft-delete one ChatMemory record",
+            ),
+            (
+                "restore",
+                self.restore_record,
+                ["POST"],
+                "Restore a soft-deleted ChatMemory record",
+            ),
             ("tools", self.query_tools, ["POST"], "Query ChatMemory tool calls"),
             (
                 "media/<media_id>",

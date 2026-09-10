@@ -57,10 +57,10 @@
           <h1 id="page-title">数据概览</h1>
         </div>
         <div class="topbar-actions">
-          <span class="readonly-pill">
+          <button type="button" class="readonly-pill" id="mode-toggle" title="点击进入删除模式：可对单条记录做软删除/恢复（仅插件实时库开放）">
             <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-            只读模式
-          </span>
+            <span id="mode-toggle-label">只读模式</span>
+          </button>
           <button class="secondary-button" id="export-button" title="导出一致快照（不阻塞查询）">
             导出快照
           </button>
@@ -197,6 +197,7 @@
                 <label class="field"><span>消息类型</span><select id="filter-message-type"><option value="">全部消息类型</option></select></label>
                 <label class="field"><span>起始时间</span><input id="filter-since" type="datetime-local"></label>
                 <label class="field"><span>结束时间</span><input id="filter-until" type="datetime-local"></label>
+                <label class="field"><span>删除状态</span><select id="filter-deleted"><option value="all">All</option><option value="visible" selected>未删除</option><option value="deleted">已删除</option></select></label>
                 <label class="field"><span>每页数量</span><select id="filter-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
               </div>
 
@@ -257,6 +258,7 @@
                 <label class="field"><span>轮次 turn_id</span><input id="tool-filter-turn" type="text" maxlength="256" placeholder="精确匹配 turn_id"></label>
                 <label class="field"><span>起始时间</span><input id="tool-filter-since" type="datetime-local"></label>
                 <label class="field"><span>结束时间</span><input id="tool-filter-until" type="datetime-local"></label>
+                <label class="field"><span>删除状态</span><select id="tool-filter-deleted"><option value="all">All</option><option value="visible" selected>未删除</option><option value="deleted">已删除</option></select></label>
                 <label class="field"><span>每页数量</span><select id="tool-filter-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
               </div>
             </form>
@@ -290,9 +292,12 @@
           <div class="eyebrow">RECORD INSPECTOR</div>
           <h2 id="detail-title">记录详情</h2>
         </div>
-        <button class="icon-button" id="detail-close" aria-label="关闭详情">
-          <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
-        </button>
+        <div class="detail-header-actions" id="detail-title-row">
+          <span id="detail-mode-slot"></span>
+          <button class="icon-button" id="detail-close" aria-label="关闭详情">
+            <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
       </header>
       <div class="detail-content" id="detail-content"></div>
     </section>

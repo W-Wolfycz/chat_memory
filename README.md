@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.5.2`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=6`。
+当前发布版本：`1.5.3`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=7`。
 
 ## 特性
 
@@ -10,7 +10,7 @@
 - **配对存储**：新记录用 `turn_id` 配对，旧记录兼容 assistant `pair_id`（= 对应 user 的 `message_id`）
 - **双列状态**：`llm_status` 描述 LLM 路径，`content_kind` 描述内容形态，正交独立
 - **可选接管上下文**：开启 `context_takeover` 后接管 LLM 的 contexts 注入
-- **命令感知**：自动识别 `/reset`（清空 CID 存档）与 `/new`（保留旧 CID 记录）
+- **命令感知**：自动识别 `/reset`（清空当前 CID 存档，与 AstrBot 语义一致）与 `/new`（保留旧 CID 记录）
 - **自动清理**：`auto_cleanup_days > 0` 时启动周期清理任务
 - **输出防污染**：LLM 回复泄漏的 `<cm_*>` 结构（含内文）在发送与落库前统一清洗，用户不会看到；用户伪造的 cm_ XML 进上下文前清除
 - **只读查询台**：自带 Plugin Page（原 chat_memory_ui，1.4.0 起并入），记录检索筛选、工具调用查询、历史媒体回看与数据库健康诊断
@@ -21,6 +21,19 @@
 不修改、清理、迁移或修复 `chat_memory.db`；数据源设置中可改为服务器上的其他绝对路径
 （快照回退策略随之保存）。历史媒体（图片/语音/视频/文件）需 1.3.0+ 的媒体归档，
 未归档显示占位。原 chat_memory_ui 插件已停止维护，请停用并移除。
+
+**软删除（1.5.3）**：软删除只在查询台开放，一次只处理**一条**记录（记录与工具调用同一套逻辑）。
+
+1. 点击顶栏「只读模式」切换到「**删除模式**」（仅当数据源是插件实时库；指向其他路径/快照库时会被拒绝）
+2. 删除模式下，每条记录（列表与详情页）后面出现 **times 图标**，点击即软删除该条
+3. 删除后该条下方出现 `deleted` chip，图标变为 **backup 图标**，点击即恢复
+4. **展示不做截断**：UMO / Conversation ID / turn_id / 昵称等标识字段一律显示完整值（徽章可换行，`title` 也是完整值），引用原文与列表正文不再按字符或高度裁剪；仅列表正文有 4000 字符的预览上限（超过会明确标注「列表预览已截断，打开详情查看完整内容」，详情返回 20 万字符）
+5. 筛选栏「删除状态」下拉：`All` / `未删除`（默认） / `已删除`（记录查询与工具调用查询各有一个）；已删除记录在详情页显示**删除时间**，工具调用卡片则在卡片内直接显示
+6. 「工具调用」页签同样支持：删除模式下每个工具卡片右上角有 times/backup 图标，删除后卡片内出现 `deleted` chip 与删除时间；被软删的工具记录不再参与接管回放
+7. 概览与健康检查的总数是**未删除**口径，另有 `已删除` 计数（记录与工具调用分别统计）
+
+软删除只标记行本身（`deleted_at`），**不动媒体文件**：记录与媒体的物理删除仍走原有配置
+（记录按 `auto_cleanup_days`，媒体按 `media_archive` 的保留期/总量上限）。查询台其余部分仍是只读。
 
 ## 双列状态体系
 
@@ -84,7 +97,9 @@ CREATE TABLE chat_memory_records (
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     turn_id         TEXT,                           -- ChatMemory 内部轮次 ID，不依赖平台 message_id
     send_status     TEXT NOT NULL DEFAULT '',       -- assistant: prepared / send_attempted
-    relation_data   TEXT                             -- v1 At 模板参数 + Reply turn/snapshot
+    relation_data   TEXT,                            -- v1 At 模板参数 + Reply turn/snapshot
+    recalled_at     DATETIME,                        -- 非空=该消息已被撤回
+    deleted_at      DATETIME                         -- 非空=软删除（仅查询台单条入口可写，默认不出现在检索与界面）
 );
 ```
 
@@ -105,7 +120,8 @@ CREATE TABLE chat_memory_tool_records (
 );
 ```
 
-工具记录不进 user/assistant 配对与查询 API，只在接管时按轮次回放成 OpenAI 格式。
+工具记录不进 user/assistant 配对与查询 API，只在接管时按轮次回放成 OpenAI 格式（自造 id 为
+`cm_tool_<完整 turn_id>_<序号>`）；同样带 `deleted_at`（v8），被查询台软删的工具记录不再回放。
 
 媒体归档（schema v5 起，`chat_memory_media_archive`）：
 
@@ -130,14 +146,14 @@ user 侧媒体落盘到 `data/plugin_data/chat_memory/media/<YYYYMM>/<media_id>.
 >
 > **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（**UTC naive 存储**，与 schema default `CURRENT_TIMESTAMP` 对齐；**查询返回时按 AstrBot `timezone` 配置转成配置时区 naive 字符串**）。
 >
-> **数据库升级**：启动时使用 `PRAGMA table_info` 校验必需列。**1.4.0 之前的旧 schema 不再自动迁移**（市场首发 1.4.0）：缺列时直接抛出可诊断错误（列出缺失列，提示先用 1.4.0 升级或移走旧库），不会静默补列或重建表。1.5.0 起 schema v5 新增媒体归档表；1.5.1 起 schema v6 主表新增 `recalled_at`（可空，非空=该消息已被撤回），升级时按需 `ALTER TABLE ADD COLUMN`。
+> **数据库升级**：启动时使用 `PRAGMA table_info` 校验必需列。**1.4.0 之前的旧 schema 不再自动迁移**（市场首发 1.4.0）：缺列时直接抛出可诊断错误（列出缺失列，提示先用 1.4.0 升级或移走旧库），不会静默补列或重建表。1.5.0 起 schema v5 新增媒体归档表；1.5.1 起 schema v6 主表新增 `recalled_at`（可空，非空=该消息已被撤回），升级时按需 `ALTER TABLE ADD COLUMN`；1.5.3 起 schema v7 主表与工具表新增 `deleted_at`（软删除标记，旧库按需 `ALTER TABLE`，各加一个 `(umo, deleted_at)` 索引）。
 
 > **turn_id 与发送状态**：1.0.0 的实时写入和状态升级统一使用内部 `turn_id`；历史记录查询仍保留 `message_id` / `pair_id` 回退，确保现有数据库中的旧轮次可读。`send_status=prepared` 表示 assistant 已写入、准备发送；`send_attempted` 仅表示 AstrBot 发送流程结束/已尝试，不等价于平台送达回执。
 
 ### 升级与备份
 
 - 支持范围：**1.4.0 及以后**的数据库（schema ≥ v4）。1.4.0 之前的旧库不会被自动迁移，插件启动时会给出明确错误提示。
-- schema 演进：1.2.2 起 v4 新增独立工具表 `chat_memory_tool_records`；1.5.0 起 v5 新增媒体归档表 `chat_memory_media_archive`；1.5.1 起 v6 主表新增 `recalled_at`（撤回标记）。v5 → v6 仅补一列，既有记录零迁移；结构化标签与当前轮焦点锚只改变请求时展示，不修改表结构或既有记录。
+- schema 演进：1.2.2 起 v4 新增独立工具表 `chat_memory_tool_records`；1.5.0 起 v5 新增媒体归档表 `chat_memory_media_archive`；1.5.1 起 v6 主表新增 `recalled_at`（撤回标记）；1.5.3 起 v7 主表与工具表新增 `deleted_at` 软删除标记（查询台单条软删除/恢复）。v5 → v6 仅补一列，v6 → v7 各补一列 + 各建一个索引，既有记录零迁移（存量行 `deleted_at` 为 NULL = 未删除）；结构化标签与当前轮焦点锚只改变请求时展示，不修改表结构或既有记录。
 - 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
 - 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
 
@@ -472,7 +488,11 @@ CM 存档的是 **LLM 实际产出的内容**：`capture_bot` 在 `on_decorating
 ## 已知限制
 
 - **首条消息是非 LLM 命令时漏存**：cid 尚未创建，且无 LLM 钩子兜底
-- **信任核心 `/reset` / `/new` 标志**：仅在 AstrBot 核心设置 `_clean_group_context_session` 后，CM 才从当前事件文本中查找 `reset` 或 `new` 以区分操作；不再根据 Bot 回复文本猜测。若可信标志存在却无法识别命令，CM 记录异常并放弃本次会话操作。
+- **信任核心 `/reset` / `/new` 标志**：仅在 AstrBot 核心设置 `_clean_group_context_session` 后，CM 才从当前事件文本中查找 `reset` 或 `new` 以区分操作；不兼容 `/reset@bot`、全角斜杠等花式写法，也不再根据 Bot 回复文本猜测。若可信标志存在却无法识别命令，CM 打出带原文的 WARNING 并放弃本次会话操作（宁可不动，避免把 `/new` 误判成 `/reset`）。
+- **日志分层与内容边界**：INFO 只记事件与统计（可带完整 id，**不带聊天正文/原始事件负载/命令原文**）；正文类诊断放 DEBUG，异常形态放 WARNING。DEBUG 与 WARNING 按排障需要**不做截断**：所有 id（umo / conversation_id / message_id / turn_id / media_id / at_id / reply_id / forward_id）在日志里一律输出**完整值**；DEBUG 与 WARNING 行的正文、原始 JSON、命令原文同样不再截断（例如未知 notice 的 `raw=…` 是完整原始事件 JSON，可能含账号，仅本地诊断用）。
+- **`/reset` 之后仍有少量记录**：`/reset` 只删「删除那一刻已经落库」的记录。平台重连后补发的旧系统通知、或删除瞬间正在写入的事件会在删除之后才落库，因此看起来像"没删掉"。插件在删除后立刻回查同一 (umo, cid)：日志里出现 `残留自检：… 已无可见记录`（DEBUG）说明删除本身是完整的；出现 `残留自检：… 仍残留 N 条（按内容类型：…）`（WARNING）才是真的交错残留。需要清理时用查询台的删除模式按条软删除。
+- **`/reset` 只清当前 CID**：与 AstrBot 语义一致（`/reset` 清空当前会话历史，`/new` 才换会话）。开着 `cross_session` 时检索会跨 CID（同 umo 全部历史会话）并带上同 `platform_id` + 同 `user_id` 的其他 UMO（群私聊互通），因此 `/reset` 之后**旧 CID 的记录仍会进入上下文**——需要清干净时用查询台的删除模式逐条软删除，或改用 `/new` 后重新评估检索范围。
+- **Dashboard 清空/删除会话不同步**：该入口走核心 `delete_conversations_by_user_id`，不设 `_clean_group_context_session`，CM 不做清理（需要时可在查询台按 CID 逐条软删除）。
 
 ## 依赖
 

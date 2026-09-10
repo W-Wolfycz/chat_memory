@@ -26,6 +26,9 @@ const state = {
   voiceUrls: [],
   voicePlayingId: null,
   detailRequestToken: 0,
+  detailRecordId: null,
+  // 删除模式：点击「只读模式」切换；仅在该模式下出现单条软删除/恢复图标
+  deleteMode: false,
 };
 
 const FACET_SELECTORS = [
@@ -39,6 +42,7 @@ const FACET_SELECTORS = [
   '#filter-event-type',
   '#filter-platform',
   '#filter-message-type',
+  '#filter-deleted',
 ];
 
 const $ = (selector) => document.querySelector(selector);
@@ -394,6 +398,53 @@ function bindImageFullView(img, mediaId, thumbUrl) {
   });
 }
 
+// 删除模式图标：times=软删除单条，backup=恢复
+const TIMES_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+const BACKUP_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.6-5.9"/><path d="M4 4v5h5"/></svg>';
+
+function deletedStateChip(record) {
+  // 软删除 chip：删除后在该条下方展示
+  if (!record || !record.deleted) return '';
+  return '<div class="record-deleted-chip"><span class="chip-deleted">deleted</span></div>';
+}
+
+function modeButtonHtml(rowId, deleted, target = 'record') {
+  // 删除模式下的单条操作图标：未删除=times（软删除），已删除=backup（恢复）
+  if (!state.deleteMode) return '';
+  const action = deleted ? 'restore' : 'soft-delete';
+  const icon = deleted ? BACKUP_ICON : TIMES_ICON;
+  const what = target === 'tool' ? '工具调用' : '记录';
+  const label = `${deleted ? '恢复' : '软删除'}此${what}`;
+  return `<button type="button" class="record-mode-button ${action}" data-mode-action="${action}" data-mode-id="${rowId}" data-mode-target="${target}" title="${label}" aria-label="${label}">${icon}</button>`;
+}
+
+function recordModeButton(record) {
+  return modeButtonHtml(record.record_id, record.deleted);
+}
+
+function applyDeletedState(recordId, deleted) {
+  // 原地更新该条：chip 出现/消失 + 图标在 times ↔ backup 之间切换。
+  // 不整表重查——删除后仍要能看到 chip 与 backup 图标（下次查询才按筛选收敛）。
+  const card = document.querySelector(`article[data-card-id="${recordId}"]`);
+  if (!card) return;
+  const main = card.querySelector('.record-main');
+  const existing = main ? main.querySelector('.record-deleted-chip') : null;
+  if (deleted && main && !existing) {
+    const chip = document.createElement('div');
+    chip.className = 'record-deleted-chip';
+    chip.innerHTML = '<span class="chip-deleted">deleted</span>';
+    const meta = main.querySelector('.record-meta');
+    main.insertBefore(chip, meta || null);
+  } else if (!deleted && existing) {
+    existing.remove();
+  }
+  const button = card.querySelector('[data-mode-action]');
+  if (button) {
+    button.outerHTML = modeButtonHtml(recordId, deleted);
+  }
+  bindModeButtons(card);
+}
+
 const VOICE_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>';
 
 function stopVoicePlaying() {
@@ -555,10 +606,14 @@ function renderOverview(data) {
   const summary = data.summary || {};
   const tools = data.tools || {};
   const media = data.media || {};
-  const toolLabel = tools.present ? '工具调用' : '工具调用（无表）';
+  const toolDeleted = Number(tools.deleted_calls || 0);
+  const toolLabel = tools.present
+    ? (toolDeleted > 0 ? `工具调用（已删 ${toolDeleted}）` : '工具调用')
+    : '工具调用（无表）';
   const toolValue = tools.present ? tools.total_calls : '—';
   const mediaLabel = media.present ? '媒体归档' : '媒体归档（无表）';
   const mediaValue = media.present ? media.total_files : '—';
+  const deletedCount = Number(summary.deleted_records || 0);
   $('#metrics-grid').innerHTML = [
     metricCard(icons.records, '', summary.total_records, '归档记录'),
     metricCard(icons.source, 'teal', summary.total_umos, 'UMO 来源'),
@@ -566,6 +621,10 @@ function renderOverview(data) {
     metricCard(icons.users, 'amber', summary.total_users, '独立用户'),
     metricCard(icons.tools, '', toolValue, toolLabel),
     metricCard(icons.media, 'teal', mediaValue, mediaLabel),
+    // 软删除计数只在存在时展示（明细见记录查询的「删除状态=已删除」）
+    deletedCount > 0
+      ? metricCard(icons.records, 'amber', deletedCount, '已删除（软删）')
+      : '',
   ].join('');
 
   renderActivity(data.daily || []);
@@ -665,6 +724,8 @@ function resetDataSourceState() {
   $('#filter-event-type').value = '';
   $('#filter-platform').value = '';
   $('#filter-message-type').value = '';
+  $('#filter-deleted').value = 'visible';
+  $('#tool-filter-deleted').value = 'visible';
   $('#filter-page-size').value = '50';
   $('#tool-filter-page-size').value = '50';
   $('#records-list').innerHTML = '<div class="empty-state"><strong>数据源已切换</strong><p>打开查询页后将读取新数据库</p></div>';
@@ -697,6 +758,19 @@ async function saveDatabaseSettings(event) {
   try {
     const settings = unwrap(await apiPost('settings', payload));
     renderSettings(settings);
+    // 数据源可能变成/变回插件实时库：刷新 write_enabled 并退出删除模式，
+    // 否则会出现"图标还在但点必 403"或"已可写却被前端拦住"
+    setDeleteMode(false);
+    try {
+      state.about = unwrap(await apiGet('about'));
+      if (state.about.write_enabled === false) {
+        $('#mode-toggle').title = '当前数据源不是插件实时数据库，软删除/恢复已禁用';
+      } else {
+        $('#mode-toggle').title = '点击进入删除模式：可对单条记录做软删除/恢复（仅插件实时库开放）';
+      }
+    } catch (error) {
+      state.about = null;
+    }
     resetDataSourceState();
     await loadDashboardData();
     setSettingsMessage('设置已保存，页面已切换到新的只读数据源。', 'success');
@@ -749,21 +823,21 @@ function populateFacets(data) {
     valueOf: (item) => item.value,
     labelOf: (item) => {
       const suffix = item.message_type || item.platform_name || '';
-      return `${compactId(item.value, 50)} · ${formatNumber(item.count)}${suffix ? ` · ${suffix}` : ''}`;
+      return `${item.value} · ${formatNumber(item.count)}${suffix ? ` · ${suffix}` : ''}`;
     },
-    missingLabel: (value) => compactId(value, 50),
+    missingLabel: (value) => value,
   });
   $('#filter-conversation').innerHTML = facetOptions({
     allValue: '', allLabel: '全部 CID', items: data.conversations || [], current: current.conversation,
     valueOf: (item) => item.value,
-    labelOf: (item) => `${compactId(item.value, 34)} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => compactId(value, 34),
+    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
+    missingLabel: (value) => value,
   });
   $('#filter-user').innerHTML = facetOptions({
     allValue: '', allLabel: '全部用户', items: data.users || [], current: current.user,
     valueOf: (item) => item.value,
-    labelOf: (item) => `${item.nickname || '未命名'} · ${compactId(item.value, 24)} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => compactId(value, 24),
+    labelOf: (item) => `${item.nickname || '未命名'} · ${item.value} · ${formatNumber(item.count)}`,
+    missingLabel: (value) => value,
   });
   $('#filter-persona').innerHTML = facetOptions({
     allValue: '__all__', allLabel: '全部 Persona', items: data.personas || [], current: current.persona,
@@ -806,22 +880,15 @@ function populateFacets(data) {
   $('#tool-filter-umo').innerHTML = facetOptions({
     allValue: '', allLabel: '全部 UMO', items: data.umos || [], current: $('#tool-filter-umo').value,
     valueOf: (item) => item.value,
-    labelOf: (item) => `${compactId(item.value, 50)} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => compactId(value, 50),
+    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
+    missingLabel: (value) => value,
   });
   $('#tool-filter-conversation').innerHTML = facetOptions({
     allValue: '', allLabel: '全部 CID', items: data.conversations || [], current: $('#tool-filter-conversation').value,
     valueOf: (item) => item.value,
-    labelOf: (item) => `${compactId(item.value, 34)} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => compactId(value, 34),
+    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
+    missingLabel: (value) => value,
   });
-}
-
-function compactId(value, max) {
-  const text = String(value || '');
-  if (text.length <= max) return text;
-  const side = Math.floor((max - 1) / 2);
-  return `${text.slice(0, side)}…${text.slice(-side)}`;
 }
 
 async function loadFacets() {
@@ -849,6 +916,7 @@ function collectQuery(page = state.page) {
     since: $('#filter-since').value,
     until: $('#filter-until').value,
     paired_only: $('#filter-paired').checked,
+    deleted_state: $('#filter-deleted').value,
     page,
     page_size: Number($('#filter-page-size').value),
   };
@@ -906,7 +974,9 @@ function renderRecords(items, keyword) {
       ...subtypeBadges(record),
       record.recalled ? '<span class="badge recalled">已撤回</span>' : '',
       record.persona_id ? `<span class="badge">persona:${escapeHtml(record.persona_id)}</span>` : '',
-      `<span class="badge" title="${escapeHtml(record.umo)}">${escapeHtml(compactId(record.umo, 44))}</span>`,
+      `<span class="badge" title="${escapeHtml(record.umo)}">${escapeHtml(record.umo)}</span>`,
+      // CID 也进列表：排查"reset 后残留"时要能直接比对（完整值，title 同样给全）
+      `<span class="badge" title="${escapeHtml(record.conversation_id || '')}">cid:${escapeHtml(record.conversation_id || '')}</span>`,
     ].filter(Boolean).join('');
     const replyView = record.reply_view;
     const replyBlock = replyView
@@ -926,21 +996,64 @@ function renderRecords(items, keyword) {
     } else {
       contentBlock = `<div class="record-content">${highlight(record.content || '(空消息)', keyword)}${record.content_truncated ? '\n… 列表预览已截断，打开详情查看完整内容' : ''}</div>`;
     }
-    return `<article class="record-card ${assistant ? 'assistant' : 'user'}">
+    return `<article class="record-card ${assistant ? 'assistant' : 'user'}" data-card-id="${record.record_id}">
       <div class="role-avatar">${assistant ? 'AI' : 'U'}</div>
       <div class="record-main">
         <div class="record-header"><span class="record-sender" title="${escapeHtml(sender)}">${escapeHtml(sender)}</span><span class="record-time">${escapeHtml(record.created_at || record.created_at_utc || '—')}</span></div>
         ${replyBlock}
         ${contentBlock}
+        ${deletedStateChip(record)}
         <div class="record-meta">${badges}</div>
       </div>
-      <button class="record-detail-button" data-record-id="${record.record_id}">详情 #${record.record_id} ›</button>
+      <div class="record-actions">
+        ${recordModeButton(record)}
+        <button class="record-detail-button" data-record-id="${record.record_id}">详情 #${record.record_id} ›</button>
+      </div>
     </article>`;
   }).join('');
   hydrateInlineThumbs($('#records-list'), state.listMediaUrls, false);
   bindVoiceBubbles($('#records-list'));
   document.querySelectorAll('[data-record-id]').forEach((button) => {
     button.addEventListener('click', () => openDetail(button.dataset.recordId));
+  });
+  bindModeButtons($('#records-list'));
+}
+
+function bindModeButtons(root) {
+  // 删除模式的单条软删除 / 恢复：查询台唯一的写操作（后端仅对插件实时库开放）
+  root.querySelectorAll('[data-mode-action]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const recordId = button.dataset.modeId;
+      const action = button.dataset.modeAction;
+      const target = button.dataset.modeTarget || 'record';
+      button.disabled = true;
+      apiPost(action === 'restore' ? 'restore' : 'soft-delete', {
+        id: recordId,
+        target,
+      })
+        .then((response) => {
+          const result = unwrap(response) || {};
+          const deleted = Boolean(result.deleted);
+          const what = target === 'tool' ? '工具调用' : '记录';
+          showToast(
+            deleted ? `已软删除${what} #${recordId}` : `已恢复${what} #${recordId}`,
+            'ok'
+          );
+          if (target === 'tool') {
+            // 工具卡片没有独立详情页：原地更新该卡片（chip + 删除时间 + 图标）
+            applyToolDeletedState(recordId, deleted, result.deleted_at || '');
+          } else {
+            applyDeletedState(recordId, deleted);
+            const modal = $('#detail-modal');
+            if (modal && !modal.classList.contains('hidden')) openDetail(recordId);
+          }
+          loadDashboardData();
+        })
+        .catch((error) => {
+          button.disabled = false;
+          showToast(`${action === 'restore' ? '恢复' : '删除'}失败：${error.message}`, 'error');
+        });
+    });
   });
 }
 
@@ -965,6 +1078,7 @@ async function openDetail(id) {
   try {
     const data = unwrap(await apiGet('record', { id }));
     if (token !== state.detailRequestToken) return;
+    state.detailRecordId = Number(id);
     renderDetail(data.record);
     setDatabaseState(data.database);
   } catch (error) {
@@ -997,16 +1111,54 @@ function renderDetail(record) {
     ...subtypeBadges(record),
     record.recalled ? '<span class="badge recalled">已撤回</span>' : '',
   ].join('');
+  // 软删除状态块：chip + 删除时间（详情页展示删除时间）；删除模式下附 times/backup 图标
+  const deleteBlock = record.deleted
+    ? `<div class="detail-deleted"><span class="chip-deleted">deleted</span><span class="detail-deleted-time">删除时间：${escapeHtml(record.deleted_at || '（未知）')}</span></div>`
+    : '';
   $('#detail-content').innerHTML = `
     <div class="detail-message">${escapeHtml(record.content || '(空消息)')}</div>
     ${detailBadges ? `<div class="record-meta">${detailBadges}</div>` : ''}
+    ${deleteBlock}
     ${relationBlocks}
     <section class="detail-section"><h3>字段</h3><div class="detail-grid">${fields.map(([key, value]) => `
       <div class="detail-item"><div class="detail-key">${escapeHtml(key)}</div><div class="detail-value">${escapeHtml(Array.isArray(value) ? value.join(', ') : value ?? 'null')}</div></div>`).join('')}</div></section>
     <section class="detail-section"><h3>原始 content_template</h3><pre class="detail-json">${escapeHtml(record.content_template || '')}</pre></section>
     <section class="detail-section"><h3>relation_data</h3><pre class="detail-json">${escapeHtml(relation)}</pre></section>`;
+  // 删除模式：详情标题右侧出现 times/backup 图标
+  const modeSlot = $('#detail-mode-slot');
+  if (modeSlot) modeSlot.innerHTML = recordModeButton(record);
   attachDetailMedia($('#detail-content'));
+  bindModeButtons($('#detail-content'));
+  bindModeButtons($('#detail-title-row'));
+  // 识图描述注入在另一条分支（feat/media-insight），本线不做
   hydrateInlineThumbs($('#detail-content'), state.mediaObjectUrls, true);
+}
+
+function setDeleteMode(enabled) {
+  // 只读模式 ↔ 删除模式：进入后每条记录（列表与详情）出现单条软删除/恢复图标
+  state.deleteMode = Boolean(enabled);
+  const pill = $('#mode-toggle');
+  pill.classList.toggle('active', state.deleteMode);
+  $('#mode-toggle-label').textContent = state.deleteMode ? '删除模式' : '只读模式';
+  if (state.deleteMode) {
+    showToast('删除模式：点每条记录后面的图标可软删除单条（backup 图标恢复）');
+  }
+  // 重绘当前列表（记录 + 工具调用两份）与（若打开着）详情，让图标立即出现/消失。
+  // 工具列表必须一起重绘：图标是渲染期插值的，漏了就表现为"工具条目没有删除图标"。
+  if (state.lastQuery) runQuery(state.page);
+  if (state.lastToolQuery) runToolQuery(state.toolPage);
+  const modal = $('#detail-modal');
+  if (modal && !modal.classList.contains('hidden') && state.detailRecordId) {
+    openDetail(state.detailRecordId);
+  }
+}
+
+function toggleDeleteMode() {
+  if (!state.deleteMode && state.about && state.about.write_enabled === false) {
+    showToast('当前数据源不是插件实时数据库，删除/恢复已禁用', 'error');
+    return;
+  }
+  setDeleteMode(!state.deleteMode);
 }
 
 function collectToolQuery(page = state.toolPage) {
@@ -1017,6 +1169,7 @@ function collectToolQuery(page = state.toolPage) {
     turn_id: $('#tool-filter-turn').value.trim(),
     since: $('#tool-filter-since').value,
     until: $('#tool-filter-until').value,
+    deleted_state: $('#tool-filter-deleted').value,
     page,
     page_size: Number($('#tool-filter-page-size').value),
   };
@@ -1049,6 +1202,31 @@ async function runToolQuery(page = 1) {
   }
 }
 
+function toolDeletedBlock(record) {
+  // 工具调用的软删除标记：chip + 删除时间（工具卡片没有独立详情页）
+  if (!record || !record.deleted) return '';
+  return `<div class="record-deleted-chip"><span class="chip-deleted">deleted</span><span class="detail-deleted-time">删除时间：${escapeHtml(record.deleted_at || '（未知）')}</span></div>`;
+}
+
+function applyToolDeletedState(toolId, deleted, deletedAt) {
+  // 原地更新该工具卡片：chip/删除时间出现或消失 + 图标 times ↔ backup
+  const card = document.querySelector(`article[data-tool-card-id="${toolId}"]`);
+  if (!card) return;
+  const head = card.querySelector('.tool-card-head');
+  const existing = card.querySelector('.record-deleted-chip');
+  if (deleted && !existing) {
+    const block = document.createElement('div');
+    block.className = 'record-deleted-chip';
+    block.innerHTML = `<span class="chip-deleted">deleted</span><span class="detail-deleted-time">删除时间：${escapeHtml(deletedAt || '（未知）')}</span>`;
+    card.insertBefore(block, head ? head.nextSibling : card.firstChild);
+  } else if (!deleted && existing) {
+    existing.remove();
+  }
+  const button = card.querySelector('[data-mode-action]');
+  if (button) button.outerHTML = modeButtonHtml(toolId, deleted, 'tool');
+  bindModeButtons(card);
+}
+
 function renderToolRecords(items) {
   if (!items.length) {
     $('#tools-list').innerHTML = '<div class="empty-state"><strong>没有匹配的工具调用</strong><p>尝试减少筛选条件或扩大时间范围；旧版数据库（schema &lt; v4）没有工具表</p></div>';
@@ -1061,16 +1239,23 @@ function renderToolRecords(items) {
     } catch (error) {
       argsPreview = record.tool_args || '';
     }
-    return `<article class="tool-card">
+    return `<article class="tool-card" data-tool-card-id="${record.tool_id}">
       <div class="tool-card-head">
         <span class="badge tool-name">${escapeHtml(record.tool_name || '(empty)')}</span>
-        <span class="tool-card-time">${escapeHtml(record.created_at || record.created_at_utc || '—')} · #${record.call_index}</span>
+        <span class="tool-card-time">${escapeHtml(record.created_at || record.created_at_utc || '—')} · 轮内 #${record.call_index} · 记录 #${record.tool_id}</span>
+        <span class="tool-card-mode">${modeButtonHtml(record.tool_id, record.deleted, 'tool')}</span>
       </div>
-      <div class="tool-card-meta">turn <code>${escapeHtml(compactId(record.turn_id, 40))}</code> · <code title="${escapeHtml(record.umo)}">${escapeHtml(compactId(record.umo, 48))}</code></div>
+      ${toolDeletedBlock(record)}
+      <div class="record-meta tool-card-chips">
+        <span class="badge" title="轮次 turn_id">turn:${escapeHtml(record.turn_id)}</span>
+        <span class="badge" title="会话来源 UMO">${escapeHtml(record.umo)}</span>
+        <span class="badge" title="Conversation ID">cid:${escapeHtml(record.conversation_id)}</span>
+      </div>
       <div class="tool-block"><div class="tool-block-title">参数</div><pre class="tool-json">${escapeHtml(argsPreview)}</pre></div>
       <div class="tool-block"><div class="tool-block-title">返回</div><pre class="tool-json">${escapeHtml(record.tool_result || '(空)')}</pre></div>
     </article>`;
   }).join('');
+  bindModeButtons($('#tools-list'));
 }
 
 function renderToolPagination() {
@@ -1093,6 +1278,7 @@ function resetToolFilters() {
 
 function closeDetail() {
   state.detailRequestToken += 1;  // 丢弃仍在途的详情响应
+  state.detailRecordId = null;
   state.mediaObjectUrls.forEach((url) => {
     try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
   });
@@ -1187,6 +1373,7 @@ function bindEvents() {
   $('#theme-toggle').addEventListener('click', toggleTheme);
   $('#reload-button').addEventListener('click', initialize);
   $('#export-button').addEventListener('click', exportSnapshot);
+  $('#mode-toggle').addEventListener('click', toggleDeleteMode);
   $('#database-settings-form').addEventListener('submit', saveDatabaseSettings);
   $('#restore-database-path').addEventListener('click', restoreDefaultDatabasePath);
   FACET_SELECTORS.forEach((selector) => $(selector).addEventListener('change', async () => {
@@ -1201,6 +1388,10 @@ async function initialize() {
       apiGet('about'), apiGet('settings'),
     ]);
     state.about = unwrap(aboutResponse);
+    if (state.about.write_enabled === false) {
+      // 数据源不是插件实时库：删除模式不可用，明确写进 title 而不是让人点了才知道
+      $('#mode-toggle').title = '当前数据源不是插件实时数据库，软删除/恢复已禁用';
+    }
     renderSettings(unwrap(settingsResponse));
     $('#version-label').textContent = `${state.about.name} · v${state.about.version}`;
     $('#filter-page-size').value = String(state.about.default_page_size || 50);

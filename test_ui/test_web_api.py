@@ -70,6 +70,24 @@ class Repository:
     async def record(self, record_id):
         return {"record": {"record_id": int(record_id)}}
 
+    async def soft_delete_record(self, row_id, target="record"):
+        return {"soft_delete": [row_id, target]}
+
+    async def restore_record(self, row_id, target="record"):
+        return {"restore": [row_id, target]}
+
+
+class DeniedRepository(Repository):
+    """写入口被拒（非实时库）与库不可用两种失败路径。"""
+
+    async def soft_delete_record(self, row_id, target="record"):
+        raise PermissionError("当前数据源不是插件实时数据库，删除/恢复操作已禁用")
+
+    async def restore_record(self, row_id, target="record"):
+        # 用 web_api 模块里的同名异常类，保证 _call 的映射分支命中
+        module = sys.modules["chat_memory.ui.web_api"]
+        raise module.DatabaseUnavailableError("数据库不存在")
+
 
 class Context:
     def __init__(self):
@@ -98,6 +116,8 @@ class WebApiTestCase(unittest.TestCase):
                 "/chat_memory/facets",
                 "/chat_memory/query",
                 "/chat_memory/record",
+                "/chat_memory/soft-delete",
+                "/chat_memory/restore",
                 "/chat_memory/tools",
                 "/chat_memory/media/<media_id>",
                 "/chat_memory/export",
@@ -105,8 +125,21 @@ class WebApiTestCase(unittest.TestCase):
             },
         )
         self.assertTrue(all(set(route[2]) <= {"GET", "POST"} for route in context.routes))
-        self.assertFalse(
-            any("delete" in route[0] or "update" in route[0] for route in context.routes)
+        # 写路由白名单：只允许设置、导出、查询与单条软删除/恢复
+        self.assertEqual(
+            sorted(
+                route[0]
+                for route in context.routes
+                if route[2] == ["POST"]
+            ),
+            [
+                "/chat_memory/export",
+                "/chat_memory/query",
+                "/chat_memory/restore",
+                "/chat_memory/settings",
+                "/chat_memory/soft-delete",
+                "/chat_memory/tools",
+            ],
         )
 
     def test_query_tools_and_facets_contract(self):
@@ -148,6 +181,36 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(facets["data"]["filters"]["content_kind"], "text")
         record = asyncio.run(controller.record_detail())
         self.assertEqual(record["data"]["record"]["record_id"], 9)
+
+    def test_soft_delete_and_restore_forward_target(self):
+        # 小节：软删除/恢复转发 id + target；缺 target 默认 record；非对象 JSON → 400
+        module = load_module(body={"id": 12, "target": "tool"})
+        controller = module.ChatMemoryUiWebApi(Context(), Repository())
+        response = asyncio.run(controller.soft_delete_record())
+        self.assertTrue(response["success"])
+        self.assertEqual(response["data"]["soft_delete"], [12, "tool"])
+        response = asyncio.run(controller.restore_record())
+        self.assertEqual(response["data"]["restore"], [12, "tool"])
+
+        module = load_module(body={"id": 7})
+        controller = module.ChatMemoryUiWebApi(Context(), Repository())
+        response = asyncio.run(controller.soft_delete_record())
+        self.assertEqual(response["data"]["soft_delete"], [7, "record"])
+
+        module = load_module(body=[])
+        controller = module.ChatMemoryUiWebApi(Context(), Repository())
+        self.assertEqual(asyncio.run(controller.soft_delete_record())[1], 400)
+        self.assertEqual(asyncio.run(controller.restore_record())[1], 400)
+
+        # 小节：写入口失败映射 —— PermissionError → 403，库不可用 → 503
+        module = load_module(body={"id": 5})
+        denied = module.ChatMemoryUiWebApi(Context(), DeniedRepository())
+        response = asyncio.run(denied.soft_delete_record())
+        self.assertEqual(response[1], 403)
+        self.assertFalse(response[0]["success"])
+        response = asyncio.run(denied.restore_record())
+        self.assertEqual(response[1], 503)
+        self.assertFalse(response[0]["success"])
 
     def test_settings_read_update_and_validate(self):
         # 小节：读取默认路径 + 更新设置

@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS chat_memory_records (
     turn_id         TEXT,
     send_status     TEXT NOT NULL DEFAULT '',
     relation_data   TEXT,
-    recalled_at     DATETIME
+    recalled_at     DATETIME,
+    deleted_at      DATETIME
 )"""
 
 # 工具调用独立存档（schema v4）：不回放进主表的 user/assistant 配对，
@@ -71,7 +72,8 @@ CREATE TABLE IF NOT EXISTS chat_memory_tool_records (
     tool_name       TEXT NOT NULL,
     tool_args       TEXT NOT NULL DEFAULT '',
     tool_result     TEXT NOT NULL DEFAULT '',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at      DATETIME
 )"""
 
 # 媒体归档（schema v5）：user 侧媒体落盘后登记，CM_UI 据此回看。
@@ -106,7 +108,7 @@ _MEDIA_ARCHIVE_INDEX_DEFINITIONS = {
     ),
 }
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 # 现有库必须已具备的列：缺失说明是 1.4.0 之前的 schema，不再自动迁移
 _REQUIRED_COLUMNS = {
@@ -153,6 +155,11 @@ _INDEX_DEFINITIONS = {
         "CREATE INDEX IF NOT EXISTS ix_cm_persona "
         "ON chat_memory_records (persona_id)"
     ),
+    # 软删除过滤（schema v7）：所有读路径都带 deleted_at IS NULL
+    "ix_cm_umo_deleted": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_umo_deleted "
+        "ON chat_memory_records (umo, deleted_at)"
+    ),
     "ux_cm_turn_role": (
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_cm_turn_role "
         "ON chat_memory_records (turn_id, role) "
@@ -169,7 +176,47 @@ _TOOL_INDEX_DEFINITIONS = {
         "CREATE INDEX IF NOT EXISTS ix_cm_tool_umo_cid_time "
         "ON chat_memory_tool_records (umo, conversation_id, created_at)"
     ),
+    # 软删除过滤（schema v7）：查询台单条软删除记录后的读路径过滤
+    "ix_cm_tool_deleted": (
+        "CREATE INDEX IF NOT EXISTS ix_cm_tool_deleted "
+        "ON chat_memory_tool_records (umo, deleted_at)"
+    ),
 }
+
+
+def schema_statements(
+    existing_columns: set, existing_tool_columns: set
+) -> list:
+    """按**执行顺序**返回建表 / 迁移 / 建索引语句（纯函数，便于测试顺序）。
+
+    顺序约定（踩过的坑）：**必须先 `ALTER TABLE ADD COLUMN` 再建该列的索引**，
+    否则存量旧库执行 `CREATE INDEX ... (umo, deleted_at)` 会因缺列直接失败，
+    插件加载阶段就崩。传入的两组列名来自 `PRAGMA table_info`；空集合表示建新表
+    （新表定义里已含新列，无需 ALTER）。
+    """
+    statements: list = [_CREATE_TABLE_SQL]
+    if existing_columns and "recalled_at" not in existing_columns:
+        # v5 → v6：撤回感知需要标记被撤回的原消息（NULL=未撤回）
+        statements.append(
+            "ALTER TABLE chat_memory_records ADD COLUMN recalled_at DATETIME"
+        )
+    if existing_columns and "deleted_at" not in existing_columns:
+        # v6 → v7：软删除标记（NULL=正常；非空=被查询台单条标记删除）
+        statements.append(
+            "ALTER TABLE chat_memory_records ADD COLUMN deleted_at DATETIME"
+        )
+    statements.extend(_INDEX_DEFINITIONS.values())
+    # 工具调用表（schema v4 起）：独立存档，不进主表配对。
+    statements.append(_CREATE_TOOL_TABLE_SQL)
+    if existing_tool_columns and "deleted_at" not in existing_tool_columns:
+        statements.append(
+            "ALTER TABLE chat_memory_tool_records ADD COLUMN deleted_at DATETIME"
+        )
+    statements.extend(_TOOL_INDEX_DEFINITIONS.values())
+    # 媒体归档表（schema v5 起）：CREATE IF NOT EXISTS 幂等，无数据迁移。
+    statements.append(_CREATE_MEDIA_ARCHIVE_TABLE_SQL)
+    statements.extend(_MEDIA_ARCHIVE_INDEX_DEFINITIONS.values())
+    return statements
 
 
 class DBManager:
@@ -224,22 +271,14 @@ class DBManager:
                         + ", ".join(missing)
                         + "）。请先用 1.4.0 升级该数据库，或移走旧库文件后重启。"
                     )
-                if existing_cols and "recalled_at" not in existing_cols:
-                    # v5 → v6：撤回感知需要标记被撤回的原消息（NULL=未撤回）
-                    await conn.execute(text(
-                        "ALTER TABLE chat_memory_records ADD COLUMN recalled_at DATETIME"
-                    ))
-                await conn.execute(text(_CREATE_TABLE_SQL))
-                for idx_sql in _INDEX_DEFINITIONS.values():
-                    await conn.execute(text(idx_sql))
-                # 工具调用表（schema v4 起）：独立存档，不进主表配对。
-                await conn.execute(text(_CREATE_TOOL_TABLE_SQL))
-                for idx_sql in _TOOL_INDEX_DEFINITIONS.values():
-                    await conn.execute(text(idx_sql))
-                # 媒体归档表（schema v5 起）：CREATE IF NOT EXISTS 幂等，无数据迁移。
-                await conn.execute(text(_CREATE_MEDIA_ARCHIVE_TABLE_SQL))
-                for idx_sql in _MEDIA_ARCHIVE_INDEX_DEFINITIONS.values():
-                    await conn.execute(text(idx_sql))
+                tool_info = await conn.execute(
+                    text("PRAGMA table_info(chat_memory_tool_records)")
+                )
+                existing_tool_cols = {row[1] for row in tool_info.fetchall()}
+                # 建表 → 补列（v5→v6 recalled_at、v6→v7 deleted_at）→ 建索引：
+                # 顺序写死在 schema_statements 里并有单测守卫（索引不得早于补列）。
+                for statement in schema_statements(existing_cols, existing_tool_cols):
+                    await conn.execute(text(statement))
                 # 防止备份表残留的同名索引再次让 IF NOT EXISTS 静默跳过。
                 for index_name, table_name in [
                     *((name, "chat_memory_records")
@@ -311,7 +350,8 @@ class DBManager:
                     text(
                         "UPDATE chat_memory_records SET llm_status = :status "
                         "WHERE umo = :umo AND conversation_id = :cid "
-                        "AND turn_id = :turn_id AND role = 'user'"
+                        "AND turn_id = :turn_id AND role = 'user' "
+                        "AND deleted_at IS NULL"
                     ),
                     {
                         "status": update_user_llm_status,
@@ -379,7 +419,8 @@ class DBManager:
                 text(
                     "UPDATE chat_memory_records SET send_status = :status "
                     "WHERE umo = :umo AND conversation_id = :cid "
-                    "AND turn_id = :turn_id AND role = 'assistant'"
+                    "AND turn_id = :turn_id AND role = 'assistant' "
+                    "AND deleted_at IS NULL"
                 ),
                 {
                     "status": new_status,
@@ -401,7 +442,8 @@ class DBManager:
                 text(
                     "UPDATE chat_memory_records SET llm_status = :status "
                     "WHERE umo = :umo AND conversation_id = :cid "
-                    "AND turn_id = :turn_id AND role = 'user'"
+                    "AND turn_id = :turn_id AND role = 'user' "
+                    "AND deleted_at IS NULL"
                 ),
                 {
                     "status": new_status,
@@ -447,7 +489,11 @@ class DBManager:
         await self.init_db()
         limit = max(1, min(1000, int(limit)))
         async with self.async_session() as session:
-            conditions = ["umo = :umo", "conversation_id = :cid"]
+            conditions = [
+                "umo = :umo",
+                "conversation_id = :cid",
+                "deleted_at IS NULL",
+            ]
             params: dict = {"umo": umo, "cid": conversation_id}
             expanding_binds: list[str] = []
 
@@ -564,6 +610,7 @@ class DBManager:
                 "umo = :umo",
                 "conversation_id = :cid",
                 "role = 'user'",
+                "deleted_at IS NULL",
             ]
             user_params: dict = {"umo": umo, "cid": conversation_id}
             expanding_binds: list[str] = []
@@ -628,6 +675,7 @@ class DBManager:
                 "WHERE a.umo = chat_memory_records.umo",
                 "AND a.conversation_id = chat_memory_records.conversation_id",
                 "AND a.role = 'assistant'",
+                "AND a.deleted_at IS NULL",
                 "AND ((chat_memory_records.turn_id IS NOT NULL "
                 "AND a.turn_id = chat_memory_records.turn_id) OR "
                 "(chat_memory_records.turn_id IS NULL "
@@ -677,6 +725,7 @@ class DBManager:
                     "conversation_id = :cid",
                     "role = 'assistant'",
                     "(turn_id IN :turn_ids OR pair_id IN :pids)",
+                    "deleted_at IS NULL",
                 ]
                 asst_params: dict = {
                     "umo": umo,
@@ -747,6 +796,7 @@ class DBManager:
             "message_id = :reply_id",
             "turn_id IS NOT NULL",
             "turn_id <> ''",
+            "deleted_at IS NULL",
         ]
         params = {"umo": umo, "reply_id": reply_id}
         if platform_id:
@@ -782,6 +832,7 @@ class DBManager:
                     _SELECT_COLS
                     + " FROM chat_memory_records WHERE umo = :umo "
                     "AND turn_id IN :turn_ids "
+                    "AND deleted_at IS NULL "
                     "ORDER BY created_at ASC, id ASC"
                 ).bindparams(bindparam("turn_ids", expanding=True)),
                 {"umo": umo, "turn_ids": clean_ids},
@@ -852,9 +903,11 @@ class DBManager:
                     "tool_result, created_at "
                     "FROM chat_memory_tool_records "
                     "WHERE umo = :umo AND conversation_id = :cid "
+                    "AND deleted_at IS NULL "
                     "AND turn_id IN ("
                     "  SELECT turn_id FROM chat_memory_tool_records "
                     "  WHERE umo = :umo AND conversation_id = :cid "
+                    "  AND deleted_at IS NULL "
                     "  GROUP BY turn_id "
                     "  ORDER BY MIN(created_at) DESC, MIN(id) DESC "
                     "  LIMIT :turn_limit"
@@ -955,6 +1008,53 @@ class DBManager:
             )
             await session.commit()
             return result.rowcount, media_rows
+
+    async def count_records_in_conversation(
+        self, umo: str, conversation_id: str
+    ) -> list[dict]:
+        """当前 CID 下的可见记录按 ``content_kind`` 分组计数（/reset 残留自检）。
+
+        返回 ``[{content_kind, count}]``，按数量降序；只统计未软删除的行。
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT content_kind, COUNT(*) AS n FROM chat_memory_records "
+                    "WHERE umo = :umo AND conversation_id = :cid "
+                    "AND deleted_at IS NULL "
+                    "GROUP BY content_kind ORDER BY n DESC LIMIT 10"
+                ),
+                {"umo": umo, "cid": str(conversation_id or "")},
+            )
+            return [
+                {"content_kind": str(row[0] or "[]"), "count": int(row[1] or 0)}
+                for row in result.fetchall()
+            ]
+
+    async def count_records_by_conversation(
+        self, umo: str, exclude_cid: str = ""
+    ) -> list[dict]:
+        """按 conversation_id 统计同 UMO 的记录数（/reset 残留诊断用）。
+
+        ``exclude_cid`` 排除刚清理的 CID；按记录数降序返回，最多 200 组。
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT conversation_id, COUNT(*) AS n "
+                    "FROM chat_memory_records "
+                    "WHERE umo = :umo AND conversation_id <> :cid "
+                    "AND deleted_at IS NULL "
+                    "GROUP BY conversation_id ORDER BY n DESC LIMIT 200"
+                ),
+                {"umo": umo, "cid": str(exclude_cid or "")},
+            )
+            return [
+                {"conversation_id": str(row[0] or ""), "count": int(row[1] or 0)}
+                for row in result.fetchall()
+            ]
 
     # ── 媒体归档表操作（schema v5）────────────────────
 
@@ -1097,6 +1197,7 @@ class DBManager:
                     "SELECT content, relation_data, sender_nickname "
                     "FROM chat_memory_records "
                     "WHERE umo = :umo AND message_id = :mid AND role = 'user' "
+                    "AND deleted_at IS NULL "
                     "ORDER BY id DESC LIMIT 1"
                 ),
                 {"umo": umo, "mid": str(message_id or "")},
@@ -1125,7 +1226,7 @@ class DBManager:
                 text(
                     "UPDATE chat_memory_records SET recalled_at = :now "
                     "WHERE umo = :umo AND message_id = :mid AND role = 'user' "
-                    "AND recalled_at IS NULL"
+                    "AND recalled_at IS NULL AND deleted_at IS NULL"
                 ),
                 {
                     "now": datetime.now(timezone.utc).replace(tzinfo=None),
@@ -1149,7 +1250,7 @@ class DBManager:
                     "SELECT sender_nickname FROM chat_memory_records "
                     "WHERE umo = :umo AND user_id = :uid AND role = 'user' "
                     "AND sender_nickname IS NOT NULL AND sender_nickname != '' "
-                    "AND sender_nickname != :uid "
+                    "AND sender_nickname != :uid AND deleted_at IS NULL "
                     "ORDER BY id DESC LIMIT 1"
                 ),
                 {"umo": umo, "uid": str(user_id or "")},
@@ -1211,6 +1312,7 @@ class DBManager:
                 )
             exists_parts.extend([
                 "AND a.role = 'assistant'",
+                "AND a.deleted_at IS NULL",
                 "AND ((chat_memory_records.turn_id IS NOT NULL "
                 "AND a.turn_id = chat_memory_records.turn_id) OR "
                 "(chat_memory_records.turn_id IS NULL "
@@ -1220,6 +1322,7 @@ class DBManager:
                 scope_cond,
                 "role = 'user'",
                 " ".join(exists_parts),
+                "deleted_at IS NULL",
             ]
             if skip_recalled:
                 conditions.append("recalled_at IS NULL")
@@ -1283,6 +1386,7 @@ class DBManager:
                     scope_cond,
                     "role = 'assistant'",
                     "(turn_id IN :turn_ids OR pair_id IN :pids)",
+                    "deleted_at IS NULL",
                 ]
                 asst_params = {
                     **scope_param,
@@ -1366,6 +1470,7 @@ class DBManager:
             conditions = [
                 scope_cond,
                 "role IN ('user', 'assistant')",
+                "deleted_at IS NULL",
             ]
             if skip_recalled:
                 conditions.append("recalled_at IS NULL")
@@ -1493,7 +1598,8 @@ _SELECT_COLS = (
     "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
     "platform_id, platform_name, message_type, session_id, self_id, "
     "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, "
-    "persona_id, created_at, turn_id, send_status, relation_data, id, recalled_at"
+    "persona_id, created_at, turn_id, send_status, relation_data, id, recalled_at, "
+    "deleted_at"
 )
 
 # 列位置索引（与 _SELECT_COLS 一一对应）
@@ -1501,7 +1607,8 @@ _SELECT_COLS = (
 # 5 llm_status | 6 content_kind | 7 platform_id | 8 platform_name | 9 message_type
 # 10 session_id | 11 self_id | 12 group_id | 13 sender_nickname | 14 raw_timestamp
 # 15 at_id | 16 reply_id | 17 forward_id | 18 persona_id | 19 created_at
-# 20 turn_id | 21 send_status | 22 relation_data | 23 id
+# 20 turn_id | 21 send_status | 22 relation_data | 23 id | 24 recalled_at
+# 25 deleted_at
 
 
 def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
@@ -1562,4 +1669,6 @@ def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
         "record_id": int(r[23]),
         # 撤回感知：非空表示该消息已被撤回（NULL=未撤回）
         "recalled_at": r[24] if len(r) > 24 else None,
+        # 软删除（v8）：非空表示该行已被标记删除（读路径默认已过滤）
+        "deleted_at": r[25] if len(r) > 25 else None,
     }

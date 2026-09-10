@@ -154,7 +154,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .distribution-group + .distribution-group { margin-top: 20px; }
 .distribution-title { margin-bottom: 10px; display: flex; justify-content: space-between; color: var(--text-2); font-size: 11px; font-weight: 720; text-transform: uppercase; letter-spacing: .08em; }
 .progress-row { margin: 9px 0; display: grid; grid-template-columns: minmax(82px, 115px) 1fr auto; align-items: center; gap: 9px; font-size: 12px; }
-.progress-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-label { overflow-wrap: anywhere; }
 .progress-track { height: 6px; overflow: hidden; border-radius: 99px; background: var(--surface-3); }
 .progress-fill { height: 100%; border-radius: inherit; background: var(--accent); }
 .progress-fill.teal { background: var(--teal); }
@@ -163,7 +163,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .database-details { margin: 0; padding: 18px 21px 21px; display: grid; grid-template-columns: 2fr repeat(3, 1fr); gap: 16px; }
 .database-details div { min-width: 0; }
 .database-details dt { color: var(--text-3); font-size: 11px; font-weight: 650; }
-.database-details dd { margin: 4px 0 0; overflow: hidden; color: var(--text-2); font: 12px/1.55 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.database-details dd { margin: 4px 0 0; color: var(--text-2); font: 12px/1.55 var(--mono); overflow-wrap: anywhere; }
 
 .filter-panel { overflow: hidden; margin-bottom: 25px; }
 .text-button { padding: 5px 3px; border: 0; color: var(--accent); background: transparent; font-size: 12px; font-weight: 650; }
@@ -203,18 +203,36 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .assistant .role-avatar { color: var(--teal); background: var(--teal-soft); }
 .record-main { min-width: 0; }
 .record-header { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
-.record-sender { max-width: 340px; overflow: hidden; font-weight: 710; text-overflow: ellipsis; white-space: nowrap; }
+.record-sender { max-width: 100%; font-weight: 710; overflow-wrap: anywhere; }
 .record-time { color: var(--text-3); font-size: 11px; }
-.record-content { margin-top: 8px; max-height: 180px; overflow: hidden; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.record-content { margin-top: 8px; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 .record-content mark { padding: 0 2px; border-radius: 3px; color: inherit; background: color-mix(in srgb, var(--amber) 34%, transparent); }
 .record-meta { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-.badge { max-width: 260px; padding: 3px 7px; overflow: hidden; border-radius: 6px; color: var(--text-2); background: var(--surface-3); font: 10px/1.45 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.badge { max-width: 100%; padding: 3px 7px; border-radius: 6px; color: var(--text-2); background: var(--surface-3); font: 10px/1.45 var(--mono); overflow-wrap: anywhere; word-break: break-all; }
 .badge.status { color: var(--accent); background: var(--accent-soft); }
 .badge.kind { color: var(--teal); background: var(--teal-soft); }
 .badge.sub { color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line-strong); }
 .badge.recalled { color: #fff; background: var(--amber); font-weight: 720; }
+/* 软删除（schema v8）：删除模式下每条记录带 times（软删除）/ backup（恢复）图标 */
+.record-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
 .record-detail-button { align-self: start; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--accent); background: var(--surface-2); font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: border-color .15s ease, background .15s ease; }
 .record-detail-button:hover { border-color: var(--accent); background: var(--accent-soft); }
+.record-mode-button { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface-2); cursor: pointer; transition: border-color .15s ease, background .15s ease, color .15s ease; }
+.record-mode-button svg { width: 16px; height: 16px; }
+.record-mode-button.soft-delete { color: #b4472f; }
+.record-mode-button.soft-delete:hover { color: #fff; background: #b4472f; border-color: #b4472f; }
+.record-mode-button.restore { color: var(--teal); }
+.record-mode-button.restore:hover { color: #fff; background: var(--teal); border-color: var(--teal); }
+.record-mode-button:disabled { opacity: .5; cursor: default; }
+/* 删除后在该条下方展示的 chip */
+.record-deleted-chip { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--text-3); font-size: 11px; }
+.tool-card-mode { margin-left: auto; display: inline-flex; align-items: center; }
+.chip-deleted { display: inline-block; padding: 2px 9px; border-radius: 999px; background: #b4472f; color: #fff; font: 10px/1.45 var(--mono); font-weight: 720; letter-spacing: .04em; }
+.detail-deleted { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 4px; padding: 10px 14px; border: 1px dashed #b4472f; border-radius: 11px; color: var(--text-2); font-size: 12px; }
+.detail-deleted-time { font-family: var(--mono); }
+.detail-header-actions { display: flex; align-items: center; gap: 8px; }
+/* 顶部模式切换：只读模式（默认）↔ 删除模式 */
+.readonly-pill.active { border-color: #b4472f; color: #b4472f; background: rgba(180, 71, 47, .1); }
 
 .pagination { margin-top: 18px; display: flex; align-items: center; justify-content: center; gap: 13px; }
 .pagination button { height: 34px; min-width: 78px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
@@ -268,7 +286,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .nav-button { width: auto; padding: 9px 10px; }
   .nav-button svg { display: none; }
   .topbar { height: 72px; padding: 0 17px; }
-  .readonly-pill { display: none; }
+  /* 移动端保留模式切换（它现在是删除模式的唯一入口），只压缩文字 */
+  .readonly-pill { padding: 0 9px; }
+  .readonly-pill svg { display: none; }
   .content { padding: 19px 14px 42px; }
   .metrics-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
   .metric-card { min-height: 115px; padding: 15px; }
@@ -279,7 +299,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .source-default-path { text-align: left; }
   .database-details { grid-template-columns: 1fr 1fr; }
   .record-card { grid-template-columns: 37px minmax(0, 1fr); padding: 14px; }
-  .record-detail-button { grid-column: 2; justify-self: start; }
+  .record-actions { grid-column: 2; flex-direction: row; align-items: center; justify-content: flex-start; }
 }
 
 @media (max-width: 500px) {
@@ -299,17 +319,17 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 
 /* 工具调用卡片 */
 .tool-card { padding: 16px 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-soft); }
-.tool-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tool-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .badge.tool-name { color: var(--amber); background: var(--amber-soft); font-weight: 720; }
 .tool-card-time { color: var(--text-3); font-size: 11px; font-family: var(--mono); }
-.tool-card-meta { margin-top: 8px; color: var(--text-3); font-size: 11px; overflow-wrap: anywhere; }
-.tool-card-meta code { font-family: var(--mono); }
+/* 工具卡片：turn_id / umo / cid 与记录列表一样用 chip（badge）展示，完整不截断 */
+.tool-card-chips { margin-top: 8px; }
 .tool-block { margin-top: 10px; }
 .tool-block-title { color: var(--text-2); font-size: 11px; font-weight: 680; margin-bottom: 5px; }
 .tool-json { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--text); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
 
 /* 回复引用块(列表卡片) */
-.reply-quote { margin: 6px 0 0; padding: 6px 10px; border-left: 3px solid var(--accent-soft); border-radius: 0 8px 8px 0; background: var(--surface-2); color: var(--text-2); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 84px; overflow: hidden; }
+.reply-quote { margin: 6px 0 0; padding: 6px 10px; border-left: 3px solid var(--accent-soft); border-radius: 0 8px 8px 0; background: var(--surface-2); color: var(--text-2); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .reply-quote strong { color: var(--text); }
 
 /* 媒体归档徽标与缩略图(列表卡片) */

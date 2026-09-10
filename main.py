@@ -182,6 +182,8 @@ class ChatMemoryPlugin(Star):
         self.ui_repository: Optional[ChatMemoryRepository] = None
         self.ui_web_api: Optional[ChatMemoryUiWebApi] = None
 
+        # "reset/new 识别不出形态"的 WARNING 是否已打过（花式写法会反复命中）
+        self._warned_reset_unknown = False
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_started = False
 
@@ -318,6 +320,8 @@ class ChatMemoryPlugin(Star):
                 default_page_size=50,
                 max_page_size=200,
                 allow_immutable_fallback=immutable_fallback,
+                # 只有指向插件实时库时才允许恢复软删除记录（写入口）
+                writable_path=self.db.db_path,
             )
             self.ui_web_api = ChatMemoryUiWebApi(
                 self.context,
@@ -354,6 +358,8 @@ class ChatMemoryPlugin(Star):
             default_page_size=50,
             max_page_size=200,
             allow_immutable_fallback=immutable_fallback,
+            # 切到别的库后 writable=False → 查询台的恢复按钮会被拒绝
+            writable_path=self.db.db_path,
         )
         health = await candidate.health()
         stored = "" if normalized == self.db.db_path else str(normalized)
@@ -509,7 +515,7 @@ class ChatMemoryPlugin(Star):
             except Exception as exc:
                 logger.debug(
                     f"{self._log_prefix(event)} 媒体归档提交失败 "
-                    f"kind={kind} id={media_id[:8]}: {exc}"
+                    f"kind={kind} id={media_id}: {exc}"
                 )
 
     @staticmethod
@@ -584,7 +590,7 @@ class ChatMemoryPlugin(Star):
             return ""
         nickname = str(row.get("sender_nickname") or "").strip()
         head = f"{nickname}：" if nickname else ""
-        return f"[撤回消息] {_escape_plain_text(head + text[:60])}"
+        return f"[撤回消息] {_escape_plain_text(head + text)}"
 
     async def _resolve_event_target(self, umo: str, user_id: str) -> str:
         """system_event 的目标昵称：按 umo+user_id 查最近一条真实昵称。
@@ -860,9 +866,9 @@ class ChatMemoryPlugin(Star):
                         detail = detail.split("：", 1)[1]
             if content in ("[系统事件]", "[系统通知]"):
                 # 未知 notice 类型（1.5.0）：兜底已落库（type=system）；每个
-                # (post_type, notice_type, sub_type) 组合首次出现打 WARNING
-                # （带原始 JSON 截断 400 字符，可能含 QQ 号，仅运行时诊断、
-                # 不入库不进上下文），重复出现降为 DEBUG 防刷屏。
+                # (post_type, notice_type, sub_type) 组合首次出现打 WARNING，
+                # 带**完整**原始事件 JSON（可能含账号/群号；按用户要求日志不截断，
+                # 仅本地诊断、不入库不进上下文），重复出现降为 DEBUG 防刷屏。
                 raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
                 if isinstance(raw, dict):
                     type_key = (
@@ -879,7 +885,7 @@ class ChatMemoryPlugin(Star):
                         f"post_type={raw.get('post_type')!r} "
                         f"notice_type={raw.get('notice_type')!r} "
                         f"sub_type={raw.get('sub_type')!r} "
-                        f"raw={str(raw)[:400]!r}"
+                        f"raw={str(raw)!r}"
                     )
             if action:
                 # <cm_event> 结构：target=被操作对象、operator=操作者（仅部分
@@ -973,13 +979,13 @@ class ChatMemoryPlugin(Star):
 
         kind_repr = "/".join(kind) if kind else "empty"
         ref_repr = []
-        if at_id: ref_repr.append(f"at={at_id[:8]}")
-        if reply_id: ref_repr.append(f"reply={reply_id[:8]}")
-        if forward_id: ref_repr.append(f"fwd={forward_id[:8]}")
+        if at_id: ref_repr.append(f"at={at_id}")
+        if reply_id: ref_repr.append(f"reply={reply_id}")
+        if forward_id: ref_repr.append(f"fwd={forward_id}")
         ref_str = f"[{','.join(ref_repr)}]" if ref_repr else ""
         logger.debug(
-            f"{self._log_prefix(event)} user[{msg_id[:8] or '-'}][{kind_repr}]{ref_str} -> "
-            f"{user_id}@{cid[:8]}: {content[:60]}"
+            f"{self._log_prefix(event)} user[{msg_id or '-'}][{kind_repr}]{ref_str} -> "
+            f"{user_id}@{cid}: {content}"
         )
 
         event.set_extra("chat_memory_captured", True)
@@ -1050,7 +1056,7 @@ class ChatMemoryPlugin(Star):
             logger.warning(f"{self._log_prefix(event)} user 已捕获但缺少 turn_id，跳过 llm_status 更新")
             return
         await self._safe_update_llm_status_by_turn(umo, cid, turn_id, _LLM_PENDING)
-        logger.debug(f"{self._log_prefix(event)} turn[{turn_id[:8]}] llm_status -> llm_pending")
+        logger.debug(f"{self._log_prefix(event)} turn[{turn_id}] llm_status -> llm_pending")
 
     # ── 工具调用捕获（写入 CM 数据库）──────────────────
 
@@ -1111,7 +1117,7 @@ class ChatMemoryPlugin(Star):
     def _build_tool_contexts(records: list[dict]) -> list[dict]:
         """把工具记录渲染成 OpenAI 格式：每轮一条 assistant(tool_calls) + N 条 role=tool。
 
-        tool_call_id 为 CM 自造（``cm_tool_<turn>_<n>``），只要求同一轮内
+        tool_call_id 为 CM 自造（``cm_tool_<turn_id>_<n>``，turn_id 完整不带截断），只要求同一轮内
         assistant 与 tool 消息成对一致，provider 不校验其来源。每条消息携带
         私有 ``_cm_tool_turn`` 供插入定位，注入前由调用方剥掉。
         """
@@ -1127,7 +1133,7 @@ class ChatMemoryPlugin(Star):
         contexts: list[dict] = []
         for turn_id in order:
             recs = grouped[turn_id]
-            call_ids = [f"cm_tool_{turn_id[:8]}_{i}" for i in range(len(recs))]
+            call_ids = [f"cm_tool_{turn_id}_{i}" for i in range(len(recs))]
             contexts.append(
                 {
                     "role": "assistant",
@@ -1232,7 +1238,8 @@ class ChatMemoryPlugin(Star):
             )
             return True
         except Exception as e:
-            logger.warning(f"{self._log_prefix()} 工具调用写入失败: {e}")
+            # 只记异常类型：DB 异常串会带出 SQL 参数（= 工具参数/结果正文）
+            logger.warning(f"{self._log_prefix()} 工具调用写入失败: {type(e).__name__}")
             return False
 
     async def _query_tool_contexts(self, umo: str, cid: str) -> list[dict]:
@@ -1293,7 +1300,7 @@ class ChatMemoryPlugin(Star):
         if ok:
             logger.debug(
                 f"{self._log_prefix(event)} tool[{tool_name}][#{call_index}] -> "
-                f"{cid[:8]}: {result_text[:60]}"
+                f"{cid}: {result_text}"
             )
 
     # ── 上下文接管 ───────────────────────────────────
@@ -1364,7 +1371,7 @@ class ChatMemoryPlugin(Star):
         logger.debug(
             f"{self._log_prefix(event)} 接管 contexts={len(contexts)} "
             f"(cross_session={self.ct_cross_session}, full_group={self.ct_full_group}, "
-            f"cid={cid[:8]})"
+            f"cid={cid})"
         )
 
     @filter.on_llm_request(priority=-1000)
@@ -1679,7 +1686,8 @@ class ChatMemoryPlugin(Star):
                 umo, conversation_id=cid, history=[]
             )
         except Exception as e:
-            logger.warning(f"{self._log_prefix()} 清理 native history 失败: {e}")
+            # 只记异常类型：异常串可能带出待写入的 history 正文
+            logger.warning(f"{self._log_prefix()} 清理 native history 失败: {type(e).__name__}")
 
     # ── 捕获 BOT 回复 + 检测 reset/new ──────────────────
 
@@ -1697,8 +1705,17 @@ class ChatMemoryPlugin(Star):
             if control_command:
                 await self._on_reset_or_new(event, umo, control_command)
                 return
-            logger.warning(
-                f"{self._log_prefix(event)} 核心会话清理标志存在，但事件文本无法区分 reset/new"
+            # 核心已清理会话，但我们分不清 reset/new：宁可不动（/new 时清库会误删），
+            # 但要留下可诊断的原文（WARNING，完整不截断），避免"reset 没反应"无从查起。
+            # 同一形态只 WARNING 一次（花式写法如 /reset@bot 会反复命中），之后降 DEBUG。
+            raw_text = self._get_context_control_text(event)
+            log_fn = (
+                logger.debug if self._warned_reset_unknown else logger.warning
+            )
+            self._warned_reset_unknown = True
+            log_fn(
+                f"{self._log_prefix(event)} 核心会话清理标志存在，但事件文本无法区分 "
+                f"reset/new，CM 未清理存档（原文：{raw_text!r}）"
             )
             return
 
@@ -1783,11 +1800,11 @@ class ChatMemoryPlugin(Star):
         )
         if not ok:
             logger.warning(
-                f"{self._log_prefix(event)} assistant prepared 写入失败，turn={turn_id[:8]}"
+                f"{self._log_prefix(event)} assistant prepared 写入失败，turn={turn_id}"
             )
         logger.debug(
             f"{self._log_prefix(event)} bot[{asst_status or 'default'}] -> "
-            f"{user_id}@{cid[:8]}: {content[:60]}..."
+            f"{user_id}@{cid}: {content}"
         )
 
     @filter.after_message_sent()
@@ -1812,14 +1829,21 @@ class ChatMemoryPlugin(Star):
     # ── reset / new 处理 ─────────────────────────────
 
     @staticmethod
-    def _get_context_control_command(event: AstrMessageEvent) -> str:
-        """在核心可信清理标志成立后，从事件文本区分 ``reset`` / ``new``。"""
+    def _get_context_control_text(event: AstrMessageEvent) -> str:
+        """取事件文本（``get_message_str`` 失败时回退 ``message_str``）。"""
         try:
             message = event.get_message_str()
         except Exception:
             message = getattr(event, "message_str", "")
-        message = str(message or "").lower()
-        # 词边界匹配：避免 renew / news / preset 之类的子串误判
+        return str(message or "")
+
+    @classmethod
+    def _get_context_control_command(cls, event: AstrMessageEvent) -> str:
+        """在核心可信清理标志成立后，从事件文本区分 ``reset`` / ``new``。"""
+        message = cls._get_context_control_text(event).lower()
+        # 词边界匹配：避免 renew / news / preset 之类的子串误判。
+        # 只认 AstrBot 自带命令的原文形态（/reset、/new）；平台后缀、全角斜杠等
+        # 花式写法不做兼容——识别不出来时上面的钩子会打 WARNING 带原文。
         if re.search(r"(?:^|[\s/])reset(?:$|[\s])", message):
             return "reset"
         if re.search(r"(?:^|[\s/])new(?:$|[\s])", message):
@@ -1834,7 +1858,8 @@ class ChatMemoryPlugin(Star):
     ):
         """按已经严格识别的 ``reset`` / ``new`` 分别处理。
 
-        /reset: CID 不变，清空历史 → 清除该 CID 下所有存档记录。
+        /reset: CID 不变，清空历史 → 清除该 CID 下所有存档记录（与 AstrBot 语义一致，
+                只作用于当前会话；顺带级联清理工具/归档/解析结果与媒体文件）。
         /new:   产生新 CID → 旧 CID 记录保留。
         """
         cid = await self._get_curr_cid(umo)
@@ -1843,17 +1868,88 @@ class ChatMemoryPlugin(Star):
 
         if command == "reset":
             # 直接删除并记录实际数量：一次 DELETE 完成，不再先 COUNT 预查。
-            deleted, media_rows = await self.db.delete_by_conversation(umo, cid)
-            await self.media_archiver.delete_files(media_rows)
+            try:
+                deleted, media_rows = await self.db.delete_by_conversation(umo, cid)
+                await self.media_archiver.delete_files(media_rows)
+            except Exception as exc:
+                # 删除失败（DB 锁/IO 等）：本地留可诊断日志，用户侧不会"点了没反应还没日志"
+                logger.warning(
+                    f"{self._log_prefix(event)} /reset 删除失败（CID={cid}）: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return
             if deleted > 0:
                 logger.info(
-                    f"{self._log_prefix(event)} /reset 完成：清除 CID={cid[:8]} "
+                    f"{self._log_prefix(event)} /reset 完成：清除 CID={cid} "
                     f"下 {deleted} 条存档（不可逆）"
                 )
             else:
-                logger.debug(f"{self._log_prefix(event)} /reset（CID={cid[:8]}），无存档记录可清除")
+                logger.debug(
+                    f"{self._log_prefix(event)} /reset（CID={cid}），无存档记录可清除"
+                )
+            await self._log_reset_residue(event, umo, cid)
+            await self._log_reset_leftovers(event, umo, cid)
         else:
-            logger.debug(f"{self._log_prefix(event)} /new（CID={cid[:8]}），新对话开始")
+            logger.debug(f"{self._log_prefix(event)} /new（CID={cid}），新对话开始")
+
+    async def _log_reset_residue(
+        self, event: AstrMessageEvent, umo: str, cid: str
+    ) -> None:
+        """自检：DELETE 之后立刻回查同一 (umo, cid)，把残留按 kind 打出来。
+
+        这行日志能区分两种"reset 后还有消息"：
+        - 有残留（WARNING 带 kind，例如 ``["event"]=3``）→ 删除与写入交错，属真实残留；
+        - 无残留（DEBUG）→ 之后在界面上看到的记录都是**删除之后**才落库的事件
+          （典型：平台重连后补发的旧系统通知），不是没删掉。
+        """
+        try:
+            rows = await self.db.count_records_in_conversation(umo, cid)
+        except Exception as exc:
+            logger.debug(
+                f"{self._log_prefix(event)} /reset 残留自检失败: {type(exc).__name__}"
+            )
+            return
+        if not rows:
+            logger.debug(
+                f"{self._log_prefix(event)} /reset 残留自检：CID={cid} 已无可见记录"
+            )
+            return
+        total = sum(item["count"] for item in rows)
+        detail = ", ".join(
+            f"{item['content_kind']}={item['count']}" for item in rows
+        )
+        logger.warning(
+            f"{self._log_prefix(event)} /reset 残留自检：CID={cid} 删除后仍有 "
+            f"{total} 条可见记录（按内容类型：{detail}）——可能是删除之后才落库的"
+            f"事件（平台补发/并发写入），也可能删除未生效；请把这个连同当时时间反馈"
+        )
+
+    async def _log_reset_leftovers(
+        self, event: AstrMessageEvent, umo: str, cid: str
+    ) -> None:
+        """诊断：/reset 只清当前 CID，同 UMO 其它 CID 的记录仍会保留。
+
+        用户看到"reset 后还有消息"时，先看这行 DEBUG 就能判断残留是别的 CID
+        （/new 之前的会话、或 Dashboard 删会话留下的）还是真的没删掉。
+        """
+        try:
+            rows = await self.db.count_records_by_conversation(umo, exclude_cid=cid)
+        except Exception as exc:
+            logger.debug(
+                f"{self._log_prefix(event)} 残留检查失败: {type(exc).__name__}"
+            )
+            return
+        if not rows:
+            return
+        total = sum(item["count"] for item in rows)
+        detail = ", ".join(
+            f"{item['conversation_id']}={item['count']}" for item in rows
+        )
+        logger.debug(
+            f"{self._log_prefix(event)} /reset 残留检查：同 UMO 其它 CID 仍有 "
+            f"{total} 条**可见**存档（{detail}）——/reset 只清当前 CID，这些属历史会话；"
+            f"如需彻底清理可在查询台按 CID 逐条软删除"
+        )
 
     # ── 公开实例方法（供 context.get_registered_star 调用）───
 
@@ -2054,7 +2150,9 @@ class ChatMemoryPlugin(Star):
             )
             return True
         except Exception as e:
-            logger.warning(f"{self._log_prefix()} 写入失败: {e}")
+            # 只记异常类型：SQLAlchemy 异常串会带出 SQL 参数（= 聊天正文
+            # / 媒体元信息），WARNING 不承载内容，细节由 DB 层启动日志覆盖
+            logger.warning(f"{self._log_prefix()} 写入失败: {type(e).__name__}")
             return False
 
     async def _safe_update_llm_status_by_turn(

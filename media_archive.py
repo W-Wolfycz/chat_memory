@@ -291,7 +291,7 @@ class MediaArchiver:
         except Exception as exc:
             logger.debug(
                 "[ChatMemory] 媒体归档登记失败 %s: %s",
-                media_id[:8], type(exc).__name__,
+                media_id, type(exc).__name__,
             )
             tmp.unlink(missing_ok=True)
             return False
@@ -319,7 +319,7 @@ class MediaArchiver:
             except Exception as exc:
                 logger.debug(
                     "[ChatMemory] 媒体下载失败 kind=%s id=%s: %s",
-                    item.get("kind"), str(item.get("media_id") or "")[:8], exc,
+                    item.get("kind"), str(item.get("media_id") or ""), exc,
                 )
             finally:
                 self._queue.task_done()

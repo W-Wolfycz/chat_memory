@@ -413,6 +413,165 @@ class RepositoryTestCase(unittest.TestCase):
         detail = asyncio.run(repo.record(result["items"][0]["record_id"]))
         self.assertIn("reply_view", detail["record"])
 
+    def test_soft_delete_filter_and_restore(self):
+        # 小节：软删除（schema v8）——默认只看未删除、三态筛选、单条软删除/恢复
+        path = Path(self.temp_dir.name) / "soft_delete.db"
+        make_database(path)
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "ALTER TABLE chat_memory_records ADD COLUMN deleted_at DATETIME"
+        )
+        connection.execute(
+            "UPDATE chat_memory_records SET deleted_at = '2026-08-12 00:00:00' "
+            "WHERE turn_id = 'turn-b'"
+        )
+        connection.commit()
+        connection.close()
+        repo = ChatMemoryRepository(
+            path,
+            timezone=timezone(timedelta(hours=8), name="Asia/Shanghai"),
+            writable_path=path,
+        )
+
+        result = asyncio.run(repo.query({"page_size": 50}))
+        self.assertEqual(result["total"], 3)
+        self.assertNotIn("turn-b", [item["turn_id"] for item in result["items"]])
+        # 默认（缺省/visible）只看未删除；all 全看；deleted 只看已删除
+        result = asyncio.run(repo.query({"page_size": 50, "deleted_state": "visible"}))
+        self.assertEqual(result["total"], 3)
+
+        result = asyncio.run(repo.query({"page_size": 50, "deleted_state": "all"}))
+        self.assertEqual(result["total"], 4)
+        by_turn = {item["turn_id"]: item for item in result["items"]}
+        self.assertTrue(by_turn["turn-b"]["deleted"])
+        self.assertEqual(by_turn["turn-b"]["deleted_at"], "2026-08-12 08:00:00")
+        self.assertFalse(by_turn["turn-a"]["deleted"])
+
+        result = asyncio.run(repo.query({"page_size": 50, "deleted_state": "deleted"}))
+        self.assertEqual([item["turn_id"] for item in result["items"]], ["turn-b"])
+        # 未知取值 → 400 语义（ValueError）
+        with self.assertRaises(ValueError):
+            asyncio.run(repo.query({"page_size": 50, "deleted_state": "unknown"}))
+
+        # 概览/健康：总数只算可见记录，软删数量单独给出
+        overview = asyncio.run(repo.overview())
+        self.assertEqual(overview["summary"]["total_records"], 3)
+        self.assertEqual(overview["summary"]["deleted_records"], 1)
+        health = asyncio.run(repo.health())
+        self.assertEqual(health["total_records"], 3)
+        self.assertEqual(health["deleted_records"], 1)
+
+        # 恢复（写入口）：writable 时成功，记录重新进入默认列表
+        restored = asyncio.run(repo.restore_record(by_turn["turn-b"]["record_id"]))
+        self.assertFalse(restored["deleted"])
+        result = asyncio.run(repo.query({"page_size": 50}))
+        self.assertEqual(result["total"], 4)
+        # 重复恢复 / 不存在的 ID → ValueError
+        with self.assertRaises(ValueError):
+            asyncio.run(repo.restore_record(by_turn["turn-b"]["record_id"]))
+        with self.assertRaises(ValueError):
+            asyncio.run(repo.restore_record(999999))
+
+        # 单条软删除（写入口）：标记后立刻从默认列表消失，并可再恢复
+        marked = asyncio.run(
+            repo.soft_delete_record(by_turn["turn-a"]["record_id"])
+        )
+        self.assertTrue(marked["deleted"])
+        self.assertTrue(marked["deleted_at"])
+        self.assertEqual(
+            asyncio.run(repo.query({"page_size": 50}))["total"], 3
+        )
+        self.assertEqual(
+            [item["turn_id"] for item in asyncio.run(
+                repo.query({"page_size": 50, "deleted_state": "deleted"})
+            )["items"]],
+            ["turn-a"],
+        )
+        # 已软删的记录再次软删 → ValueError
+        with self.assertRaises(ValueError):
+            asyncio.run(repo.soft_delete_record(by_turn["turn-a"]["record_id"]))
+        asyncio.run(repo.restore_record(by_turn["turn-a"]["record_id"]))
+        self.assertEqual(asyncio.run(repo.query({"page_size": 50}))["total"], 4)
+
+        # 数据源不是插件实时库（未传 writable_path）→ 拒绝写入
+        readonly = ChatMemoryRepository(
+            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+        )
+        self.assertFalse(readonly.writable)
+        with self.assertRaises(PermissionError):
+            asyncio.run(readonly.restore_record(1))
+        with self.assertRaises(PermissionError):
+            asyncio.run(readonly.soft_delete_record(1))
+
+        # 工具调用表同一套逻辑：三态筛选 + 单条软删除/恢复（target=tool）
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "ALTER TABLE chat_memory_tool_records ADD COLUMN deleted_at DATETIME"
+        )
+        connection.commit()
+        connection.close()
+        tools = asyncio.run(repo.tool_records({"page": 1, "page_size": 20}))
+        self.assertEqual(len(tools["items"]), 3)
+        self.assertFalse(any(item["deleted"] for item in tools["items"]))
+
+        marked_tool = asyncio.run(
+            repo.soft_delete_record(tools["items"][0]["tool_id"], "tool")
+        )
+        self.assertEqual(marked_tool["target"], "tool")
+        self.assertTrue(marked_tool["deleted"])
+        self.assertTrue(marked_tool["deleted_at"])  # 按配置时区返回本地时间
+        visible_tools = asyncio.run(repo.tool_records({"page": 1, "page_size": 20}))
+        self.assertEqual(len(visible_tools["items"]), 2)
+        self.assertNotIn(
+            marked_tool["id"],
+            [item["tool_id"] for item in visible_tools["items"]],
+        )
+        deleted_tools = asyncio.run(repo.tool_records({
+            "page": 1, "page_size": 20, "deleted_state": "deleted",
+        }))
+        self.assertEqual([item["tool_id"] for item in deleted_tools["items"]],
+                         [marked_tool["id"]])
+        self.assertTrue(deleted_tools["items"][0]["deleted"])
+        all_tools = asyncio.run(repo.tool_records({
+            "page": 1, "page_size": 20, "deleted_state": "all",
+        }))
+        self.assertEqual(len(all_tools["items"]), 3)
+        # 概览：工具调用同样按可见口径 + 已删除计数
+        overview = asyncio.run(repo.overview())
+        self.assertEqual(overview["tools"]["total_calls"], 2)
+        self.assertEqual(overview["tools"]["deleted_calls"], 1)
+        # 被软删的是最新一条（turn-b 的 draw）：draw 计数从 2 降到 1，query 不受影响
+        self.assertEqual(overview["tools"]["tool_names"]["draw"], 1)
+        self.assertEqual(overview["tools"]["tool_names"]["query"], 1)
+        # 恢复后回到可见列表
+        restored_tool = asyncio.run(
+            repo.restore_record(marked_tool["id"], "tool")
+        )
+        self.assertFalse(restored_tool["deleted"])
+        self.assertEqual(
+            len(asyncio.run(repo.tool_records({"page": 1, "page_size": 20}))["items"]),
+            3,
+        )
+        # 未知 target → ValueError
+        with self.assertRaises(ValueError):
+            asyncio.run(repo.soft_delete_record(1, "unknown"))
+
+        # 旧库（无 deleted_at 列）：过滤条件自动降级，不报错也不误判
+        legacy = Path(self.temp_dir.name) / "legacy_no_soft.db"
+        make_database(legacy)
+        repo_legacy = ChatMemoryRepository(
+            legacy, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+        )
+        legacy_result = asyncio.run(repo_legacy.query({"page_size": 50}))
+        self.assertEqual(legacy_result["total"], 4)
+        legacy_tools = asyncio.run(repo_legacy.tool_records({"page": 1, "page_size": 20}))
+        self.assertEqual(len(legacy_tools["items"]), 3)
+        self.assertFalse(any(item["deleted"] for item in legacy_tools["items"]))
+        self.assertFalse(any(item["deleted"] for item in legacy_result["items"]))
+        self.assertEqual(
+            asyncio.run(repo_legacy.overview())["summary"]["deleted_records"], 0
+        )
+
     def test_media_view_and_archive(self):
         # 小节：归档 join（archived/mime/size/name/poke_label）+ media_file 单查
         path = Path(self.temp_dir.name) / "media.db"

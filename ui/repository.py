@@ -37,6 +37,8 @@ REQUIRED_COLUMNS = {
     "created_at",
 }
 VALID_ROLES = {"user", "assistant"}
+# 软删除筛选三态：all=全部 / visible=未删除（默认） / deleted=仅已删除
+VALID_DELETED_STATES = {"all", "visible", "deleted"}
 VALID_STATUSES = {"", "llm_pending", "llm_success", "proactive", "orphan"}
 VALID_KINDS = {
     "text",
@@ -160,6 +162,7 @@ class ChatMemoryRepository:
         default_page_size: int = 50,
         max_page_size: int = 200,
         allow_immutable_fallback: bool = True,
+        writable_path: str | Path | None = None,
     ) -> None:
         self.db_path = Path(db_path).expanduser().resolve(strict=False)
         self.timezone = timezone or _default_timezone()
@@ -167,6 +170,12 @@ class ChatMemoryRepository:
         self.max_page_size = max(20, min(500, int(max_page_size)))
         self.default_page_size = min(self.default_page_size, self.max_page_size)
         self.allow_immutable_fallback = allow_immutable_fallback
+        # 唯一允许写入（恢复软删除）的库：插件实时库。查询台指向别处时只读。
+        self.writable_path = (
+            Path(writable_path).expanduser().resolve(strict=False)
+            if writable_path
+            else None
+        )
 
     async def health(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._run_read, self._health_query)
@@ -190,6 +199,116 @@ class ChatMemoryRepository:
         if normalized_id <= 0:
             raise ValueError("记录 ID 必须大于 0")
         return await asyncio.to_thread(self._run_read, self._record_query, normalized_id)
+
+    @property
+    def writable(self) -> bool:
+        """当前查询的数据源是否就是插件实时库（决定能否恢复软删除记录）。"""
+        return self.writable_path is not None and self.db_path == self.writable_path
+
+    async def soft_delete_record(
+        self, row_id: int, target: str = "record"
+    ) -> dict[str, Any]:
+        """软删除**单条**记录或工具调用（标记 ``deleted_at``，不物理删除）。
+
+        软删除只对查询台开放，且一次只允许一条：记录本体不动、媒体文件也不动
+        （媒体清理仍走 ``media_archive`` 的保留期/总量配置）。
+        """
+        return await self._write_deleted_at(row_id, target, deleted=True)
+
+    async def restore_record(
+        self, row_id: int, target: str = "record"
+    ) -> dict[str, Any]:
+        """恢复一条被软删除的记录或工具调用（清除 ``deleted_at``）。"""
+        return await self._write_deleted_at(row_id, target, deleted=False)
+
+    async def _write_deleted_at(
+        self, row_id: int, target: str, *, deleted: bool
+    ) -> dict[str, Any]:
+        """查询台仅有的写路径：改单条记录/工具调用的 ``deleted_at``。
+
+        只对插件实时库开放：数据源被改成其他路径（快照/备份库）时直接拒绝，避免误改快照。
+        """
+        table = self._target_table(target)
+        try:
+            normalized_id = int(row_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ID 必须是整数") from exc
+        if normalized_id <= 0:
+            raise ValueError("ID 必须大于 0")
+        if not self.writable:
+            raise PermissionError("当前数据源不是插件实时数据库，删除/恢复操作已禁用")
+        return await asyncio.to_thread(
+            self._apply_deleted_at, table, normalized_id, target, deleted
+        )
+
+    @staticmethod
+    def _target_table(target: str) -> str:
+        """写目标表：record=主表，tool=工具调用表（两者 ID 空间独立）。"""
+        normalized = str(target or "record").strip().lower()
+        if normalized == "record":
+            return TABLE_NAME
+        if normalized == "tool":
+            return TOOL_TABLE_NAME
+        raise ValueError("未知的删除目标")
+
+    def _apply_deleted_at(
+        self, table: str, row_id: int, target: str, deleted: bool
+    ) -> dict[str, Any]:
+        if not self.db_path.is_file():
+            raise DatabaseUnavailableError(f"未找到 ChatMemory 数据库：{self.db_path}")
+        connection = sqlite3.connect(str(self.db_path), timeout=5)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 5000")
+            self._validate_schema(connection)
+            has_column = (
+                self._has_deleted_column(connection)
+                if table == TABLE_NAME
+                else self._has_tool_deleted_column(connection)
+            )
+            if not has_column:
+                raise ValueError("该数据库没有软删除列（schema < v8），无法软删除")
+            current_row = connection.execute(
+                f"SELECT deleted_at FROM {table} WHERE id = ?", (row_id,)
+            ).fetchone()
+            if current_row is None:
+                # 区分「不存在」与「状态不符」，排障时不会被合成一条消息误导
+                raise ValueError("记录不存在")
+            current = str(current_row["deleted_at"] or "").strip()
+            if deleted and current:
+                raise ValueError("记录已被软删除")
+            if not deleted and not current:
+                raise ValueError("记录未被软删除")
+            now_raw = (
+                datetime.now(dt_timezone.utc)
+                .replace(tzinfo=None)
+                .strftime("%Y-%m-%d %H:%M:%S.%f")
+            )
+            if deleted:
+                connection.execute(
+                    f"UPDATE {table} SET deleted_at = :now WHERE id = :rid",
+                    {"now": now_raw, "rid": row_id},
+                )
+                deleted_at_raw = now_raw
+            else:
+                connection.execute(
+                    f"UPDATE {table} SET deleted_at = NULL WHERE id = :rid",
+                    {"rid": row_id},
+                )
+                deleted_at_raw = ""
+            connection.commit()
+            return {
+                "id": row_id,
+                "target": target,
+                "deleted": bool(deleted_at_raw),
+                "deleted_at": (
+                    self._time_pair(deleted_at_raw)[1] if deleted_at_raw else ""
+                ),
+            }
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseUnavailableError(f"写入失败：{exc}") from exc
+        finally:
+            connection.close()
 
     async def tool_records(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_tool_filters(payload)
@@ -234,6 +353,28 @@ class ChatMemoryRepository:
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 3000")
         return connection
+
+    @staticmethod
+    def _has_tool_deleted_column(connection: sqlite3.Connection) -> bool:
+        """工具表是否有 deleted_at（schema >= v8）。"""
+        try:
+            info = connection.execute(
+                f"PRAGMA table_info({TOOL_TABLE_NAME})"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return False
+        return any(str(row[1]) == "deleted_at" for row in info)
+
+    @staticmethod
+    def _has_deleted_column(connection: sqlite3.Connection) -> bool:
+        """主表是否有 deleted_at（schema >= v8）。旧库/旧快照按无软删除处理。"""
+        try:
+            info = connection.execute(
+                f"PRAGMA table_info({TABLE_NAME})"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return False
+        return any(str(row[1]) == "deleted_at" for row in info)
 
     def _validate_schema(self, connection: sqlite3.Connection) -> None:
         table = connection.execute(
@@ -303,18 +444,22 @@ class ChatMemoryRepository:
         )
 
     def _health_query(self, connection: sqlite3.Connection) -> dict[str, Any]:
+        visible = "WHERE deleted_at IS NULL" if self._has_deleted_column(connection) else ""
         row = connection.execute(
             f"SELECT COUNT(*) AS total, MIN(created_at) AS oldest, "
-            f"MAX(created_at) AS newest FROM {TABLE_NAME}"
+            f"MAX(created_at) AS newest FROM {TABLE_NAME} {visible}"
         ).fetchone()
         return {
             "healthy": True,
             "total_records": int(row["total"] or 0),
             "oldest_at": self._local_time(row["oldest"]),
             "newest_at": self._local_time(row["newest"]),
+            "deleted_records": self._deleted_count(connection),
         }
 
     def _overview_query(self, connection: sqlite3.Connection) -> dict[str, Any]:
+        # 软删除行不算进概览（与列表口径一致），另用 deleted_records 单独说明
+        visible = "WHERE deleted_at IS NULL" if self._has_deleted_column(connection) else ""
         summary = connection.execute(
             f"""
             SELECT
@@ -324,19 +469,19 @@ class ChatMemoryRepository:
                 COUNT(DISTINCT CASE WHEN role = 'user' THEN user_id END) AS total_users,
                 MIN(created_at) AS oldest_at,
                 MAX(created_at) AS newest_at
-            FROM {TABLE_NAME}
+            FROM {TABLE_NAME} {visible}
             """
         ).fetchone()
         roles = _count_map(
             connection.execute(
                 f"SELECT role AS value, COUNT(*) AS amount FROM {TABLE_NAME} "
-                "GROUP BY role ORDER BY amount DESC"
+                f"{visible} GROUP BY role ORDER BY amount DESC"
             )
         )
         statuses = _count_map(
             connection.execute(
                 f"SELECT llm_status AS value, COUNT(*) AS amount FROM {TABLE_NAME} "
-                "GROUP BY llm_status ORDER BY amount DESC"
+                f"{visible} GROUP BY llm_status ORDER BY amount DESC"
             ),
             empty_label="no_llm",
         )
@@ -347,12 +492,18 @@ class ChatMemoryRepository:
                 FROM {TABLE_NAME},
                      json_each(CASE WHEN json_valid(content_kind)
                                     THEN content_kind ELSE '[]' END) AS kinds
+                {visible}
                 GROUP BY kinds.value
                 ORDER BY amount DESC
                 """
             )
         )
         # created_at 存 UTC naive；按插件时区偏移分桶，避免日界与展示口径不一致
+        soft_and = (
+            "deleted_at IS NULL"
+            if self._has_deleted_column(connection)
+            else "1 = 1"
+        )
         tz_offset = self.timezone.utcoffset(datetime.now(self.timezone))
         offset_seconds = int((tz_offset or timedelta(0)).total_seconds())
         daily_rows = connection.execute(
@@ -360,6 +511,7 @@ class ChatMemoryRepository:
             SELECT date(created_at, :tz_offset) AS day, COUNT(*) AS amount
             FROM {TABLE_NAME}
             WHERE created_at >= datetime('now', '-29 days')
+              AND {soft_and}
             GROUP BY day
             ORDER BY day ASC
             """,
@@ -375,6 +527,7 @@ class ChatMemoryRepository:
                 "total_users": int(summary["total_users"] or 0),
                 "oldest_at": self._local_time(summary["oldest_at"]),
                 "newest_at": self._local_time(summary["newest_at"]),
+                "deleted_records": self._deleted_count(connection),
                 "timezone": str(self.timezone),
             },
             "roles": roles,
@@ -387,6 +540,15 @@ class ChatMemoryRepository:
             "tools": tools,
             "media": media,
         }
+
+    def _deleted_count(self, connection: sqlite3.Connection) -> int:
+        """已软删除（deleted_at 非空）的记录数；旧库无该列时返回 0。"""
+        if not self._has_deleted_column(connection):
+            return 0
+        row = connection.execute(
+            f"SELECT COUNT(*) AS amount FROM {TABLE_NAME} WHERE deleted_at IS NOT NULL"
+        ).fetchone()
+        return int(row["amount"] or 0)
 
     @staticmethod
     def _media_overview(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -413,6 +575,7 @@ class ChatMemoryRepository:
 
     @staticmethod
     def _tools_overview(connection: sqlite3.Connection) -> dict[str, Any]:
+        tool_visible = ChatMemoryRepository._has_tool_deleted_column(connection)
         present = (
             connection.execute(
                 "SELECT 1 FROM sqlite_master "
@@ -422,31 +585,54 @@ class ChatMemoryRepository:
             is not None
         )
         if not present:
-            return {"present": False, "total_calls": 0, "tool_names": {}}
+            return {
+                "present": False,
+                "total_calls": 0,
+                "deleted_calls": 0,
+                "tool_names": {},
+            }
+        visible = " WHERE deleted_at IS NULL" if tool_visible else ""
         total = int(
             connection.execute(
-                f"SELECT COUNT(*) FROM {TOOL_TABLE_NAME}"
+                f"SELECT COUNT(*) FROM {TOOL_TABLE_NAME}{visible}"
             ).fetchone()[0]
             or 0
         )
         names = _count_map(
             connection.execute(
                 f"SELECT tool_name AS value, COUNT(*) AS amount "
-                f"FROM {TOOL_TABLE_NAME} GROUP BY tool_name ORDER BY amount DESC"
+                f"FROM {TOOL_TABLE_NAME}{visible} "
+                "GROUP BY tool_name ORDER BY amount DESC"
             ),
             empty_label="(empty)",
         )
-        return {"present": True, "total_calls": total, "tool_names": names}
+        deleted_calls = 0
+        if tool_visible:
+            deleted_calls = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {TOOL_TABLE_NAME} "
+                    "WHERE deleted_at IS NOT NULL"
+                ).fetchone()[0]
+                or 0
+            )
+        return {
+            "present": True,
+            "total_calls": total,
+            "deleted_calls": deleted_calls,
+            "tool_names": names,
+        }
 
     def _facets_query(
         self, connection: sqlite3.Connection, filters: dict[str, Any]
     ) -> dict[str, Any]:
+        soft_delete = self._has_deleted_column(connection)
+
         def scope(excluded: str) -> tuple[str, dict[str, Any]]:
             scoped_filters = {
                 key: value for key, value in filters.items() if key != excluded
             }
             conditions, scoped_params = self._where_clause(
-                scoped_filters, alias="r"
+                scoped_filters, alias="r", soft_delete=soft_delete
             )
             return (" AND ".join(conditions) if conditions else "1 = 1"), scoped_params
 
@@ -655,7 +841,10 @@ class ChatMemoryRepository:
     def _records_query(
         self, connection: sqlite3.Connection, filters: dict[str, Any]
     ) -> dict[str, Any]:
-        conditions, params = self._where_clause(filters, alias="r")
+        conditions, params = self._where_clause(
+            filters, alias="r",
+            soft_delete=self._has_deleted_column(connection),
+        )
         where = " AND ".join(conditions) if conditions else "1 = 1"
         cte = self._paired_cte(connection) if filters.get("paired_only") else ""
         matched_join = (
@@ -920,6 +1109,13 @@ class ChatMemoryRepository:
         if filters.get("until"):
             conditions.append("created_at <= :until")
             params["until"] = filters["until"]
+        # 软删除（v8）：与主表同一套三态筛选；旧库无该列时自动降级
+        soft_delete = self._has_tool_deleted_column(connection)
+        deleted_state = filters.get("deleted_state") or "visible"
+        if soft_delete and deleted_state == "visible":
+            conditions.append("deleted_at IS NULL")
+        elif soft_delete and deleted_state == "deleted":
+            conditions.append("deleted_at IS NOT NULL")
         where = " AND ".join(conditions) if conditions else "1 = 1"
         total = int(
             connection.execute(
@@ -950,8 +1146,13 @@ class ChatMemoryRepository:
 
     def _serialize_tool_record(self, row: sqlite3.Row) -> dict[str, Any]:
         created_at_utc, created_at_local = self._time_pair(row["created_at"])
+        deleted_at_raw = _row_value(row, "deleted_at")
         return {
             "tool_id": int(row["id"]),
+            "deleted": bool(str(deleted_at_raw or "").strip()),
+            "deleted_at": (
+                self._time_pair(deleted_at_raw)[1] if deleted_at_raw else ""
+            ),
             "umo": str(row["umo"]),
             "conversation_id": str(row["conversation_id"]),
             "turn_id": str(row["turn_id"] or ""),
@@ -962,6 +1163,14 @@ class ChatMemoryRepository:
             "created_at": created_at_local,
             "created_at_utc": created_at_utc,
         }
+
+    @staticmethod
+    def _normalize_deleted_state(raw: Any) -> str:
+        """删除状态三态归一：all / visible（默认） / deleted。"""
+        value = str(raw or "").strip().lower() or "visible"
+        if value not in VALID_DELETED_STATES:
+            raise ValueError("未知的删除状态筛选")
+        return value
 
     def _normalize_tool_filters(self, raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
@@ -985,6 +1194,10 @@ class ChatMemoryRepository:
         if normalized["since"] and normalized["until"]:
             if normalized["since"] > normalized["until"]:
                 raise ValueError("起始时间不能晚于结束时间")
+        # 工具表与主表同一套软删除筛选
+        normalized["deleted_state"] = self._normalize_deleted_state(
+            raw.get("deleted_state")
+        )
         normalized["page"] = _bounded_int(raw.get("page", 1), 1, 1_000_000, 1)
         normalized["page_size"] = _bounded_int(
             raw.get("page_size", self.default_page_size),
@@ -995,7 +1208,11 @@ class ChatMemoryRepository:
         return normalized
 
     def _where_clause(
-        self, filters: dict[str, Any], *, alias: str
+        self,
+        filters: dict[str, Any],
+        *,
+        alias: str,
+        soft_delete: bool = True,
     ) -> tuple[list[str], dict[str, Any]]:
         conditions: list[str] = []
         params: dict[str, Any] = {}
@@ -1054,6 +1271,14 @@ class ChatMemoryRepository:
         if filters.get("until"):
             conditions.append(f"{alias}.created_at <= :until")
             params["until"] = filters["until"]
+        # 软删除（schema v7）：旧库无该列时调用方传 soft_delete=False 降级
+        if not soft_delete:
+            return conditions, params
+        deleted_state = filters.get("deleted_state") or "visible"
+        if deleted_state == "visible":
+            conditions.append(f"{alias}.deleted_at IS NULL")
+        elif deleted_state == "deleted":
+            conditions.append(f"{alias}.deleted_at IS NOT NULL")
         return conditions, params
 
     def _normalize_filters(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -1118,7 +1343,11 @@ class ChatMemoryRepository:
         if normalized["since"] and normalized["until"]:
             if normalized["since"] > normalized["until"]:
                 raise ValueError("起始时间不能晚于结束时间")
-        normalized["paired_only"] = bool(raw.get("paired_only", False))
+        normalized["paired_only"] = _as_bool(raw.get("paired_only", False))
+        # 软删除（schema v7）：三态下拉 all / visible / deleted，默认只看未删除
+        normalized["deleted_state"] = self._normalize_deleted_state(
+            raw.get("deleted_state")
+        )
         normalized["page"] = _bounded_int(raw.get("page", 1), 1, 1_000_000, 1)
         normalized["page_size"] = _bounded_int(
             raw.get("page_size", self.default_page_size),
@@ -1226,17 +1455,18 @@ class ChatMemoryRepository:
                             (target or {}).get("sender_nickname") or ""
                         ).strip()
                         or "未知成员",
-                        "text": str((target or {}).get("content") or "")[:300],
+                        "text": str((target or {}).get("content") or ""),
                     }
                 else:
                     reply_view = {
                         "resolution": "snapshot",
                         "target": str(reply.get("target_nickname") or "").strip()
                         or "未知成员",
-                        "text": str(reply.get("fallback_text") or "")[:300],
+                        "text": str(reply.get("fallback_text") or ""),
                     }
         media_view = self._media_view(relation_data, media_archive)
         recalled_at_raw = _row_value(row, "recalled_at")
+        deleted_at_raw = _row_value(row, "deleted_at")
         return {
             "record_id": int(row["id"]),
             "role": str(row["role"]),
@@ -1252,6 +1482,9 @@ class ChatMemoryRepository:
             "llm_status": str(row["llm_status"] or ""),
             "recalled": bool(str(recalled_at_raw or "").strip()),
             "recalled_at": self._time_pair(recalled_at_raw)[1] if recalled_at_raw else "",
+            # 软删除（schema v7）：deleted=True 表示被查询台单条软删除（/reset 是硬删除）
+            "deleted": bool(str(deleted_at_raw or "").strip()),
+            "deleted_at": self._time_pair(deleted_at_raw)[1] if deleted_at_raw else "",
             "content_kind": content_kind,
             "platform_id": _optional_str(_row_value(row, "platform_id")),
             "platform_name": _optional_str(_row_value(row, "platform_name")),
@@ -1391,9 +1624,9 @@ def _parse_relation_data(value: Any) -> dict[str, Any] | None:
 
 
 def _clean_inline_name(value: Any) -> str:
-    """文件名进占位符的净化：去控制字符与 ⟦⟧ 结构符，限长 60。"""
+    """文件名进占位符的净化：去控制字符与 ⟦⟧ 结构符；不截断（与上下文里的文件名一致）。"""
     text = "".join(ch for ch in str(value or "") if ch >= " " or ch == "\t")
-    return text.replace("⟦", "").replace("⟧", "").strip()[:60]
+    return text.replace("⟦", "").replace("⟧", "").strip()
 
 
 def _ui_media_label_of(item: Any) -> str:
@@ -1494,6 +1727,20 @@ def _localize_pure_media_placeholder(value: str, kinds: set[str]) -> str:
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """宽松布尔归一化：字符串 "false"/"0"/"no" 不得被判成 True。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return default
+        return text in ("1", "true", "yes", "on")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 def _bounded_int(value: Any, minimum: int, maximum: int, default: int) -> int:

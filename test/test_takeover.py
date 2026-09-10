@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import types
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2487,7 +2488,226 @@ def test_mark_send_attempted_and_control_command():
     assert cmd("renew 一下") == ""
     assert cmd("news 今天") == ""
     assert cmd("preset 配置") == ""
+    # 只认 AstrBot 自带命令的原文形态；花式写法不兼容（识别不出会打 WARNING）
+    assert cmd("/reset@bot_demo") == ""
+    assert cmd("／reset") == ""
     print("[T62] mark_send_attempted_and_control_command ✓")
+
+
+def test_reset_cleanup_and_leftover_diagnostics():
+    """reset 只清当前 cid（AstrBot 语义）：硬删除 + 级联媒体；无 cid 时告警不误删。"""
+    p = _make_plugin()
+    calls = []
+
+    class _DB:
+        async def delete_by_conversation(self, umo, cid):
+            calls.append(("delete", umo, cid))
+            return 3, [{"media_id": "a" * 32, "file_name": "a.jpg",
+                        "created_at": "2026-07-09 10:00:00"}]
+
+        async def count_records_by_conversation(self, umo, exclude_cid=""):
+            calls.append(("count", umo, exclude_cid))
+            return [{"conversation_id": "old_cid_demo", "count": 7}]
+
+        async def count_records_in_conversation(self, umo, cid):
+            calls.append(("residue", umo, cid))
+            # 残留自检：返回空 = 这次 DELETE 是完整的
+            return []
+
+    class _Arch:
+        async def delete_files(self, rows):
+            calls.append(("files", len(rows)))
+            return 1
+
+    class _Ev:
+        message_str = "/reset"
+        unified_msg_origin = "aiocqhttp:GroupMessage:g1"
+
+        def get_extra(self, key, default=None):
+            return default
+
+        def get_messages(self):
+            return []
+
+    p.db = _DB()
+    p.media_archiver = _Arch()
+
+    async def _cid(umo):
+        return "cid_demo"
+
+    p._get_curr_cid = _cid
+    asyncio.run(p._on_reset_or_new(_Ev(), "aiocqhttp:GroupMessage:g1", "reset"))
+    # 只清当前 cid；级联删除媒体文件；残留诊断按 cid 排除
+    assert calls == [
+        ("delete", "aiocqhttp:GroupMessage:g1", "cid_demo"),
+        ("files", 1),
+        ("residue", "aiocqhttp:GroupMessage:g1", "cid_demo"),
+        ("count", "aiocqhttp:GroupMessage:g1", "cid_demo"),
+    ]
+
+    # 日志必须带**完整** cid：排障时才能与记录里的 conversation_id 直接比对
+    logger_mod = sys.modules["astrbot.api"]
+    captured = []
+    orig_info, orig_debug = logger_mod.logger.info, logger_mod.logger.debug
+    logger_mod.logger.info = lambda *a, **k: captured.append(("info", a))
+    logger_mod.logger.debug = lambda *a, **k: captured.append(("debug", a))
+    try:
+        p._get_curr_cid = _cid
+        asyncio.run(p._on_reset_or_new(_Ev(), "aiocqhttp:GroupMessage:g1", "reset"))
+    finally:
+        logger_mod.logger.info, logger_mod.logger.debug = orig_info, orig_debug
+    joined = " ".join(str(args) for _, args in captured)
+    assert "cid_demo" in joined, joined
+    assert "[:" not in joined
+
+    # 残留自检命中（删除与写入交错）→ 仍然只记日志，不影响流程
+    class _ResidueDB(_DB):
+        async def count_records_in_conversation(self, umo, cid):
+            return [{"content_kind": '["event"]', "count": 3}]
+
+    p.db = _ResidueDB()
+    asyncio.run(p._on_reset_or_new(_Ev(), "aiocqhttp:GroupMessage:g1", "reset"))
+    p.db = _DB()
+
+    # /new 只记日志，不删任何记录
+    calls.clear()
+    asyncio.run(p._on_reset_or_new(_Ev(), "aiocqhttp:GroupMessage:g1", "new"))
+    assert calls == []
+
+    # cid 未就绪：不做删除（并打 WARNING，避免"reset 没反应"无从查起）
+    calls.clear()
+
+    async def _no_cid(umo):
+        return ""
+
+    p._get_curr_cid = _no_cid
+    asyncio.run(p._on_reset_or_new(_Ev(), "aiocqhttp:GroupMessage:g1", "reset"))
+    assert calls == []
+    print("[T73] reset_cleanup_and_leftover_diagnostics ✓")
+
+
+def test_schema_migration_order_and_v7_upgrade():
+    """schema v7 → v8：必须先补 deleted_at 再建索引，否则存量库加载即崩。
+
+    线上崩点：`CREATE INDEX ... (umo, deleted_at)` 排在 `ALTER TABLE ... ADD COLUMN`
+    之前 → `sqlite3.OperationalError: no such column: deleted_at`（插件加载失败）。
+    """
+    storage = storage_mod
+
+    # 1) 顺序守卫：两张表的补列语句都必须排在对应索引之前
+    statements = storage.schema_statements({"id", "umo"}, {"id", "turn_id"})
+    main_alter = next(
+        i for i, sql in enumerate(statements)
+        if sql.startswith("ALTER TABLE chat_memory_records ADD COLUMN deleted_at")
+    )
+    main_index = next(
+        i for i, sql in enumerate(statements) if "ix_cm_umo_deleted" in sql
+    )
+    tool_alter = next(
+        i for i, sql in enumerate(statements)
+        if sql.startswith("ALTER TABLE chat_memory_tool_records ADD COLUMN deleted_at")
+    )
+    tool_index = next(
+        i for i, sql in enumerate(statements) if "ix_cm_tool_deleted" in sql
+    )
+    assert main_alter < main_index, statements
+    assert tool_alter < tool_index, statements
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 2) 新库（PRAGMA 返回空集合）：建表即含新列，语句可直接执行
+        fresh = Path(tmp) / "fresh.db"
+        conn = sqlite3.connect(fresh)
+        for sql in storage.schema_statements(set(), set()):
+            conn.execute(sql)
+        conn.commit()
+        fresh_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(chat_memory_records)")
+        }
+        assert {"deleted_at", "recalled_at"} <= fresh_cols
+        conn.close()
+
+        # 3) v7 存量库（有 recalled_at、无 deleted_at）：迁移后补列 + 建索引都成功
+        legacy = Path(tmp) / "v7.db"
+        conn = sqlite3.connect(legacy)
+        for sql in storage.schema_statements(set(), set()):
+            conn.execute(sql)
+        # 先删引用该列的索引，否则 SQLite 拒绝 DROP COLUMN
+        conn.execute("DROP INDEX IF EXISTS ix_cm_umo_deleted")
+        conn.execute("DROP INDEX IF EXISTS ix_cm_tool_deleted")
+        conn.execute("ALTER TABLE chat_memory_records DROP COLUMN deleted_at")
+        conn.execute("ALTER TABLE chat_memory_tool_records DROP COLUMN deleted_at")
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+        # 反例：旧顺序（先建索引）必须失败——这正是线上那次加载失败
+        try:
+            conn.execute(
+                "CREATE INDEX ix_cm_umo_deleted ON chat_memory_records "
+                "(umo, deleted_at)"
+            )
+        except sqlite3.OperationalError as exc:
+            assert "deleted_at" in str(exc)
+        else:  # pragma: no cover - 顺序若被改回去，这里会暴露
+            raise AssertionError("缺列时建索引应当失败")
+        # 正确顺序：补列 → 建索引
+        cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(chat_memory_records)")
+        }
+        tool_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(chat_memory_tool_records)")
+        }
+        assert "deleted_at" not in cols
+        for sql in storage.schema_statements(cols, tool_cols):
+            conn.execute(sql)
+        conn.commit()
+        migrated = {
+            row[1] for row in conn.execute("PRAGMA table_info(chat_memory_records)")
+        }
+        migrated_tool = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(chat_memory_tool_records)")
+        }
+        assert "deleted_at" in migrated
+        assert "deleted_at" in migrated_tool
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert {"ix_cm_umo_deleted", "ix_cm_tool_deleted"} <= indexes
+        # 幂等：再跑一次不报错、不重复补列
+        for sql in storage.schema_statements(migrated, migrated_tool):
+            conn.execute(sql)
+        conn.commit()
+        conn.close()
+    print("[T76] schema_migration_order_and_v7_upgrade ✓")
+
+
+def test_logs_and_ids_never_truncated():
+    """静态守卫：id 一律完整，DEBUG/WARNING 文本不得再出现截断切片。"""
+    forbidden = (
+        "[:8]", "[:16]", "[:24]", "[:40]", "[:44]", "[:48]", "[:50]",
+        "[:60]", "[:100]", "[:120]", "[:200]", "[:300]", "[:400]",
+    )
+    for name in (
+        "main.py",
+        "storage.py",
+        "media_archive.py",
+        "message_classifier.py",
+        "context_builder.py",
+        "relation_codec.py",
+        "ui/repository.py",
+        "ui/web_api.py",
+    ):
+        source = (PLUGIN_DIR / name).read_text(encoding="utf-8")
+        hits = [
+            f"{name}:{index}: {line.strip()}"
+            for index, line in enumerate(source.splitlines(), 1)
+            if any(token in line for token in forbidden)
+        ]
+        assert not hits, hits
+    print("[T75] logs_and_ids_never_truncated ✓")
 
 
 def test_inject_current_turn_focus_guard_and_anchor():
@@ -2610,6 +2830,51 @@ def test_file_placeholder_carries_name_in_context():
     out3 = p._takeover_normalize([unnamed], _UMO_GROUP)
     assert out3[0]["content"].endswith("<cm_file/>")
     print("[T65] file_placeholder_carries_name_in_context ✓")
+
+
+def test_write_failure_warning_has_no_content():
+    """写库失败只记异常类型：DB 异常串里的 SQL 参数（= 正文）不进 WARNING。
+
+    SQLAlchemy 的 StatementError/IntegrityError 会把 `[parameters: (...)]`
+    拼进异常串，而写入参数就是聊天正文、工具结果与 history，故三处承载内容的
+    写路径（记录 / 工具记录 / native history）只输出异常类型。
+    """
+    p = _make_plugin()
+
+    class _FailingDb:
+        async def insert(self, *a, **k):
+            raise RuntimeError("INSERT ... [parameters: ('机密正文-LEAK',)]")
+
+        async def insert_tool_record(self, *a, **k):
+            raise RuntimeError("INSERT ... [parameters: ('机密工具结果-LEAK',)]")
+
+    class _FailingConvMgr:
+        async def update_conversation(self, *a, **k):
+            raise RuntimeError("history=[{'content': '机密历史-LEAK'}]")
+
+    p.db = _FailingDb()
+    p.context = types.SimpleNamespace(conversation_manager=_FailingConvMgr())
+
+    logger_mod = sys.modules["astrbot.api"]
+    warnings = []
+    orig_warning = logger_mod.logger.warning
+    logger_mod.logger.warning = lambda *a, **k: warnings.append(a)
+    try:
+        assert asyncio.run(
+            p._safe_insert("umo", "cid", "u1", "user", "机密正文-LEAK")
+        ) is False
+        assert asyncio.run(
+            p._safe_insert_tool("umo", "cid", "t1", 0, "tool_x", "{}", "机密工具结果-LEAK")
+        ) is False
+        assert asyncio.run(p._safe_reset_history("umo", "cid")) is None
+    finally:
+        logger_mod.logger.warning = orig_warning
+
+    joined = "\n".join(str(w[0]) for w in warnings)
+    assert len(warnings) == 3
+    assert "LEAK" not in joined and "parameters" not in joined
+    assert joined.count("RuntimeError") == 3  # 异常类型保留，便于定位形态
+    print("[T77] write_failure_warning_has_no_content ✓")
 
 
 # ── 运行 ─────────────────────────────────────────────

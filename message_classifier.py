@@ -59,7 +59,7 @@ def extract_text(event: AstrMessageEvent) -> str:
 
 
 def sanitize_file_name(name: str) -> str:
-    """只保留安全 basename：去路径、去控制字符、去非法字符、限长 120。"""
+    """只保留安全 basename：去路径、去控制字符、去非法字符、限长 255（文件系统上限）。"""
     if not name:
         return ""
     normalized = str(name).replace("\\", "/")
@@ -68,7 +68,7 @@ def sanitize_file_name(name: str) -> str:
         basename = basename.replace(char, "_")
     if basename in {"", ".", ".."}:
         return ""
-    return basename[:120]
+    return basename[:255]
 
 
 def _file_uri_to_path(uri: str) -> str:
