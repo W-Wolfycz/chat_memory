@@ -58,7 +58,7 @@ class ChatMemoryUiWebApi:
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.5.3",
+                "version": "1.5.4",
                 "read_only": True,
                 # 查询台仍只读；软删除/恢复是唯一写入口（单条记录，仅插件实时库）
                 "write_enabled": bool(self.repository.writable),

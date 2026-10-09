@@ -2,7 +2,7 @@
 
 以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
 
-当前发布版本：`1.5.3`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=7`。
+当前发布版本：`1.5.4`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=7`。
 
 ## 特性
 
@@ -282,7 +282,8 @@ CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚�
 > **模型兼容性**：整群模式会保留群聊原始消息边界，因此 contexts 中可能出现连续的 `role=user`。部分模型或 Provider 不支持这种格式；如出现请求错误，请关闭 `full_group`。
 > **隐私**：full_group 开启后，群内其他人发言及昵称会注入 LLM。时间、发送者和身份前缀属于正确归因所需的协议字段，不提供关闭选项。
 > **跨会话来源**：无来源元数据表示当前会话；`<cm_source n="N"/>` 表示其他来源，同一编号只在本次请求内有效，`<cm_source n="?"/>` 表示来源字段不足。N 不编码群聊/私聊类型、人物、时间顺序或重要性。跨会话查询的其他来源 user 历史必定属于当前 `user_id`，不再重复添加“本人”标签，也不进行猜测或跨来源归并。
-> **scope 实现**：storage 层 `_scope_filter(umo, user_id, cross_umo, full_group)` 按 4 种组合构造 WHERE — F/F=`umo+user_id`、T/F=`platform_id+user_id`、F/T=`umo`、T/T=前两者 OR。跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 保证 user/assistant 在同一 umo 内配对。空 `user_id` 不允许进入跨 UMO scope：仅 `full_group` 可降级到当前 UMO，公开 API 会进一步固定当前 CID。
+> **跨会话黑名单（`cross_session_blacklist`）**：一行一个，两种写法——**`G:<群号>`**（群聊）、**`F:<用户号>`**（私聊，填对方用户号）。**双向生效**：名单内的会话① 不作为来源出现在别的会话的记忆里（跨会话查询在 SQL 层按 `(message_type, session_id)` 排除），② 自己也读不到任何其他会话（即便 `cross_session=true` 也强制只读本会话）。群与私聊**按类型区分**——拉黑一个群不会连带同号的私聊；名单内会话**自己的同会话记忆完全不受影响**，存档与查询台手动检索也不受影响（黑名单只作用于上下文/记忆注入）。命中的会话首次使用时打一条 INFO；写错的条目在插件加载时告警并忽略（不会被静默当成通配）。
+> **scope 实现**：storage 层 `_scope_filter(umo, user_id, cross_umo, full_group, blacklist)` 按 4 种组合构造 WHERE — F/F=`umo+user_id`、T/F=`platform_id+user_id`、F/T=`umo`、T/T=前两者 OR。跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 保证 user/assistant 在同一 umo 内配对。空 `user_id` 不允许进入跨 UMO scope：仅 `full_group` 可降级到当前 UMO，公开 API 会进一步固定当前 CID。
 
 ### 状态过滤
 
@@ -428,6 +429,7 @@ AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `
 |---|---|---|---|
 | `enable` | bool | false | 总开关 |
 | `cross_session` | bool | false | 跨 umo（群私聊互通） |
+| `cross_session_blacklist` | list | `[]` | **跨会话黑名单**：`G:<群号>` / `F:<用户号>`，名单内会话不参与跨会话记忆（双向，见下） |
 | `full_group` | bool | false | 整群消息（仅群聊） |
 | `limit_rounds` | int | 30 | 注入轮数或消息数；最小按 1 处理，不限制上限（含义随状态过滤变化，见上） |
 | `max_context_chars` | int | 0 | 规整后字符预算，超出从最旧完整 user 起点裁剪；0=关闭 |

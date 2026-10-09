@@ -2215,8 +2215,8 @@ def test_takeover_event_type_filter():
     class _Db:
         async def query_rounds_raw(self, umo, cid, user_id, limit, kinds,
                                    all_match, cross_umo=False, full_group=False,
-                                   persona_id="", filter_by_persona=False,
-                                   skip_recalled=False):
+                                   blacklist=None, persona_id="",
+                                   filter_by_persona=False, skip_recalled=False):
             return [[
                 {"role": "user", "content_kind": ["event"], "content": "x",
                  "relation_data": {"event": {"type": "ban"}}},
@@ -2875,6 +2875,172 @@ def test_write_failure_warning_has_no_content():
     assert "LEAK" not in joined and "parameters" not in joined
     assert joined.count("RuntimeError") == 3  # 异常类型保留，便于定位形态
     print("[T77] write_failure_warning_has_no_content ✓")
+
+
+def test_cross_session_blacklist():
+    """跨会话黑名单：`G:<群号>` / `F:<用户号>` 的解析、匹配、SQL 边界与错误写法。
+
+    守的静默失效：① 名单写对了但不生效（别人的记忆里仍出现黑名单群的内容）；
+    ② 生效过头——把当前会话自己也排掉，导致黑名单会话**完全没有**记忆；
+    ③ 群/私聊不区分类型，拉黑一个群连累了同号的私聊。
+    """
+    parse = storage_mod.parse_blacklist_entry
+    bad = storage_mod.invalid_blacklist_entries
+    hit = storage_mod.session_blacklisted
+    excl = storage_mod.blacklist_exclusion
+    sf = storage_mod._scope_filter
+
+    # 小节：只认 G:/F:（大小写不敏感、半角冒号），其它写法一律判非法
+    assert parse("G:123456") == ("group", "123456")
+    assert parse("f:10001") == ("friend", "10001")
+    assert parse(" g:123456 ") == ("group", "123456")
+    assert parse("123456") is None and parse("BOT1:GroupMessage:123") is None
+    assert parse("G：123456") is None and parse("G:") is None and parse("G:1:2") is None
+    assert parse("X:1") is None, "只认 G/F 两种前缀（其它前缀不得被当成私聊）"
+    assert parse("G:１２３") is None and parse("G:1 2") is None, (
+        "非 ASCII / 带空格的 id 永远匹配不上真实会话号 → 判成写错并告警"
+    )
+    assert bad(["G:1", "123456", "BOT1:", "F:2"]) == ["123456", "BOT1:"]
+    # 配置写成裸字符串时按**一条**处理（否则会被逐字符拆开）
+    assert storage_mod.normalize_session_blacklist("G:1") == ["G:1"]
+    assert bad("G:1") == [] and bad({"G": 1}) == ["{'G': 1}"]
+    assert storage_mod.normalize_session_blacklist(
+        ["G:1", "123456", "G:1", "F:2"]
+    ) == ["G:1", "F:2"]
+
+    # 小节：群/私聊按类型分别命中（同号不互相牵连）
+    group_umo = "BOT1:GroupMessage:123456789"
+    friend_umo = "BOT1:FriendMessage:123456789"
+    assert hit(group_umo, ["G:123456789"]) is True
+    assert hit(friend_umo, ["G:123456789"]) is False, "拉黑群不得连带同号私聊"
+    assert hit(friend_umo, ["F:123456789"]) is True
+    assert hit(group_umo, ["F:123456789"]) is False
+    assert hit(group_umo, ["G:987654321"]) is False
+    assert hit(group_umo, []) is False and hit("", ["G:1"]) is False
+    assert hit(group_umo, ["BOT1:GroupMessage:123456789", "123456789"]) is False, (
+        "旧写法已不认（加载时会告警），不得当成命中"
+    )
+
+    # 小节：SQL 片段——类型与会话号一起比，参数按 G/F 分开
+    cond, params = excl(["G:123", "F:456"])
+    assert cond == ("NOT ((message_type = 'GroupMessage' AND session_id = :blk_g_0) "
+                    "OR (message_type = 'FriendMessage' AND session_id = :blk_f_1))")
+    assert params == {"blk_g_0": "123", "blk_f_1": "456"}
+    assert excl(["不是名单"]) == ("", {}), "非法条目不进 SQL（不会意外放大范围）"
+    assert excl([]) == ("", {})
+
+    # 小节：只在跨 umo 时排除（非跨会话查询只覆盖当前会话，排掉自己会让记忆变空）
+    plain, _ = sf(group_umo, "u1", False, False, ["G:123456789"])
+    assert plain == "umo = :scope_umo AND user_id = :scope_uid"
+    full, _ = sf(group_umo, "u1", False, True, ["G:123456789"])
+    assert full == "umo = :scope_umo"
+    # 名单里是**别人**的会话 → 真的加排除
+    cross, cross_params = sf(group_umo, "u1", True, False, ["G:987654321"])
+    assert "NOT ((message_type = 'GroupMessage' AND session_id = :blk_g_0))" in cross
+    assert cross_params["blk_g_0"] == "987654321"
+    mixed, mixed_params = sf(group_umo, "u1", True, True, ["F:10001"])
+    assert "session_id = :blk_f_0" in mixed
+    assert mixed_params["scope_umo"] == group_umo and mixed_params["blk_f_0"] == "10001"
+    # 名单里是**自己** → 整个 scope 降级为"只覆盖自己"（即便调用方传了 cross_umo=True），
+    # 既不会把自己的记忆排空，也不会放进别的会话
+    self_cond, self_params = sf(group_umo, "u1", True, False, ["G:123456789"])
+    assert self_cond == "umo = :scope_umo AND user_id = :scope_uid", self_cond
+    assert self_params == {"scope_umo": group_umo, "scope_uid": "u1"}
+    self_full, _ = sf(group_umo, "u1", True, True, ["G:123456789"])
+    assert self_full == "umo = :scope_umo", "同会话整群仍然保留"
+    # 单条展开时也不把"自己"写进排除条件（双保险）
+    assert excl(["G:123456789"], current_umo=group_umo) == ("", {})
+    # 没有名单时行为与从前完全一致（老配置不受影响）
+    assert sf(group_umo, "u1", True, False, [])[0] == sf(group_umo, "u1", True, False)[0]
+    print("[T78] cross_session_blacklist ✓")
+
+
+def test_blacklist_invalid_entries_warn_on_load():
+    """加载时非法条目必须逐条 WARNING（写错的名单等于没有名单）。
+
+    守的静默失效：用户以为拉黑了某群，实际条目格式错、被丢掉且毫无提示。
+    """
+    p = _make_plugin()
+    logger_mod = sys.modules["astrbot.api"]
+    warnings: list[str] = []
+    orig_warning = logger_mod.logger.warning
+    logger_mod.logger.warning = lambda *a, **k: warnings.append(str(a[0]))
+    try:
+        assert p._warn_invalid_blacklist(["G:1", "F:2"]) == 0, "合法条目不得告警"
+        assert warnings == []
+        n = p._warn_invalid_blacklist(["G:1", "裸号", "BOT1:GroupMessage:1"])
+        assert n == 2, n
+        assert len(warnings) == 3, warnings           # 1 条汇总 + 逐条明细
+        assert "有 2 条写法不对" in warnings[0] and "G:<群号> 或 F:<用户号>" in warnings[0]
+        assert any("裸号" in w for w in warnings[1:]), warnings
+        assert any("BOT1:GroupMessage:1" in w for w in warnings[1:]), warnings
+    finally:
+        logger_mod.logger.warning = orig_warning
+    print("[T81] blacklist_invalid_entries_warn_on_load ✓")
+
+
+def test_cross_session_blacklist_takeover_wiring():
+    """黑名单接到 takeover 查询链上：当前会话在名单里 → 强制只读本会话。
+
+    守的静默失效：配置项被默默忽略（名单内会话仍读到别人的记忆）。
+    """
+    eff = storage_mod.effective_cross_session
+    umo = "aiocqhttp:GroupMessage:g1"
+    assert eff(True, umo, ["G:g1"]) is False, "名单内会话不得跨会话读"
+    assert eff(True, umo, ["F:g1"]) is True, "私聊名单不影响群聊"
+    assert eff(True, "aiocqhttp:FriendMessage:g1", ["F:g1"]) is False
+    assert eff(True, umo, []) is True
+    assert eff(False, umo, []) is False, "黑名单只做减法，不会把没开的开关打开"
+    assert eff(True, umo, [], force_current_session=True) is False
+
+    p = _make_plugin()
+    p.ct_enable = True
+    p.ct_cross_session = True
+    p.ct_cross_session_blacklist = ["G:g1", "F:10001"]
+    p.ct_limit_rounds = 5
+    p.ct_llm_status_filter = {"llm_success"}
+
+    # ① 普通会话（自己不在名单里）：照样跨会话，并把名单原样交给 storage 层（来源侧排除）
+    other = "aiocqhttp:GroupMessage:g3"
+    db = _FakeDB(rounds=[[_rec(content="甲的发言")]])
+    p.db = db
+    asyncio.run(p.build_takeover_contexts(other, "u1", "cid_demo"))
+    assert db.last_kwargs.get("cross_umo") is True
+    assert db.last_kwargs.get("blacklist") == ["G:g1", "F:10001"], db.last_kwargs
+
+    # ② 名单内会话：只读本会话——cross_umo=False、目标 CID 落回当前 CID（不是 None）
+    db2 = _FakeDB(rounds=[[_rec(content="自己的发言")]])
+    p.db = db2
+    asyncio.run(p.build_takeover_contexts(umo, "u1", "cid_demo"))
+    assert db2.last_kwargs.get("cross_umo") is False, db2.last_kwargs
+    assert db2.last_kwargs.get("blacklist") == ["G:g1", "F:10001"]
+
+    # 命中名单必须真的打日志（且每会话只一次、不带正文）——只查内部 set 是假断言
+    logger_mod = sys.modules["astrbot.api"]
+    infos: list[str] = []
+    orig_info = logger_mod.logger.info
+    logger_mod.logger.info = lambda *a, **k: infos.append(str(a[0]))
+    try:
+        fresh = _make_plugin()          # 干净的实例：noted 集合不含这条会话
+        fresh.ct_enable = True
+        fresh.ct_cross_session = True
+        fresh.ct_cross_session_blacklist = ["G:g1"]
+        fresh.ct_limit_rounds = 5
+        fresh.ct_llm_status_filter = {"llm_success"}
+        fresh.db = _FakeDB(rounds=[[_rec(content="自己的发言")]])
+        asyncio.run(fresh.build_takeover_contexts(umo, "u1", "cid_demo"))
+        assert len(infos) == 1, infos
+        assert "跨会话黑名单" in infos[0] and umo in infos[0]
+        assert "自己的发言" not in infos[0], "INFO 不得含聊天正文"
+        asyncio.run(fresh.build_takeover_contexts(umo, "u1", "cid_demo"))
+        assert len(infos) == 1, "同一会话不得重复刷屏"
+        # 公开 API 的空 user_id 降级路径也要能看到这条提示（两件事互不掩盖）
+        fresh.ct_full_group = True
+        asyncio.run(fresh.build_takeover_contexts(umo, "", "cid_demo"))
+        assert len(infos) == 1, "同一会话仍只提示一次"
+    finally:
+        logger_mod.logger.info = orig_info
+    print("[T79] cross_session_blacklist_takeover_wiring ✓")
 
 
 # ── 运行 ─────────────────────────────────────────────

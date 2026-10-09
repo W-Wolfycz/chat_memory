@@ -36,7 +36,13 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import Plain
 from astrbot.core.agent.message import TextPart
 
-from .storage import DBManager
+from .storage import (
+    DBManager,
+    effective_cross_session,
+    invalid_blacklist_entries,
+    normalize_session_blacklist,
+    session_blacklisted,
+)
 from .media_archive import MediaArchiver
 from .ui.repository import ChatMemoryRepository
 from .ui.web_api import ChatMemoryUiWebApi
@@ -112,6 +118,13 @@ class ChatMemoryPlugin(Star):
         self.ct_enable = bool(ct_conf.get("enable", False))
         self.ct_cross_session = bool(ct_conf.get("cross_session", False))
         self.ct_full_group = bool(ct_conf.get("full_group", False))
+        # 跨会话黑名单（双向生效）：名单内的会话不参与跨会话记忆——既不作为来源出现在
+        # 别人的记忆里，自己也读不到任何其他会话；它们自己的同会话记忆不受影响。
+        self.ct_cross_session_blacklist = normalize_session_blacklist(
+            ct_conf.get("cross_session_blacklist", [])
+        )
+        self._warn_invalid_blacklist(ct_conf.get("cross_session_blacklist", []))
+        self._blacklist_noted: set[str] = set()
         # 只钳下限：避免负数触发 SQLite LIMIT -1（等价于不限制）；上限交给用户决定。
         self.ct_limit_rounds = max(1, int(ct_conf.get("limit_rounds", 30)))
         self.ct_max_context_chars = max(0, int(ct_conf.get("max_context_chars", 0)))
@@ -1433,6 +1446,50 @@ class ChatMemoryPlugin(Star):
             await self._safe_reset_history(umo, cid)
         logger.debug(f"{self._log_prefix(event)} 严格接管 contexts=0：{reason}")
 
+    def _warn_invalid_blacklist(self, entries) -> int:
+        """非法黑名单条目逐条 WARNING（返回告警条数）。
+
+        写错的名单等于没有名单：用户以为拉黑了某群、实际条目被判非法丢弃，必须可见。
+        逐条输出（不截断条目本身），格式提示只打一次。
+        """
+        bad = invalid_blacklist_entries(entries)
+        if not bad:
+            return 0
+        logger.warning(
+            f"{self._log_prefix()} 跨会话黑名单有 {len(bad)} 条写法不对，已忽略；"
+            f"格式：G:<群号> 或 F:<用户号>"
+        )
+        for item in bad:
+            logger.warning(
+                f"{self._log_prefix()} 跨会话黑名单条目无效（已忽略）：{item}"
+            )
+        return len(bad)
+
+    def _blacklist_entries(self) -> list[str]:
+        """跨会话黑名单（懒取：__init__ 之外构造的实例也不会炸）。"""
+        return list(getattr(self, "ct_cross_session_blacklist", None) or [])
+
+    def _note_blacklisted_session(self, umo: str) -> None:
+        """黑名单会话只提示一次：让"为什么这条会话没有跨会话记忆"在日志里可见。"""
+        noted = getattr(self, "_blacklist_noted", None)
+        if noted is None:
+            noted = set()
+            self._blacklist_noted = noted
+        if umo in noted:
+            return
+        noted.add(umo)
+        # INFO 只放事件与 id（不放正文），带 platform 段与完整 umo 便于定位
+        platform_id = umo.split(":", 1)[0] if ":" in umo else ""
+        prefix = (
+            f"[ChatMemory:{platform_id}]"
+            if self.log_with_bot_id and platform_id
+            else "[ChatMemory]"
+        )
+        logger.info(
+            f"{prefix} 会话在跨会话黑名单内，本次只使用本会话记忆: {umo}"
+            f"（名单 {len(self._blacklist_entries())} 项）"
+        )
+
     async def _takeover_query(
         self,
         umo: str,
@@ -1472,9 +1529,19 @@ class ChatMemoryPlugin(Star):
 
         # cross_session：跨 CID（cid=None）+ 跨 umo（cross_umo=True）
         # 跨 umo 按 platform_id + user_id 聚合，实现群私聊互通
-        effective_cross_session = self.ct_cross_session and not force_current_session
-        target_cid: Optional[str] = None if effective_cross_session else cid
-        cross_umo = effective_cross_session
+        # 黑名单**双向**生效：名单内的会话不参与跨会话记忆——即便开了 cross_session，
+        # 也只读本会话（同 CID）的记录；同时它也不会作为来源出现在别人的记忆里（由
+        # storage 层的 scope 排除保证）。
+        cross_read = effective_cross_session(
+            self.ct_cross_session,
+            umo,
+            self._blacklist_entries(),
+            force_current_session=force_current_session,
+        )
+        if session_blacklisted(umo, self._blacklist_entries()):
+            self._note_blacklisted_session(umo)
+        target_cid: Optional[str] = None if cross_read else cid
+        cross_umo = cross_read
 
         try:
             if is_pair_only:
@@ -1483,6 +1550,7 @@ class ChatMemoryPlugin(Star):
                 rounds = await self.db.query_rounds_raw(
                     umo, target_cid, user_id, limit, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
+                    blacklist=self._blacklist_entries(),
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
                     skip_recalled=self.ct_recall_skip_context,
                 )
@@ -1494,6 +1562,7 @@ class ChatMemoryPlugin(Star):
                 records = await self.db.query_messages_raw(
                     umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
+                    blacklist=self._blacklist_entries(),
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
                     exclude_turn_id=exclude_turn_id or None,
                     skip_recalled=self.ct_recall_skip_context,
@@ -2102,7 +2171,12 @@ class ChatMemoryPlugin(Star):
             max_chars=self.ct_max_context_chars,
             current_user_id=user_id,
             full_group=effective_full_group,
-            cross_session=self.ct_cross_session and bool(user_id),
+            cross_session=effective_cross_session(
+                self.ct_cross_session,
+                umo,
+                self._blacklist_entries(),
+                force_current_session=not bool(user_id),
+            ),
             paired_rounds=not mixed_mode,
             target_map=target_map,
         )

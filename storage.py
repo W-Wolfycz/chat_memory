@@ -1271,6 +1271,7 @@ class DBManager:
         persona_id: Optional[str] = None,
         filter_by_persona: bool = False,
         skip_recalled: bool = False,
+        blacklist: Optional[list[str]] = None,
     ) -> list[list[dict]]:
         """内部方法：配对模式查询（takeover 专用）。
 
@@ -1299,7 +1300,9 @@ class DBManager:
         """
         await self.init_db()
         async with self.async_session() as session:
-            scope_cond, scope_param = _scope_filter(umo, user_id, cross_umo, full_group)
+            scope_cond, scope_param = _scope_filter(
+                umo, user_id, cross_umo, full_group, blacklist
+            )
             # EXISTS 子查：cid 非空时加 conversation_id 条件（防跨 cid 误配对）；
             # cid=None（cross_session）时不加，允许跨 cid 配对
             exists_parts = [
@@ -1442,6 +1445,7 @@ class DBManager:
         filter_by_persona: bool = False,
         exclude_turn_id: Optional[str] = None,
         skip_recalled: bool = False,
+        blacklist: Optional[list[str]] = None,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
@@ -1466,7 +1470,9 @@ class DBManager:
         """
         await self.init_db()
         async with self.async_session() as session:
-            scope_cond, scope_param = _scope_filter(umo, user_id, cross_umo, full_group)
+            scope_cond, scope_param = _scope_filter(
+                umo, user_id, cross_umo, full_group, blacklist
+            )
             conditions = [
                 scope_cond,
                 "role IN ('user', 'assistant')",
@@ -1540,11 +1546,154 @@ def _normalize_dt(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
+def parse_blacklist_entry(entry) -> Optional[tuple[str, str]]:
+    """解析一条黑名单配置：``G:<群号>`` / ``F:<用户号>`` → ``("group"|"friend", id)``。
+
+    只认这两种写法（大小写不敏感，冒号必须半角）：
+
+    - ``G:123456789`` —— 群聊会话（``message_type='GroupMessage'``）
+    - ``F:123456789`` —— 私聊会话（``message_type='FriendMessage'``，id 是对方用户号）
+
+    其它写法一律返回 ``None``（调用方负责提示，别让"写错的名单"变成静默失效）。
+    与前缀一起看，标识的是**会话本身**、与实例无关：同一群在不同平台实例下都命中。
+    """
+    raw = str(entry or "").strip()
+    if len(raw) < 3 or raw[1] != ":":
+        return None
+    kind = raw[0].lower()
+    value = raw[2:].strip()
+    if kind not in ("g", "f") or not value or ":" in value:
+        return None
+    # 只接受 ASCII 且不含空白的 id：全角数字（１２３）、内嵌空格这类写法永远匹配不上
+    # 真实会话号，判成"写错"并告警，而不是留下一个静默失效的名单条目。
+    if not value.isascii() or any(ch.isspace() for ch in value):
+        return None
+    return ("group" if kind == "g" else "friend", value)
+
+
+def _blacklist_items(entries) -> list[str]:
+    """把配置值摊平成待解析的字符串条目。
+
+    只接受 list / tuple / 单条字符串：写成裸字符串时按**一条**处理（否则会被逐字符拆开，
+    告警里出现一堆单字符）；其余类型（数字、dict…）按一条非法值处理，交给告警去说。
+    """
+    if entries is None or entries == "":
+        return []
+    if isinstance(entries, str):
+        return [entries]
+    if isinstance(entries, (list, tuple)):
+        return [str(x) for x in entries if x is not None and str(x).strip()]
+    return [str(entries)]
+
+
+def normalize_session_blacklist(entries) -> list[str]:
+    """把配置值归一化成去重后的**合法**条目（去空白、丢空串/非字符串/解析失败的）。
+
+    黑名单是"跨会话记忆"的**边界**：它同时决定"别人的记忆里不出现这些会话"和
+    "这些会话看不到别人的记忆"，所以只接受 ``G:<群号>`` / ``F:<用户号>``；写错的条目
+    由调用方（插件加载时）列出并告警——被静默忽略的名单等于没有名单。
+    """
+    out: list[str] = []
+    for raw in _blacklist_items(entries):
+        item = raw.strip()
+        if item and item not in out and parse_blacklist_entry(item) is not None:
+            out.append(item)
+    return out
+
+
+def invalid_blacklist_entries(entries) -> list[str]:
+    """列出写错的条目（供加载时告警用；空列表表示配置没问题）。"""
+    bad: list[str] = []
+    for raw in _blacklist_items(entries):
+        if raw.strip() and parse_blacklist_entry(raw) is None:
+            bad.append(raw.strip())
+    return bad
+
+
+def session_key(umo: str) -> Optional[tuple[str, str]]:
+    """UMO → ``("group"|"friend", 会话号)``；形态不对返回 ``None``。
+
+    只认 AstrBot 的 ``{platform_id}:{message_type}:{session_id}``：``GroupMessage`` 归
+    ``group``、``FriendMessage`` 归 ``friend``，其余类型不参与黑名单匹配。
+    """
+    parts = str(umo or "").split(":", 2)
+    if len(parts) != 3 or not parts[2]:
+        return None
+    message_type, session_id = parts[1], parts[2]
+    if message_type == "GroupMessage":
+        return ("group", session_id)
+    if message_type == "FriendMessage":
+        return ("friend", session_id)
+    return None
+
+
+def session_blacklisted(umo: str, entries) -> bool:
+    """这个会话是否在跨会话黑名单里（纯函数，读取侧与查询侧共用）。
+
+    UMO 形如 ``{platform_id}:{message_type}:{session_id}``：``G:`` 只对
+    ``GroupMessage`` 生效、``F:`` 只对 ``FriendMessage`` 生效（私聊与群聊的 id 空间不同，
+    不区分类型就会出现"拉黑一个群，结果把同号的私聊也拉了"）。
+    """
+    key = session_key(umo)
+    if key is None:
+        return False
+    return any(
+        parse_blacklist_entry(item) == key
+        for item in normalize_session_blacklist(entries)
+    )
+
+
+def effective_cross_session(
+    cross_session: bool,
+    umo: str,
+    entries,
+    *,
+    force_current_session: bool = False,
+) -> bool:
+    """当前会话**实际**是否跨会话读取：黑名单内的会话强制只读本会话。
+
+    ``force_current_session``（公开 API 在缺少 user_id 时的降级）优先于配置；
+    黑名单只做减法——它永远不会把没开跨会话的会话变成跨会话。
+    """
+    if not cross_session or force_current_session:
+        return False
+    return not session_blacklisted(umo, entries)
+
+
+def blacklist_exclusion(entries, *, current_umo: str = "") -> tuple[str, dict]:
+    """构造"排除黑名单会话"的 SQL 片段 ``(条件, 绑定参数)``；没有条目时返回空串。
+
+    逐条展开成 ``(message_type = 'GroupMessage' AND session_id = :blk_g_i)`` 或
+    ``(message_type = 'FriendMessage' AND session_id = :blk_f_i)``——**类型与会话号一起比**，
+    所以拉黑一个群不会连带同号的私聊。
+
+    只在**跨 umo 查询**里使用；``current_umo`` 命中的条目会被跳过——名单内的会话即便
+    被谁用 ``cross_umo=True`` 直接查，也必须仍能看到**自己**的记录（排除自己是把记忆排空，
+    不是"不参与跨会话"）。非跨会话查询只覆盖当前会话，同样不需要排除。
+    """
+    current = session_key(current_umo)
+    conds: list[str] = []
+    params: dict = {}
+    for i, item in enumerate(normalize_session_blacklist(entries)):
+        parsed = parse_blacklist_entry(item)
+        if parsed is None or parsed == current:
+            continue
+        kind, value = parsed
+        column = "blk_g" if kind == "group" else "blk_f"
+        mtype = "GroupMessage" if kind == "group" else "FriendMessage"
+        conds.append(f"(message_type = '{mtype}' AND session_id = :{column}_{i})")
+        params[f"{column}_{i}"] = value
+    if not conds:
+        return "", {}
+    return "NOT (" + " OR ".join(conds) + ")", params
+
+
 def _scope_filter(
     umo: str,
     user_id: Optional[str],
     cross_umo: bool,
     full_group: bool,
+    blacklist: Optional[list[str]] = None,
 ) -> tuple[str, dict]:
     """构造 takeover scope 的 WHERE 条件 + 绑定参数。
 
@@ -1561,7 +1710,18 @@ def _scope_filter(
 
     ``user_id`` 为空时禁止进入跨 UMO scope：仅 ``full_group=True`` 可降级为当前 UMO，
     其他组合返回恒假条件。公开 API 还会进一步把该场景限制在当前 CID。
+
+    ``blacklist``：跨会话黑名单（``G:<群号>`` / ``F:<用户号>``）。**只在跨 umo 时生效**——
+    名单里的会话不作为来源出现在别人的记忆里；名单内的会话自己也读不到别人（那一步由调用方
+    用 ``effective_cross_session`` 强制关掉 cross_session）。非跨会话查询只覆盖当前会话，
+    排掉它自己会让整段记忆变空。
     """
+    # 名单内的会话**只覆盖自己**：即便调用方传了 cross_umo=True（例如第三方直接查），
+    # 也不允许它读到别的会话——把它降级成非跨 umo（full_group 同会话整群仍照旧）。
+    # 插件路径另有 effective_cross_session 先关一次，这里是对 storage 层的兜底。
+    if cross_umo and session_blacklisted(umo, blacklist):
+        cross_umo = False
+
     user_id = str(user_id or "").strip()
     pid = umo.split(":", 1)[0] if umo else ""
     has_uid = bool(user_id)
@@ -1571,16 +1731,25 @@ def _scope_filter(
             return "umo = :scope_umo", {"scope_umo": umo}
         return "1 = 0", {}
 
+    def _with_blacklist(cond: str, params: dict) -> tuple[str, dict]:
+        """跨 umo 时追加黑名单排除；非跨 umo 原样返回。"""
+        if not cross_umo:
+            return cond, params
+        excl, excl_params = blacklist_exclusion(blacklist, current_umo=umo)
+        if not excl:
+            return cond, params
+        return f"({cond}) AND {excl}", {**params, **excl_params}
+
     if cross_umo and full_group:
         cond = (
             "((umo = :scope_umo) "
             "OR (platform_id = :scope_pid AND umo != :scope_umo "
             "AND user_id = :scope_uid))"
         )
-        return cond, {"scope_umo": umo, "scope_pid": pid, "scope_uid": user_id}
+        return _with_blacklist(cond, {"scope_umo": umo, "scope_pid": pid, "scope_uid": user_id})
 
     if cross_umo:
-        return (
+        return _with_blacklist(
             "platform_id = :scope_pid AND user_id = :scope_uid",
             {"scope_pid": pid, "scope_uid": user_id},
         )
