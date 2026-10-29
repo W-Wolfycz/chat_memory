@@ -3,60 +3,72 @@
     "description": "单条记录最大字符数",
     "type": "int",
     "default": 0,
-    "hint": "0 表示不限制；设置为正数时，超长文本会按字符数截断存储。"
+    "hint": "0 = 不限制；正数时超长文本按字符截断后存储。"
   },
   "auto_cleanup_days": {
     "description": "自动清理天数",
     "type": "int",
     "default": 0,
-    "hint": "自动删除超过此天数的记录。0 表示不清理。"
+    "hint": "删除超过此天数的记录；0 = 不清理。"
   },
   "log_with_bot_id": {
     "description": "日志区分机器人实例",
     "type": "bool",
     "default": false,
-    "hint": "启用后日志前缀附加机器人实例 ID，多 Bot 环境便于定位。日志等级请到 WebUI 插件详情页调整（运行期生效，无需重启）。"
+    "hint": "日志前缀附加实例 ID，多 Bot 环境便于定位；日志等级在 WebUI 插件详情页调整。"
+  },
+  "shadow_read": {
+    "description": "读取改用合并存储（切读）",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后接管上下文与公开查询 API 都读合并存储（模型看到的是实际发出的分段拼接）；双写起点＝本版首次加载那一刻，跑满 7 天才生效（重启/重载不重置），读失败自动回退旧表。"
+  },
+  "sent_capture_history": {
+    "description": "发送后拉群历史（兜底通道）",
+    "type": "bool",
+    "default": false,
+    "hint": "只在自身消息回显不可用时兜底（满效率前提是 NapCat 上报自身消息，reportSelfMessage）：发送后调 get_group_msg_history 把自己刚发的补回来，写的是同一条平台行（存在即丢弃）；接口不支持时告警一次并永久停用。"
   },
   "context_takeover": {
     "description": "上下文接管",
     "type": "object",
-    "hint": "使用 ChatMemory 记录替换 LLM 的历史上下文。",
+    "hint": "用 ChatMemory 记录替换 LLM 的历史上下文。",
     "items": {
       "enable": {
         "description": "启用接管",
         "type": "bool",
         "default": false,
-        "hint": "总开关。关闭后仅存档，不干预 LLM 请求。"
+        "hint": "总开关；关闭后仅存档，不干预 LLM 请求。"
       },
       "cross_session": {
         "description": "跨会话目标（群私聊互通）",
         "type": "bool",
         "default": false,
-        "hint": "同一用户在其他群聊和私聊中的记录也进入当前上下文。与整群消息同时开启时，其他会话仍只取当前用户。"
+        "hint": "同一用户在其他群聊/私聊的记录也进入当前上下文；与整群同开时，其他会话仍只取该用户。"
       },
       "cross_session_blacklist": {
         "description": "跨会话黑名单",
         "type": "list",
         "default": [],
-        "hint": "跨会话时排除这些会话，一行一个，写成 G:<群号> 或 F:<用户号>（群与私聊分开匹配）；双向生效：它不进入别人的上下文，自己也读不到其他会话，同会话记忆不受影响。写错的条目会在加载时告警并忽略。"
+        "hint": "一行一个，写成 G:<群号> 或 F:<用户号>（群与私聊分开匹配）；双向生效：它不进入别人的上下文，自己也读不到其他会话，同会话记忆不受影响。写错的条目在加载时告警并忽略。"
       },
       "full_group": {
         "description": "整群消息",
         "type": "bool",
         "default": false,
-        "hint": "群内其他成员的消息也会进入模型上下文；私聊中无效。部分模型可能不支持整群模式使用的连续 user 消息，如出现请求错误请关闭此项。"
+        "hint": "群内其他成员的消息也进入上下文（私聊无效）；模型报错时关闭此项。"
       },
       "limit_rounds": {
         "description": "注入轮数/消息数",
         "type": "int",
         "default": 30,
-        "hint": "仅选择 llm_success 时按轮数计算，否则按消息数计算。最小为 1，不限制上限。"
+        "hint": "仅选 llm_success 时按轮数计算，否则按消息数；最小 1。"
       },
       "max_context_chars": {
         "description": "上下文字符预算",
         "type": "int",
         "default": 0,
-        "hint": "上下文最大字符数；0 表示不限制，超出时从最旧内容开始裁剪。"
+        "hint": "0 = 不限制；超出时从最旧内容开始裁剪。"
       },
       "llm_status_filter": {
         "description": "状态过滤",
@@ -71,7 +83,7 @@
         "default": [
           "llm_success"
         ],
-        "hint": "选择允许进入上下文的消息状态；默认仅使用成功配对。"
+        "hint": "允许进入上下文的消息状态；默认仅成功配对。"
       },
       "include_content_kinds": {
         "description": "内容白名单",
@@ -82,6 +94,7 @@
           "video",
           "voice",
           "emoji",
+          "poke",
           "file",
           "forward",
           "event"
@@ -89,7 +102,7 @@
         "default": [
           "text"
         ],
-        "hint": "只注入选中的 content_kind（与存储值一一对应）：text/image/video/voice/emoji/file/forward/event；清空表示不过滤。混合消息由“全部命中”控制。"
+        "hint": "只注入选中的类型；清空 = 不过滤。混合消息是否要求全部命中，由「全部命中」决定。"
       },
       "event_kinds": {
         "description": "事件子类",
@@ -114,74 +127,74 @@
           "reaction",
           "system"
         ],
-        "hint": "事件子类（relation_data.event.type）：白名单放行 event 时生效（白名单为空=不过滤时同样生效）；清空 = 不按子类过滤（全部放行）。"
+        "hint": "事件子类白名单；清空 = 不按子类过滤。"
       },
       "recall_skip_context": {
         "description": "撤回消息跳过上下文",
         "type": "bool",
         "default": false,
-        "hint": "开启后：被撤回的消息与被撤回事件（<cm_event type=\"recall\">）都不再进入 LLM 上下文；查询台仍可查看（标记「已撤回」）。"
+        "hint": "被撤回的消息与撤回事件都不进上下文；查询台仍可查看（标「已撤回」）。"
       },
       "include_all_match": {
         "description": "全部命中（ALL 模式）",
         "type": "bool",
         "default": false,
-        "hint": "关闭时命中任一类型即可；开启时消息中的全部类型都必须在白名单内。"
+        "hint": "开启时消息的全部类型都须在白名单内，否则命中任一即可。"
       },
       "clear_native_history": {
         "description": "清理原生历史",
         "type": "bool",
         "default": true,
-        "hint": "接管后清空 AstrBot 原生历史，避免上下文重复。建议保持开启。"
+        "hint": "接管后清空 AstrBot 原生历史，避免上下文重复；建议保持开启。"
       },
       "fallback_to_native_on_empty": {
         "description": "空结果时回退原生历史",
         "type": "bool",
         "default": false,
-        "hint": "关闭时空结果会清空上下文；开启时保留 AstrBot 原生历史。"
+        "hint": "关闭时空结果会清空上下文；开启则保留原生历史。"
       },
       "filter_by_persona": {
         "description": "按 persona 隔离",
         "type": "bool",
         "default": false,
-        "hint": "只使用当前 persona 的记录；空 persona 只匹配未标记 persona 的旧记录。跨 /new 查询需同时开启跨会话目标。"
+        "hint": "只用当前 persona 的记录；空 persona 匹配未标记的旧记录。跨 /new 查询需同时开启「跨会话目标」。"
       },
       "keep_tool_turns": {
         "description": "工具上下文保留轮数",
         "type": "int",
         "default": 2,
-        "hint": "接管时回放 CM 库中最近 N 个轮次的 LLM 工具调用（assistant tool_calls + role=tool），让 LLM 跨轮看到工具返回，避免重复调用工具。0 = 不回放工具调用。"
+        "hint": "回放最近 N 轮的工具调用（tool_calls + tool 返回），避免重复调用；0 = 不回放。"
       }
     }
   },
   "media_archive": {
     "description": "媒体归档",
     "type": "object",
-    "hint": "把 user 侧媒体（图片/语音/视频/文件）落盘到插件数据目录，供 ChatMemory UI 回看。异步下载不阻塞消息处理；失败不影响存档。",
+    "hint": "user 侧媒体（图片/语音/视频/文件）落盘到插件数据目录，供查询台回看；异步下载，失败不影响存档。",
     "items": {
       "enabled": {
         "description": "启用媒体归档",
         "type": "bool",
         "default": true,
-        "hint": "总开关。关闭时只存媒体元信息（文件名等），不落盘。"
+        "hint": "关闭时只存媒体元信息（文件名等），不落盘。"
       },
       "include_video": {
         "description": "归档视频",
         "type": "bool",
         "default": false,
-        "hint": "视频体积大、下载久，默认关闭；开启后单文件上限 200MB。"
+        "hint": "视频体积大、下载久，默认关闭；单文件上限 200MB。"
       },
       "retention_days": {
         "description": "保留天数",
         "type": "int",
         "default": 30,
-        "hint": "超过此天数的媒体文件与归档记录将被清理。最小 1 天。"
+        "hint": "超期的媒体文件与归档记录会被清理；最小 1 天。"
       },
       "max_total_mb": {
         "description": "总量上限（MB）",
         "type": "int",
         "default": 2048,
-        "hint": "媒体总量超过该上限时从最旧开始删除。最小 64MB。"
+        "hint": "超过上限时从最旧开始删除；最小 64MB。"
       }
     }
   }

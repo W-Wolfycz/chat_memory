@@ -25,7 +25,7 @@
         </div>
         <div>
           <div class="brand-title">ChatMemory</div>
-          <div class="brand-subtitle">只读查询台</div>
+          <div class="brand-subtitle">聊天归档查询台</div>
         </div>
       </div>
 
@@ -60,6 +60,10 @@
           <button type="button" class="readonly-pill" id="mode-toggle" title="点击进入删除模式：可对单条记录做软删除/恢复（仅插件实时库开放）">
             <svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
             <span id="mode-toggle-label">只读模式</span>
+          </button>
+          <button type="button" class="readonly-pill" id="advanced-toggle" title="高级只读模式：选一个 persona，为每条消息额外显示轮次与状态（只读）">
+            <svg viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15v-4"/><path d="M13 15V7"/><path d="M18 15v-6"/></svg>
+            <span id="advanced-toggle-label">高级模式</span>
           </button>
           <button class="secondary-button" id="export-button" title="导出一致快照（不阻塞查询）">
             导出快照
@@ -124,7 +128,7 @@
               <div class="panel-heading">
                 <div>
                   <h2>近 30 天写入</h2>
-                  <p>按 UTC 入库日期统计</p>
+                  <p>按插件时区的入库日期统计</p>
                 </div>
                 <span class="panel-note" id="activity-total">—</span>
               </div>
@@ -184,28 +188,24 @@
                 </button>
               </div>
 
+              <div class="filters-grid advanced-only hidden" id="advanced-filters">
+                <label class="field"><span>Persona（高级模式必选）</span><select id="filter-persona"><option value="">请选择 persona</option></select></label>
+                <label class="field"><span>角色</span><select id="filter-persona-role"><option value="">user + assistant</option><option value="user">user</option><option value="assistant">assistant</option></select></label>
+                <label class="field"><span>该轮 LLM 状态</span><select id="filter-persona-status"><option value="__all__">all</option><option value="__empty__">no_llm</option><option value="llm_success">llm_success</option><option value="llm_pending">llm_pending</option><option value="proactive">proactive</option><option value="orphan">orphan</option></select></label>
+                <label class="field"><span>配对</span><select id="filter-paired-only"><option value="">all</option><option value="1">仅看配对</option></select></label>
+              </div>
               <div class="filters-grid">
-                <label class="field"><span>会话来源 UMO</span><select id="filter-umo"><option value="">全部 UMO</option></select></label>
-                <label class="field"><span>Conversation ID</span><select id="filter-conversation"><option value="">全部 CID</option></select></label>
-                <label class="field"><span>用户</span><select id="filter-user"><option value="">全部用户</option></select></label>
-                <label class="field"><span>Persona</span><select id="filter-persona"><option value="__all__">全部 Persona</option></select></label>
-                <label class="field"><span>Role</span><select id="filter-role"><option value="">全部 Role</option><option value="user">user</option><option value="assistant">assistant</option></select></label>
-                <label class="field"><span>LLM 状态</span><select id="filter-status"><option value="__all__">全部状态</option><option value="__empty__">no_llm（空值）</option><option value="llm_success">llm_success</option><option value="llm_pending">llm_pending</option><option value="proactive">proactive</option><option value="orphan">orphan</option></select></label>
-                <label class="field"><span>内容类型</span><select id="filter-kind"><option value="">全部类型</option></select></label>
-                <label class="field"><span>事件子类</span><select id="filter-event-type"><option value="">全部子类</option><option value="ban">ban（禁言）</option><option value="member">member（成员变动）</option><option value="title">title（头衔荣誉）</option><option value="recall">recall（撤回）</option><option value="resource">resource（文件）</option><option value="poke">poke（戳一戳）</option><option value="reaction">reaction（表情回应）</option><option value="system">system（其它）</option></select></label>
-                <label class="field"><span>平台类型</span><select id="filter-platform"><option value="">全部平台</option></select></label>
-                <label class="field"><span>消息类型</span><select id="filter-message-type"><option value="">全部消息类型</option></select></label>
+                <label class="field"><span>聊天类型</span><select id="filter-chat-type"><option value="">group + private</option><option value="group">group</option><option value="private">private</option></select></label>
+                <label class="field"><span>QQ 号</span><input id="filter-session" type="search" maxlength="64" placeholder="群号 / 对方号（精确）"></label>
+                <label class="field"><span>发言者</span><input id="filter-sender" type="search" maxlength="64" placeholder="QQ 号（精确）或昵称（模糊）"></label>
+                <label class="field"><span>内容类型</span><select id="filter-kind"><option value="">all</option></select></label>
+                <label class="field"><span>事件子类</span><select id="filter-event-type"><option value="">all</option><option value="ban">ban（禁言）</option><option value="member">member（成员变动）</option><option value="title">title（头衔荣誉）</option><option value="recall">recall（撤回）</option><option value="resource">resource（文件）</option><option value="poke">poke（戳一戳）</option><option value="reaction">reaction（表情回应）</option><option value="system">system（其它）</option></select></label>
                 <label class="field"><span>起始时间</span><input id="filter-since" type="datetime-local"></label>
                 <label class="field"><span>结束时间</span><input id="filter-until" type="datetime-local"></label>
-                <label class="field"><span>删除状态</span><select id="filter-deleted"><option value="all">All</option><option value="visible" selected>未删除</option><option value="deleted">已删除</option></select></label>
+                <label class="field"><span>删除状态</span><select id="filter-deleted"><option value="all">all</option><option value="visible" selected>未删除</option><option value="deleted">已删除</option></select></label>
                 <label class="field"><span>每页数量</span><select id="filter-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
               </div>
 
-              <label class="check-field">
-                <input type="checkbox" id="filter-paired">
-                <span class="check-box"></span>
-                <span><strong>仅看完整配对轮次</strong><small>排除未配对 user、proactive 与 orphan 单边消息</small></span>
-              </label>
             </form>
           </article>
 
@@ -253,12 +253,13 @@
               </div>
 
               <div class="filters-grid">
-                <label class="field"><span>会话来源 UMO</span><select id="tool-filter-umo"><option value="">全部 UMO</option></select></label>
-                <label class="field"><span>Conversation ID</span><select id="tool-filter-conversation"><option value="">全部 CID</option></select></label>
-                <label class="field"><span>轮次 turn_id</span><input id="tool-filter-turn" type="text" maxlength="256" placeholder="精确匹配 turn_id"></label>
+                <label class="field"><span>聊天类型</span><select id="tool-filter-chat-type"><option value="">group + private</option><option value="group">group</option><option value="private">private</option></select></label>
+                <label class="field"><span>QQ 号</span><input id="tool-filter-session" type="search" maxlength="64" placeholder="群号 / 对方号"></label>
+                <label class="field"><span>BOT</span><input id="tool-filter-platform" type="search" maxlength="128" placeholder="如 BOT1（留空=全部）"></label>
+                <label class="field"><span>人设</span><select id="tool-filter-persona"><option value="">all</option></select></label>
                 <label class="field"><span>起始时间</span><input id="tool-filter-since" type="datetime-local"></label>
                 <label class="field"><span>结束时间</span><input id="tool-filter-until" type="datetime-local"></label>
-                <label class="field"><span>删除状态</span><select id="tool-filter-deleted"><option value="all">All</option><option value="visible" selected>未删除</option><option value="deleted">已删除</option></select></label>
+                <label class="field"><span>删除状态</span><select id="tool-filter-deleted"><option value="all">all</option><option value="visible" selected>未删除</option><option value="deleted">已删除</option></select></label>
                 <label class="field"><span>每页数量</span><select id="tool-filter-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
               </div>
             </form>

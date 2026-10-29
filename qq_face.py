@@ -339,4 +339,7 @@ FACE_NAMES = {
 
 def face_name(face_id) -> str:
     """face id → 名称；未知/空值返回空串。"""
-    return FACE_NAMES.get(str(face_id or "").strip(), "")
+    # 0 是合法 face id（"惊讶"）：`or ""` 会把它吞成空串，取不到名字。
+    if face_id is None:
+        return ""
+    return FACE_NAMES.get(str(face_id).strip(), "")

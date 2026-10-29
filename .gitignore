@@ -12,3 +12,10 @@ integration/
 .coverage
 htmlcov/
 node_modules/
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+*.log
+dist/
+.venv/

@@ -18,14 +18,16 @@
 import ast
 import asyncio
 import enum
+import datetime
 import json
 import os
 import re
 import sqlite3
 import sys
+import time
 import tempfile
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -139,43 +141,68 @@ sys.modules["chat_memory"] = pkg
 
 models_mod = types.ModuleType("chat_memory.models")
 sys.modules["chat_memory.models"] = models_mod
-exec(compile((PLUGIN_DIR / "models.py").read_text(), "models.py", "exec"),
+exec(compile((PLUGIN_DIR / "models.py").read_text(encoding="utf-8"), "models.py", "exec"),
      models_mod.__dict__)
 setattr(pkg, "models", models_mod)
 
 qq_face_mod = types.ModuleType("chat_memory.qq_face")
 sys.modules["chat_memory.qq_face"] = qq_face_mod
-exec(compile((PLUGIN_DIR / "qq_face.py").read_text(), "qq_face.py", "exec"),
+exec(compile((PLUGIN_DIR / "qq_face.py").read_text(encoding="utf-8"), "qq_face.py", "exec"),
      qq_face_mod.__dict__)
 setattr(pkg, "qq_face", qq_face_mod)
 
 relation_codec_mod = types.ModuleType("chat_memory.relation_codec")
 sys.modules["chat_memory.relation_codec"] = relation_codec_mod
-exec(compile((PLUGIN_DIR / "relation_codec.py").read_text(), "relation_codec.py", "exec"),
-     relation_codec_mod.__dict__)
+_src = (PLUGIN_DIR / "relation_codec.py").read_text(encoding="utf-8")
+exec(compile(_src, "relation_codec.py", "exec"), relation_codec_mod.__dict__)
 setattr(pkg, "relation_codec", relation_codec_mod)
 
 media_archive_mod = types.ModuleType("chat_memory.media_archive")
 sys.modules["chat_memory.media_archive"] = media_archive_mod
-exec(compile((PLUGIN_DIR / "media_archive.py").read_text(), "media_archive.py", "exec"),
-     media_archive_mod.__dict__)
+_src = (PLUGIN_DIR / "media_archive.py").read_text(encoding="utf-8")
+exec(compile(_src, "media_archive.py", "exec"), media_archive_mod.__dict__)
 setattr(pkg, "media_archive", media_archive_mod)
 
 classifier_mod = types.ModuleType("chat_memory.message_classifier")
 sys.modules["chat_memory.message_classifier"] = classifier_mod
-exec(compile((PLUGIN_DIR / "message_classifier.py").read_text(),
+exec(compile((PLUGIN_DIR / "message_classifier.py").read_text(encoding="utf-8"),
              "message_classifier.py", "exec"), classifier_mod.__dict__)
 setattr(pkg, "message_classifier", classifier_mod)
 
 context_builder_mod = types.ModuleType("chat_memory.context_builder")
 sys.modules["chat_memory.context_builder"] = context_builder_mod
-exec(compile((PLUGIN_DIR / "context_builder.py").read_text(),
+exec(compile((PLUGIN_DIR / "context_builder.py").read_text(encoding="utf-8"),
              "context_builder.py", "exec"), context_builder_mod.__dict__)
 setattr(pkg, "context_builder", context_builder_mod)
 
+shadow_diag_mod = types.ModuleType("chat_memory.shadow_diag")
+sys.modules["chat_memory.shadow_diag"] = shadow_diag_mod
+exec(compile((PLUGIN_DIR / "shadow_diag.py").read_text(encoding="utf-8"), "shadow_diag.py", "exec"),
+     shadow_diag_mod.__dict__)
+setattr(pkg, "shadow_diag", shadow_diag_mod)
+
+shared_store_mod = types.ModuleType("chat_memory.shared_store")
+sys.modules["chat_memory.shared_store"] = shared_store_mod
+_src = (PLUGIN_DIR / "shared_store.py").read_text(encoding="utf-8")
+exec(compile(_src, "shared_store.py", "exec"), shared_store_mod.__dict__)
+setattr(pkg, "shared_store", shared_store_mod)
+
+group_names_mod = types.ModuleType("chat_memory.group_names")
+sys.modules["chat_memory.group_names"] = group_names_mod
+exec(compile((PLUGIN_DIR / "group_names.py").read_text(encoding="utf-8"),
+             "group_names.py", "exec"), group_names_mod.__dict__)
+setattr(pkg, "group_names", group_names_mod)
+
+shadow_read_mod = types.ModuleType("chat_memory.shadow_read")
+sys.modules["chat_memory.shadow_read"] = shadow_read_mod
+exec(compile((PLUGIN_DIR / "shadow_read.py").read_text(encoding="utf-8"), "shadow_read.py", "exec"),
+     shadow_read_mod.__dict__)
+setattr(pkg, "shadow_read", shadow_read_mod)
+
+
 storage_mod = types.ModuleType("chat_memory.storage")
 sys.modules["chat_memory.storage"] = storage_mod
-exec(compile((PLUGIN_DIR / "storage.py").read_text(), "storage.py", "exec"),
+exec(compile((PLUGIN_DIR / "storage.py").read_text(encoding="utf-8"), "storage.py", "exec"),
      storage_mod.__dict__)
 setattr(pkg, "storage", storage_mod)
 
@@ -190,16 +217,16 @@ sys.modules["chat_memory.ui"] = ui_pkg
 setattr(pkg, "ui", ui_pkg)
 ui_repository_mod = types.ModuleType("chat_memory.ui.repository")
 sys.modules["chat_memory.ui.repository"] = ui_repository_mod
-exec(compile((PLUGIN_DIR / "ui" / "repository.py").read_text(), "ui/repository.py", "exec"),
-     ui_repository_mod.__dict__)
+_src = (PLUGIN_DIR / "ui" / "repository.py").read_text(encoding="utf-8")
+exec(compile(_src, "ui/repository.py", "exec"), ui_repository_mod.__dict__)
 setattr(ui_pkg, "repository", ui_repository_mod)
 ui_web_api_mod = types.ModuleType("chat_memory.ui.web_api")
 sys.modules["chat_memory.ui.web_api"] = ui_web_api_mod
-exec(compile((PLUGIN_DIR / "ui" / "web_api.py").read_text(), "ui/web_api.py", "exec"),
-     ui_web_api_mod.__dict__)
+_src = (PLUGIN_DIR / "ui" / "web_api.py").read_text(encoding="utf-8")
+exec(compile(_src, "ui/web_api.py", "exec"), ui_web_api_mod.__dict__)
 setattr(ui_pkg, "web_api", ui_web_api_mod)
 
-_main_src = (PLUGIN_DIR / "main.py").read_text()
+_main_src = (PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
 _mod_ns = {"__name__": "chat_memory.main"}
 exec(compile(ast.parse(_main_src), "main.py", "exec"), _mod_ns)
 _ChatMemoryPlugin = _mod_ns["ChatMemoryPlugin"]
@@ -209,11 +236,23 @@ class _PluginStub(_ChatMemoryPlugin):
     """绕过 __init__（依赖 db / context），手填测试用属性。"""
 
     def __init__(self):
-        pass
+        # 巡检/声明用到的实例状态（真实实例在 __init__ 里建）
+        self._push_missing_declared = False
+        self._push_subscribed_platforms = set()
 
 
 def _make_plugin():
     p = _PluginStub()
+    p.shared_store_shadow = False          # 单测不碰影子层（需要时各自设桩）
+    p.sent_capture_history = False
+    p._shadow_tasks = set()
+    p._sent_history_unsupported = set()
+    p._echo_subscribe_failed = set()
+    p._sent_history_cursor = {}
+    p._conversation_ids = {}
+    p._echo_poll_rounds = 0
+    p._echo_poll_last = ""
+    p._platform_bots = {}
     p.ct_enable = True
     p.ct_cross_session = False
     p.ct_full_group = False
@@ -296,13 +335,13 @@ def test_user_forged_cm_tags_stripped():
 
 
 def test_nickname_fallback_hides_user_id():
-    """昵称缺失时不回退 user_id：cm_nickname 用中性的 ?，账号 ID 不进入上下文。"""
+    """昵称缺失时不回退 user_id：cm_nickname 用「未知成员」，账号 ID 不进入上下文。"""
     p = _make_plugin()
     out = p._takeover_normalize(
         [_rec(nickname="", user_id="10001")], _UMO_GROUP,
     )
     content = out[0]["content"]
-    assert "<cm_nickname>?</cm_nickname> 你好" in content
+    assert "<cm_nickname>未知成员</cm_nickname> 你好" in content
     assert "10001" not in content
     print("[T03] nickname_fallback_hides_user_id ✓")
 
@@ -429,18 +468,18 @@ def test_reply_restoration():
 
     # 小节：turn 命中 / snapshot / 全空降级
     target_map = {("turn_1", "user"): {
-        "sender_nickname": "Wolfycz", "content": "被引用的原文"}}
+        "sender_nickname": "Alice", "content": "被引用的原文"}}
     rec = _rec(content="回复内容", relation={"v": 1, "mentions": [], "reply": {
         "resolution": "turn", "target_turn_id": "turn_1", "target_role": "user"}})
     out = p._takeover_normalize([rec], _UMO_GROUP, target_map=target_map)
-    assert '<cm_reply target="Wolfycz">被引用的原文</cm_reply>' in out[0]["content"]
+    assert '<cm_reply target="Alice">被引用的原文</cm_reply>' in out[0]["content"]
     assert "回复内容" in out[0]["content"]
 
     rec2 = _rec(content="x", relation={"v": 1, "mentions": [], "reply": {
-        "resolution": "snapshot", "target_nickname": "虾仁粽子",
+        "resolution": "snapshot", "target_nickname": "Alice",
         "fallback_text": "快照原文"}})
     out2 = p._takeover_normalize([rec2], _UMO_GROUP)
-    assert '<cm_reply target="虾仁粽子">快照原文</cm_reply>' in out2[0]["content"]
+    assert '<cm_reply target="Alice">快照原文</cm_reply>' in out2[0]["content"]
 
     rec3 = _rec(content="y", relation={"v": 1, "mentions": [], "reply": {}})
     out3 = p._takeover_normalize([rec3], _UMO_GROUP)
@@ -608,14 +647,15 @@ def test_media_placeholder_render_and_cleanup():
              created_at="2026-08-18 04:05:30"),
     ], _UMO_GROUP)
     assert out4[0]["content"].endswith('<cm_event type="poke">戳一戳</cm_event>')
-    # 旧 poke 记录（消息路径）发言者昵称照常显示——消息昵称恒为真实名，
-    # 纯数字兜底只存在于 notice 事件（现已走 event 捕获，见 T58 过滤）
+    # 旧 poke 记录（消息路径）发言者是号码时，上下文里渲染成「未知成员」：
+    # 落库允许 QQ 号作最后一档昵称，但账号绝不能进 LLM 上下文
     out5 = p._takeover_normalize([
         _rec(content="[poke]", kinds=["poke"], relation=poke_rel,
              nickname="123456789", created_at="2026-08-18 04:05:30"),
     ], _UMO_GROUP)
     assert out5[0]["content"].endswith('<cm_event type="poke">戳一戳</cm_event>')
-    assert "<cm_nickname>123456789</cm_nickname>" in out5[0]["content"]
+    assert "<cm_nickname>未知成员</cm_nickname>" in out5[0]["content"]
+    assert "123456789" not in out5[0]["content"]
     # relation_codec 混合消息 token 渲染（旧数据兜底）
     assert relation_codec_mod.render_content_template(
         "戳⟦CM_POKE:0⟧", poke_rel) == \
@@ -661,10 +701,10 @@ def test_relation_codec_render_and_tokens():
     assert "event" not in json.loads(bad_dump)
 
     # 小节：At token 渲染
-    rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "虾仁粽子"}],
+    rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "Alice"}],
            "reply": None}
     assert (r.render_content_template("⟦CM_AT:0⟧在干嘛", rel)
-            == '<cm_mention target="虾仁粽子"/>在干嘛')
+            == '<cm_mention target="Alice"/>在干嘛')
     assert (r.render_content_template("⟦CM_AT:9⟧越界", rel)
             == '<cm_mention target="未知成员"/>越界')
     assert r.render_content_template("⦑CM_AT:0⦒原文", rel) == "⟦CM_AT:0⟧原文"
@@ -778,6 +818,12 @@ def test_classify_content():
     fw = components.Forward(); fw.id = "fwd_001"
     kind, _, _, forward_id = p._classify_content(_mk_event([fw]))
     assert kind == ["forward"] and forward_id == "fwd_001"
+
+    # 纯媒体消息必须落占位符，绝不能存成空正文（空正文与"漏存/版本冲突"分不开，
+    # 且 LLM 上下文与查询台都会显示空白）。转发与图片/视频同规则：只占位、不展开。
+    for media_kind in ("image", "video", "voice", "file", "forward", "emoji", "poke"):
+        assert p._content_placeholder([media_kind]) == f"[{media_kind}]", media_kind
+    assert p._content_placeholder([]) == ""
 
     img2 = components.Image()
     vc = components.Record()
@@ -1424,14 +1470,14 @@ def test_storage_pure_helpers():
         "g1", "Alice", 0, "at1", "rep1", "fwd1", "", "2026-07-09 02:00:00",
         "turn_1", "", None, 42,
     )
-    rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "虾仁粽子"}],
+    rel = {"v": 1, "mentions": [{"user_id": "10001", "nickname": "Alice"}],
            "reply": None}
     r_with_rel = list(r)
     r_with_rel[1] = "⟦CM_AT:0⟧在干嘛"
     r_with_rel[22] = json.dumps(rel, ensure_ascii=False)
     d = storage_mod._row_to_dict(tuple(r_with_rel))
     assert d["role"] == "user"
-    assert d["content"] == '<cm_mention target="虾仁粽子"/>在干嘛'
+    assert d["content"] == '<cm_mention target="Alice"/>在干嘛'
     assert d["content_template"] == "⟦CM_AT:0⟧在干嘛"
     assert d["user_id"] == "u1" and d["message_id"] == "m1"
     assert d["content_kind"] == ["text"]
@@ -1506,12 +1552,19 @@ def test_media_archive_local_and_cleanup():
         open(src, "wb").write(b"#!AMR\n\x00\x00\x00\x1c" + b"\x00" * 64)
 
         insert = _AsyncInsert()
+        referenced = {"value": False}      # 同一路径是否还有别的归档行在用（引用计数）
+
+        async def _media_file_referenced(*, file_name, created_at):
+            return referenced["value"]
+
         db = types.SimpleNamespace(
             insert_media_archive=insert,
-            query_media_archive_by_ids=_AsyncEmpty(),
             query_media_archive_for_cleanup=_AsyncEmpty(),
             media_archive_total_size=_AsyncZero(),
             delete_media_archive_by_ids=_AsyncZero(),
+            media_file_referenced=_media_file_referenced,
+            query_media_without_hash=_AsyncEmpty(),
+            update_media_content_hash=_AsyncNone(),
         )
         archiver = MediaArchiver(db, Path(tmp) / "data", enabled=True,
                                  include_video=False, retention_days=30,
@@ -1523,18 +1576,36 @@ def test_media_archive_local_and_cleanup():
         row = insert.last
         assert row["kind"] == "voice" and row["ext"] == "amr"
         assert row["mime_type"] == "audio/amr"
-        assert row["file_name"].startswith("aaaa") and row["file_name"].endswith(".amr")
+        # 内容寻址：文件名是内容哈希（不是 media_id），32 位 hex + 扩展名
+        assert len(row["file_name"].split(".")[0]) == 32, row["file_name"]
+        assert row["file_name"].endswith(".amr") and row["content_hash"]
         # 文件真实落盘（按月分桶；归档行 created_at 为 UTC naive，与生产一致）
         utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
         month_dir = archiver.media_dir / utc_now.strftime("%Y%m")
-        assert list(month_dir.glob("aaaa*"))
-        # 级联删除文件
+        assert list(month_dir.glob(f"{row['content_hash']}*"))
+        # 多实例归档同一张图（media_id 不同、字节相同）→ 落同一个文件，只占一份磁盘
+        other_id = "bbbb" + "0" * 28
+        assert asyncio.run(archiver.archive_local(
+            other_id, src, "umo_other", "cid_other", "turn_other", "voice",
+        ))
+        assert insert.last["file_name"] == row["file_name"], "同内容必须复用同一个文件"
+        assert len(list(month_dir.iterdir())) == 1, "同一内容只应有一个文件"
+        assert insert.last["content_hash"] == row["content_hash"]
+        # 引用计数：还有别的归档行在用这个文件时不得删（否则会把别人的图删掉）
+        referenced["value"] = True
+        assert asyncio.run(archiver.delete_files([{
+            "file_name": row["file_name"],
+            "created_at": utc_now,
+        }])) == 0
+        assert list(month_dir.glob(f"{row['content_hash']}*")), "共用文件必须保留"
+        # 没有别的引用了才真删
+        referenced["value"] = False
         deleted = asyncio.run(archiver.delete_files([{
             "file_name": row["file_name"],
             "created_at": utc_now,
         }]))
         assert deleted == 1
-        assert not list(month_dir.glob("aaaa*"))
+        assert not list(month_dir.glob(f"{row['content_hash']}*"))
         # 视频开关关闭 / 归档关闭：拒绝
         assert not archiver.allowed_kind("video")
         off = MediaArchiver(db, Path(tmp) / "off", enabled=False,
@@ -1542,6 +1613,52 @@ def test_media_archive_local_and_cleanup():
                             max_total_mb=64)
         assert not off.allowed_kind("image")
         assert not asyncio.run(off.archive_local("b" * 32, src, "u", "c", "t", "voice"))
+
+        # 孤儿扫描必须按"文件是否还有归档行在用"判定：内容寻址后一个文件可能被多个
+        # media_id 共用，若按文件名前缀当 media_id 去查（查不到行）就会把共用文件删掉
+        # ——这是不可逆的数据丢失。守的静默失效：误删他人共用的媒体。
+        orphan_dir = archiver.media_dir / utc_now.strftime("%Y%m")
+        orphan = orphan_dir / ("f" * 32 + ".jpg")
+        orphan.write_bytes(b"shared-bytes")
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).timestamp()
+        os.utime(orphan, (old_ts, old_ts))
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+        referenced["value"] = True
+        assert asyncio.run(archiver._orphan_scan(cutoff)) == 0, "还有归档行在用就不能当孤儿删"
+        assert orphan.is_file()
+        referenced["value"] = False
+        assert asyncio.run(archiver._orphan_scan(cutoff)) == 1, "确实没人用了才删"
+        assert not orphan.is_file()
+
+        # 保留期/总量清理删文件必须按行里的 file_name 定位：内容寻址后文件名是内容哈希、
+        # 不再含 media_id，按 media_id 前缀扫目录会一个文件都删不掉——DB 行清了、文件永久
+        # 留在磁盘上，表现为「清理日志正常、占用只增不减」。守的静默失效：媒体文件无限增长。
+        assert asyncio.run(archiver.archive_local(
+            "cccc" + "0" * 28, src, "umo_demo", "cid_demo", "turn_demo", "voice",
+        ))
+        old_dt = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=40)
+        old_dir = archiver.media_dir / old_dt.strftime("%Y%m")
+        old_dir.mkdir(parents=True, exist_ok=True)
+        expired_file = old_dir / insert.last["file_name"]
+        os.replace(month_dir / insert.last["file_name"], expired_file)
+
+        async def _expired_rows(*a, **k):
+            return [{
+                "media_id": insert.last["media_id"],
+                "file_name": insert.last["file_name"],
+                "ext": insert.last["ext"],
+                "created_at": old_dt,
+                "size_bytes": 8,
+            }]
+
+        db.query_media_archive_for_cleanup = _expired_rows
+        referenced["value"] = True
+        assert asyncio.run(archiver.cleanup_cycle())["retention"] == 0, "共用文件不能删"
+        assert expired_file.is_file()
+        referenced["value"] = False
+        stats = asyncio.run(archiver.cleanup_cycle())
+        assert stats["retention"] == 1, "过期归档行的文件必须真删掉"
+        assert not expired_file.is_file()
         print("[T23] media_archive_local_and_cleanup ✓")
 
 
@@ -1635,8 +1752,13 @@ def test_instruction_idempotent():
     assert "无 <cm_speaker> 也无 <cm_source>" in req.system_prompt
     assert "续写角色" in req.system_prompt
     assert "每条默认回应其前最近" in req.system_prompt
-    assert "可合并参考" in req.system_prompt
+    # 跨会话规则必须以当前会话为主（旧措辞"可合并参考"正是串味的来源，已废除）
+    assert "当前会话是本次对话的主场" in req.system_prompt
+    assert "一律以当前会话为准" in req.system_prompt
+    assert "可合并参考" not in req.system_prompt
     assert "来源标记仅供你理解" in req.system_prompt
+    # 泄漏防线：不许向用户提及会话编号或暗示还有其他会话（静默删掉这半句会让规则失效）
+    assert "也不要暗示存在其他会话" in req.system_prompt
     assert "<cm_speaker" in req.system_prompt
     assert "闲聊触发" in req.system_prompt
     print("[T26] instruction_idempotent ✓")
@@ -2228,7 +2350,7 @@ def test_takeover_event_type_filter():
             ]]
 
     p.db = _Db()
-    records = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    records, _src = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
     event_types = [
         r.get("relation_data", {}).get("event", {}).get("type")
         for r in records
@@ -2465,8 +2587,22 @@ def test_mark_send_attempted_and_control_command():
         def set_extra(self, key, value):
             self.extras[key] = value
 
+    plan_marks = []
+
+    async def _plan(umo, cid, turn_id):
+        plan_marks.append((umo, cid, turn_id))
+        return 1
+
+    class _DbStub:
+        mark_plan_send_attempted = staticmethod(_plan)
+
+    p.db = _DbStub()
+
     asyncio.run(p.mark_send_attempted(_Ev({"chat_memory_assistant_turn_id": "t1"})))
     assert calls == [("aiocqhttp:GroupMessage:g1", "cid_demo", "t1", "send_attempted")]
+    # 守的静默失效：旧表 rowcount 恒 ≥1（有计划成员就一定有发送前的 prepared 行），
+    # 曾用它当"这一轮有没有实发行"的判据，导致计划标记永不执行、<cm_unsent/> 不可达。
+    assert plan_marks == [("aiocqhttp:GroupMessage:g1", "cid_demo", "t1")], plan_marks
     # 无 turn_id / 无 umo：不写状态
     asyncio.run(p.mark_send_attempted(_Ev({})))
     assert len(calls) == 1
@@ -2595,7 +2731,9 @@ def test_schema_migration_order_and_v7_upgrade():
     storage = storage_mod
 
     # 1) 顺序守卫：两张表的补列语句都必须排在对应索引之前
-    statements = storage.schema_statements({"id", "umo"}, {"id", "turn_id"})
+    statements = storage.schema_statements(
+        {"id", "umo"}, {"id", "turn_id"}, {"media_id", "file_name"}
+    )
     main_alter = next(
         i for i, sql in enumerate(statements)
         if sql.startswith("ALTER TABLE chat_memory_records ADD COLUMN deleted_at")
@@ -2612,6 +2750,15 @@ def test_schema_migration_order_and_v7_upgrade():
     )
     assert main_alter < main_index, statements
     assert tool_alter < tool_index, statements
+    # 媒体表补列（v7→v8 content_hash）同样必须早于它的索引，否则存量库建索引即崩
+    media_alter = next(
+        i for i, st in enumerate(statements)
+        if "ALTER TABLE chat_memory_media_archive" in st and "content_hash" in st
+    )
+    media_hash_index = next(
+        i for i, st in enumerate(statements) if "ix_cm_media_hash" in st
+    )
+    assert media_alter < media_hash_index, statements
 
     with tempfile.TemporaryDirectory() as tmp:
         # 2) 新库（PRAGMA 返回空集合）：建表即含新列，语句可直接执行
@@ -2693,6 +2840,7 @@ def test_logs_and_ids_never_truncated():
     for name in (
         "main.py",
         "storage.py",
+        "shared_store.py",
         "media_archive.py",
         "message_classifier.py",
         "context_builder.py",
@@ -2786,7 +2934,7 @@ def test_takeover_recall_skip_context():
     db = _Db([normal, recalled, recall_event])
     p.db = db
     p.ct_llm_status_filter = ["", "llm_success"]
-    records = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
+    records, _src = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
     assert len(records) == 3
     assert db.skip_flags == [False]
 
@@ -2794,14 +2942,14 @@ def test_takeover_recall_skip_context():
     p.ct_recall_skip_context = True
     db = _Db([normal, recalled, recall_event])
     p.db = db
-    records = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
+    records, _src = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
     assert [r["content"] for r in records] == ["正常消息"]
     assert db.skip_flags == [True]
 
     # SQL 层已过滤（模拟返回不含 recalled_at 的集合）时不应误伤其他记录
     db = _Db([normal])
     p.db = db
-    records = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
+    records, _src = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
     assert [r["content"] for r in records] == ["正常消息"]
     print("[T64] takeover_recall_skip_context ✓")
 
@@ -2875,6 +3023,352 @@ def test_write_failure_warning_has_no_content():
     assert "LEAK" not in joined and "parameters" not in joined
     assert joined.count("RuntimeError") == 3  # 异常类型保留，便于定位形态
     print("[T77] write_failure_warning_has_no_content ✓")
+
+
+def test_shared_store_fingerprint_stability():
+    """合并存储物理键：同一物理消息跨实例同键，正文/秒/发送者/会话/平台任一不同即不同键。"""
+    ss = sys.modules["chat_memory.shared_store"]
+    base = ("aiocqhttp", "GroupMessage", "g1", "10001", 1756900000, "你好")
+    fp = ss.fingerprint(*base)
+    assert fp == ss.fingerprint(*base) and len(fp) == 32
+    assert fp != ss.fingerprint("aiocqhttp", "GroupMessage", "g1", "10001", 1756900000, "你好 ")
+    assert fp != ss.fingerprint("aiocqhttp", "GroupMessage", "g1", "10001", 1756900001, "你好")
+    assert fp != ss.fingerprint("aiocqhttp", "GroupMessage", "g1", "10002", 1756900000, "你好")
+    assert fp != ss.fingerprint("aiocqhttp", "GroupMessage", "g2", "10001", 1756900000, "你好")
+    assert fp != ss.fingerprint("other", "GroupMessage", "g1", "10001", 1756900000, "你好")
+    print("[T78] shared_store_fingerprint_stability ✓")
+
+
+def test_shared_store_normalize_record():
+    """归一化：入站取 user_id、出站取 self_id；缺物理身份返回 None（不猜测）。"""
+    ss = sys.modules["chat_memory.shared_store"]
+
+    def params(**over):
+        base = {
+            "umo": "aiocqhttp:GroupMessage:g1", "cid": "cid1", "uid": "10001",
+            "role": "user", "content": "你好", "mid": "m1", "lstatus": "",
+            "ckind": '["text"]', "pid_plat": "BOT2", "pname": "aiocqhttp",
+            "mtype": "GroupMessage", "sid": "g1", "self_id": "20002",
+            "nick": "Alice", "rts": 1756900000, "pts": 1756899998, "puid": "88001",
+            "turn_id": "t1",
+            "send_status": "", "relation_data": None, "now": None,
+        }
+        base.update(over)
+        return base
+
+    inbound = ss.normalize_record(params())
+    assert inbound["message"]["sender_id"] == "10001"      # 入站发送者＝消息发送者
+    # 归一时间取平台时间（跨实例一致），本地接收时刻只作每实例属性
+    assert inbound["message"]["platform_timestamp"] == 1756899998
+    assert inbound["participation"]["raw_timestamp"] == 1756900000
+    assert inbound["message"]["platform_uid"] == "88001"   # NapCat real_seq 等平台共享 id
+    assert "raw_timestamp" not in inbound["message"]
+    # 同一条消息：两实例接收时刻差 1 秒（跨秒边界）但平台时间相同 → 同指纹、可归一行
+    other = ss.normalize_record(params(rts=1756900001))
+    assert other["message"]["fingerprint"] == inbound["message"]["fingerprint"]
+    assert other["participation"]["raw_timestamp"] == 1756900001
+    # 平台时间缺失时回落接收时刻（同类平台取不到 time 的已知局限）
+    no_pts = ss.normalize_record(params(pts=None))
+    assert no_pts["message"]["platform_timestamp"] == 1756900000
+    # 客户端不给共享 id 时留空（归一自动退化到内容指纹）
+    assert ss.normalize_record(params(puid=None))["message"]["platform_uid"] is None
+    assert ss.normalize_record(params(puid=""))["message"]["platform_uid"] is None
+    assert inbound["participation"]["self_id"] == "20002"  # 观察者实例账号
+    assert inbound["participation"]["role"] == "user"
+    assert inbound["participation"]["platform_id"] == "BOT2"
+    # 出站（自己回复）：发送者是 self_id，且同一物理消息与观察侧同指纹
+    outbound = ss.normalize_record(params(role="assistant", self_id="10001", uid="10001"))
+    assert outbound["message"]["sender_id"] == "10001"
+    assert outbound["participation"]["role"] == "assistant"
+    assert outbound["message"]["fingerprint"] == inbound["message"]["fingerprint"]
+    # 「是不是计划正文」只是写入前的路由标记（不落库）：发送路径的 assistant 正文是计划
+    assert outbound["message"]["is_plan"] is True
+    assert inbound["message"]["is_plan"] is False
+    # 出站行时间＝**本地发送尝试时刻**（不是触发它的用户消息时间）：观察侧分段在发送后几秒
+    # 到达，reply_group 的锚点必须是发送时刻才套得住（线上 297 条观察副本里 103 条曾漏归组）。
+    # 无 now（历史镜像/手动构造）时回落接收时刻，绝不静默取触发侧平台时间。
+    assert outbound["message"]["platform_timestamp"] == 1756900000, outbound["message"]
+    sent_at = datetime(2026, 9, 29, 12, 0, 30)
+    timed = ss.normalize_record(
+        params(role="assistant", self_id="10001", uid="10001", now=sent_at)
+    )
+    assert timed["message"]["platform_timestamp"] == int(
+        sent_at.replace(tzinfo=timezone.utc).timestamp()
+    ), timed["message"]
+    # 但本地键指纹仍以触发侧平台时间为基准：同一轮回复重复镜像（新的 now）必须同一个 uid，
+    # 否则重载/重试会多出一行“自己说过的话”。
+    assert timed["message"]["fingerprint"] == outbound["message"]["fingerprint"], (
+        "出站行指纹不得掺入发送时刻，否则重复镜像会新增物理消息"
+    )
+    # 出站行不得采用触发事件的平台 uid（那是用户消息的 real_seq；照搬会把回复折进用户消息行）
+    assert outbound["message"]["platform_uid"] is None
+    assert ss.normalize_record(
+        params(role="assistant", self_id="10001", uid="10001", puid="88001")
+    )["message"]["platform_uid"] is None
+    assert inbound["message"]["platform_uid"] == "88001"   # 入站仍然用
+    # 出站行的昵称不能照搬旧表 audit（那里存的是被回复者昵称，不是发送者昵称）；
+    # 真实昵称由影子层按「同平台会话+同发送者」的既有记录补齐（见集成 [6.1]）
+    assert outbound["message"]["sender_nickname"] == ""
+    nick_ignored = ss.normalize_record(
+        params(role="assistant", self_id="10001", uid="10001", nick="Alice")
+    )
+    assert nick_ignored["message"]["sender_nickname"] == ""
+    # 缺物理身份一律 None：无 platform_id / 无 self_id 的出站 / 无平台时间戳
+    assert ss.normalize_record(params(pid_plat="", umo="")) is None
+    assert ss.normalize_record(params(role="assistant", self_id="")) is None
+    assert ss.normalize_record(params(rts=None)) is None
+    assert ss.normalize_record(params(pname="")) is None
+    # 消息属性 vs 每实例属性：relation_data 属每实例（19% 跨实例不一致，含平台媒体 id）；
+    # 出站行的 target_id 是"被回复/目标用户"（主动消息没有同轮 user 行可 join）
+    media = ss.normalize_record(
+        params(ckind='["image"]', relation_data='{"v":1,"media":[]}')
+    )
+    assert media["message"]["relation_data"] == '{"v":1,"media":[]}'
+    assert "relation_data" not in media["participation"]
+    assert media["participation"]["target_id"] is None
+    assert outbound["participation"]["target_id"] == "10001"
+    assert "relation_data" in outbound["message"]
+    # umo 是 platform_id/message_type/session_id 的回退来源
+    fallback = ss.normalize_record(
+        params(pid_plat="", umo="BOT9:GroupMessage:g9", mtype="", sid="")
+    )
+    assert fallback["participation"]["platform_id"] == "BOT9"
+    assert fallback["message"]["message_type"] == "GroupMessage"
+    assert fallback["message"]["session_id"] == "g9"
+    print("[T79] shared_store_normalize_record ✓")
+
+
+def test_session_seq_never_rewinds():
+    """守的静默失效：会话被删空后 `seq` 从 1 重来，外部只读消费者的 `seq > cursor`
+    会永久漏读、幂等键还会撞车——功能上一切正常，只有消费者悄悄少数据。
+
+    直接用原生 sqlite3 跑生产代码里的那两条 SQL 常量（不 mock SQLAlchemy）。
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    ss = sys.modules["chat_memory.shared_store"]
+
+    con = sqlite3.connect(Path(tempfile.mkdtemp()) / "seq.db")
+    try:
+        for statement in ss.shadow_schema_statements():
+            con.execute(statement)
+
+        message = {
+            "fingerprint": "fp",
+            "platform_name": "aiocqhttp", "message_type": "GroupMessage",
+            "session_id": "group_demo", "sender_id": "10001",
+            "sender_nickname": "阿明", "platform_timestamp": 1,
+            "content": "hi", "content_kind": '["text"]',
+            "relation_data": None, "platform_seq": 1,
+            "created_at": "2026-10-28 00:00:00.000000",
+        }
+
+        def insert(msg_uid: str, platform_seq: int) -> int:
+            seq = con.execute(
+                ss.SEQ_ALLOCATE_SQL, message
+            ).fetchone()[0]
+            con.execute(
+                ss.INSERT_MESSAGE_SQL,
+                {**message, "msg_uid": msg_uid, "platform_seq": platform_seq, "seq": seq},
+            )
+            return int(seq)
+
+        assert [insert("p:1", 1), insert("p:2", 2)] == [1, 2]
+
+        # 会话被删空（/reset、保留期清理、孤儿回收都会走到这里）
+        con.execute("DELETE FROM chat_memory_messages")
+        assert con.execute("SELECT COUNT(*) FROM chat_memory_messages").fetchone()[0] == 0
+
+        assert insert("p:3", 3) == 3, "会话清空后序号回到了 1（外部游标会永久漏读）"
+
+        # 迁移路径：版本 2 必须可迁移（不能丢弃重建），且迁移里有计数器播种
+        steps = ss.shadow_migration_statements("2")
+        assert steps is not None, "版本 2 必须可迁移"
+        assert any("chat_memory_session_seq" in step for step in steps)
+        assert any("MAX(seq)" in step for step in steps), "迁移要把计数器种到现有最大值"
+        assert ss.shadow_migration_statements("99") is None, "未知版本才走重建"
+    finally:
+        con.close()
+
+
+def test_shared_store_schema_order_and_keys():
+    """影子表 DDL：先建表后建索引；参与行唯一键与外键列名（cm_msg_id 不与平台 id 撞名）。"""
+    ss = sys.modules["chat_memory.shared_store"]
+    statements = ss.shadow_schema_statements()
+    tables, first_index = [], None
+    for i, statement in enumerate(statements):
+        if "CREATE TABLE" in statement:
+            tables.append(re.search(r"chat_memory_\w+", statement).group(0))
+        elif re.search(r"CREATE (?:UNIQUE )?INDEX", statement) and first_index is None:
+            first_index = i
+    assert tables and first_index is not None
+    # 建索引之前只允许"建表"与"清理已废弃表"（DROP 不涉列序），守的仍是索引早于列的老坑
+    assert all(
+        "CREATE TABLE" in st or st.strip().upper().startswith("DROP TABLE")
+        for st in statements[:first_index]
+    ), statements[:first_index]
+    for statement in statements[first_index:]:
+        match = re.search(r"ON (chat_memory_\w+)", statement)
+        assert match and match.group(1) in tables, statement
+    ddl = "\n".join(statements)
+    assert "DROP TABLE IF EXISTS chat_memory_send_intents" in ddl, (
+        "已废弃的表必须在每次加载时清理（结构升级只删当前表清单，删过的表会留残骸）"
+    )
+    assert "UNIQUE (msg_uid, platform_id, self_id, conversation_id)" in ddl
+    assert "platform_message_id" in ddl          # 每实例平台消息 id
+    bots_ddl = next(s for s in statements if "chat_memory_message_bots" in s)
+    msg_ddl = next(s for s in statements if "chat_memory_messages" in s)
+    assert "relation_data" in msg_ddl and "deleted_at" in msg_ddl
+    assert "platform_timestamp" in msg_ddl and "raw_timestamp" not in msg_ddl
+    assert re.search(r"^\s+seq\s+INTEGER NOT NULL", msg_ddl, re.M), "会话内公共序号"
+    assert "ux_cmm_session_seq" in ddl and "ix_cmm_session_time" not in ddl
+    # 主键＝平台共享 id（msg_uid）；内容指纹只是归并输入，**不建索引**（结构线 6 删掉：
+    # 真实查重语句同时带 (pn,mt,sid)，优化器一直选 ix_cmm_session_sender，单列指纹索引从未命中）
+    assert re.search(r"^\s+msg_uid\s+TEXT PRIMARY KEY", msg_ddl, re.M)
+    assert "ix_cmm_fingerprint" not in ddl and "UNIQUE" not in msg_ddl
+    assert "msg_uid" in bots_ddl and "ix_cmmb_msg" in ddl
+    assert "raw_timestamp" in bots_ddl, "本地接收时刻是每实例属性"
+    assert "target_id" in bots_ddl
+    assert "deleted_at" not in bots_ddl, "软删按消息维度，参与行不存 deleted_at"
+    assert "msg_uid             TEXT NOT NULL" in bots_ddl
+    assert not re.search(r"^\s+message_id\s", bots_ddl, re.M), "外键不得叫 message_id"
+    # 纯函数：平台主键与本地键的构造
+    assert ss.platform_msg_uid("aiocqhttp", "GroupMessage", "g1", "777") \
+        == "p:aiocqhttp:GroupMessage:g1:777"
+    assert ss.local_msg_uid("abc", 2) == "l:abc:2"
+    print("[T80] shared_store_schema_order_and_keys ✓")
+
+
+def test_unsent_plan_marked_and_rendered():
+    """守的静默失效两件：
+
+    1) 被禁言/平台拒收时这一轮只有计划成员，`send_status` 若不从 `prepared` 推进一步，
+       "没发出去"与"还没开始发"永远同形；
+    2) 上下文兜底用计划全文时若不打 `<cm_unsent/>`，模型会把它当成"已经说出口"，
+       之后可能引用一句用户根本没见过的话。
+    """
+    shadow = sys.modules["chat_memory.shadow_read"]
+
+    plan = {
+        "turn_id": "turn_unsent", "content": "（这句没发出去）", "content_kind": '["text"]',
+        "relation_data": None, "llm_status": "llm_success",
+        "send_status": "send_attempted", "persona_id": "p_demo",
+        "created_at": "2026-10-28 00:00:00.000000",
+    }
+    collapsed = shadow._collapse_turn([shadow._plan_row(plan)], tz=None)
+    assert collapsed["delivery_unknown"] is True, "只有计划且已尝试发送 → 交付未知"
+    assert collapsed["send_status"] == "send_attempted"
+
+    # 有实发段时不算未知（段才是用户真正看到的内容）
+    plan["send_status"] = "prepared"
+    still_plan = shadow._collapse_turn([shadow._plan_row(plan)], tz=None)
+    assert still_plan["delivery_unknown"] is False, "没走过发送流程的不算交付未知"
+
+    # 刚发的轮次不能立刻标未知：回显可能还在路上（否则已送达的会被说成没发出去）
+    from datetime import datetime as _dt, timezone as _tz
+
+    fresh = dict(plan, send_status="send_attempted",
+                 created_at=_dt.now(_tz.utc).replace(tzinfo=None)
+                 .strftime("%Y-%m-%d %H:%M:%S.%f"))
+    assert shadow._collapse_turn([shadow._plan_row(fresh)], tz=None)[
+        "delivery_unknown"] is False, "宽限期内的新轮次不该判成未送达"
+
+    # 上下文渲染：交付未知的记录必须带 <cm_unsent/>
+    builder = _mod_ns["TakeoverContextBuilder"](
+        media_kinds={"image"}, current_user_id="10001", current_umo="BOT1:GroupMessage:g1",
+    )
+    formatted = builder._format_records([
+        {"role": "assistant", "content": "（这句没发出去）", "llm_status": "llm_success",
+         "delivery_unknown": True, "created_at": "2026-10-28 00:00:00.000000",
+         "persona_id": "p_demo"},
+    ])
+    assert "<cm_unsent/>" in formatted[0]["content"], formatted[0]["content"]
+
+    # 正常回复不带这个标记
+    normal = builder._format_records([
+        {"role": "assistant", "content": "正常回复", "llm_status": "llm_success",
+         "delivery_unknown": False, "created_at": "2026-10-28 00:00:00.000000"},
+    ])
+    assert "<cm_unsent/>" not in normal[0]["content"]
+
+
+def test_shared_store_shadow_default_on():
+    """配置契约：双写强制启用（没有关闭入口）、切读是单个 checkbox 且受 7 天窗口门槛。
+
+    守的静默失效：配置项写成模式选择/留了"可关闭双写"的入口时，"现在到底读哪边"
+    要靠读文档猜；门槛失效则等于拿几小时的数据就切读。
+    """
+    schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
+    assert "shared_store_shadow" not in schema, "本版不提供关闭双写的配置项"
+    entry = schema["shadow_read"]
+    assert entry["type"] == "bool" and entry["default"] is False, "切读只用一个 checkbox"
+    assert "options" not in entry and "labels" not in entry
+    source = (PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
+    assert "self.shared_store_shadow = True" in source, "双写必须强制启用"
+    assert 'config.get("shadow_read", False)' in source
+    shared_text = (PLUGIN_DIR / "shared_store.py").read_text(encoding="utf-8")
+    assert "SHADOW_READ_MIN_DAYS = 7" in shared_text, "门槛天数定义在 shared_store"
+    assert "_SHADOW_READ_MIN_DAYS = shared_store.SHADOW_READ_MIN_DAYS" in source
+    # 影子层是内部结构线，从 1 起算（不背着开发期的编号史）
+    shared = (PLUGIN_DIR / "shared_store.py").read_text(encoding="utf-8")
+    assert "SHADOW_SCHEMA_VERSION = 6" in shared
+    print("[T81] shared_store_shadow_forced_on_and_read_gated ✓")
+
+
+def test_shadow_message_view_collapses_turn():
+    """消息级 V2 读路径也要"一轮一条逻辑回复"：计划行让位、各段按平台号拼接。
+
+    守的静默失效：影子层一轮是"计划行 + 各段实际形态"三行，消息级读路径若不合并，
+    切读后同一句回复会在上下文里重复出现 N+1 次；V1 那边一轮只有一行，不开切读
+    看不出差别，只有"勾了切读 + 状态白名单含空串"的混合模式才会命中。
+    """
+    cols = shadow_read_mod._COLS
+
+    def row(**over):
+        values = {name: None for name in cols}
+        values.update(over)
+        return tuple(values[name] for name in cols)
+
+    base = dict(created_at="2026-10-01 00:00:00", content_kind='["text"]')
+    rows = [
+        row(role="user", turn_id="t1", msg_uid="l:u", seq=1, content="提问", **base),
+        # 计划成员是**合成行**（uid 固定 l:plan）；messages 里真实 l: 行是"没有平台
+        # 共享 id 的真实消息"，要当段参与拼接——混键轮次（一段 p: 一段 l:）不能丢段。
+        row(role="assistant", turn_id="t1", msg_uid="l:plan", seq=2, content="计划全文",
+            **base),
+        row(role="assistant", turn_id="t1", msg_uid="p:a", seq=3, content="段一",
+            platform_seq=11, **base),
+        row(role="assistant", turn_id="t1", msg_uid="p:b", seq=4, content="段二",
+            platform_seq=12, **base),
+        # 没有轮次的 assistant（别人的发言 / 孤儿）原样保留
+        row(role="assistant", turn_id="", msg_uid="p:solo", seq=5, content="独白", **base),
+    ]
+    out = shadow_read_mod._collapse_rows(rows, tz=None)
+    assert [r["content"] for r in out] == ["提问", "段一\n段二", "独白"], out
+    merged = out[1]
+    assert merged["segments"] == ["p:a", "p:b"] and merged["segment_count"] == 2, merged
+    assert merged["record_id"] == 4, "游标要取组内最大序号，否则 after_id 翻页会翻回同一轮"
+    # 混合键（p: + 真实 l:）必须两段都在；真实 l: 行不是计划成员
+    mixed = shadow_read_mod._collapse_rows(
+        [
+            row(role="assistant", turn_id="t3", msg_uid="l:real", seq=7, content="本地键段",
+                **base),
+            row(role="assistant", turn_id="t3", msg_uid="p:x", seq=8, content="平台键段",
+                platform_seq=21, **base),
+        ],
+        tz=None,
+    )
+    assert [r["content"] for r in mixed] == ["本地键段\n平台键段"], mixed
+    # 只有计划行的轮次：assistant = 计划全文（与 V1 一致）
+    only_plan = shadow_read_mod._collapse_rows(
+        [row(role="assistant", turn_id="t2", msg_uid="l:plan", seq=6, content="只有计划",
+             **base)],
+        tz=None,
+    )
+    assert [r["content"] for r in only_plan] == ["只有计划"], only_plan
+    print("[T91] shadow_message_view_collapses_turn ✓")
 
 
 def test_cross_session_blacklist():
@@ -2952,7 +3446,7 @@ def test_cross_session_blacklist():
     assert excl(["G:123456789"], current_umo=group_umo) == ("", {})
     # 没有名单时行为与从前完全一致（老配置不受影响）
     assert sf(group_umo, "u1", True, False, [])[0] == sf(group_umo, "u1", True, False)[0]
-    print("[T78] cross_session_blacklist ✓")
+    print("[T83] cross_session_blacklist ✓")
 
 
 def test_blacklist_invalid_entries_warn_on_load():
@@ -2976,7 +3470,7 @@ def test_blacklist_invalid_entries_warn_on_load():
         assert any("BOT1:GroupMessage:1" in w for w in warnings[1:]), warnings
     finally:
         logger_mod.logger.warning = orig_warning
-    print("[T81] blacklist_invalid_entries_warn_on_load ✓")
+    print("[T85] blacklist_invalid_entries_warn_on_load ✓")
 
 
 def test_cross_session_blacklist_takeover_wiring():
@@ -3040,7 +3534,7 @@ def test_cross_session_blacklist_takeover_wiring():
         assert len(infos) == 1, "同一会话仍只提示一次"
     finally:
         logger_mod.logger.info = orig_info
-    print("[T79] cross_session_blacklist_takeover_wiring ✓")
+    print("[T84] cross_session_blacklist_takeover_wiring ✓")
 
 
 # ── 运行 ─────────────────────────────────────────────
@@ -3067,6 +3561,813 @@ def _run_all():
         return 1
     print(f"结果：{passed}/{passed} 通过")
     return 0
+
+
+def test_render_ob11_segments():
+    """OB11 段数组 → 落库字段：词表与入站/出站一致（同一条消息不能两副面孔）。
+
+    写错的表现是"同一条物理消息在观察侧显示 [image]、在发送侧显示 [图片]"这类静默错位。
+    """
+    render = _mod_ns["_render_ob11_segments"]
+    segs = [
+        {"type": "at", "data": {"qq": "10001"}},
+        {"type": "text", "data": {"text": "晚上好"}},
+        {"type": "image", "data": {"file": "x.jpg"}},
+        {"type": "face", "data": {"id": "1"}},
+        {"type": "reply", "data": {"id": "mid-9"}},
+        {"type": "text", "data": {"text": "  "}},          # 空文本段不进 kind/正文
+    ]
+    out = render(segs)
+    assert out["kind"] == ["text", "image", "emoji"], out
+    assert out["text"] == "晚上好"
+    assert out["at_id"] == "10001" and out["reply_id"] == "mid-9"
+    assert out["forward_id"] is None
+    fwd = render([{"type": "forward", "data": {"id": "fwd-1"}}])
+    assert fwd["kind"] == ["forward"] and fwd["forward_id"] == "fwd-1"
+    assert render([])["kind"] == [] and render(None)["text"] == ""
+    assert render([{"type": "json", "data": {"data": "{}"}}])["text"] == "[json]"
+    print("[T83] render_ob11_segments ✓")
+
+
+def test_select_own_history_items():
+    """群历史筛选：只取自己发的、窗口内的、带 real_seq 的（缺 real_seq 直接丢）。
+
+    取错的表现是静默的：要么把别人的话记成自己发的，要么丢一条自己真实发出的消息。
+    """
+    pick = _mod_ns["_select_own_history_items"]
+    items = [
+        {"sender": {"user_id": 20001}, "real_seq": "10", "time": 1000, "message": []},
+        {"sender": {"user_id": 10001}, "real_seq": "11", "time": 1001, "message": []},  # 别人
+        {"sender": {"user_id": 20001}, "real_seq": "12", "time": 900, "message": []},   # 窗口外
+        {"sender": {"user_id": 20001}, "real_seq": "", "time": 1002, "message": []},    # 无 real_seq
+        {"sender": {"user_id": 20001}, "real_seq": "10", "time": 1000, "message": []},  # 重复
+        {"sender": {"user_id": 20001}, "real_seq": "13", "time": 1003, "message": []},
+        "不是字典",
+    ]
+    picked = pick(items, self_id="20001", since_ts=950)
+    assert [i["real_seq"] for i in picked] == ["10", "13"], picked
+    assert pick(items, self_id="", since_ts=950) == [], "没有 self_id 时不得乱认领"
+    # 窗口为 0＝不过滤，仍按时间升序并去重
+    assert [i["real_seq"] for i in pick(items, self_id="20001", since_ts=0)] == ["12", "10", "13"]
+    print("[T84] select_own_history_items ✓")
+
+
+class _FakeBus:
+    """aiocqhttp `EventBus` 的最小等价物：订阅表 + subscribe/unsubscribe。"""
+
+    def __init__(self):
+        self._subscribers = {}
+
+    def subscribe(self, event, func):
+        self._subscribers.setdefault(event, set()).add(func)
+
+    def unsubscribe(self, event, func):
+        if func in self._subscribers.get(event, ()):
+            self._subscribers[event].remove(func)
+
+
+class _BareBus:
+    """没有 unsubscribe 的总线（旧版 aiocqhttp）：只能直接摘订阅表。"""
+
+    def __init__(self):
+        self._subscribers = {}
+
+    def subscribe(self, event, func):
+        self._subscribers.setdefault(event, set()).add(func)
+
+
+class _FakeBot:
+    """最小 bot 桩：记录订阅（订阅名 + 回调）+ 提供 _bus 订阅表，供回显订阅测试用。"""
+
+    def __init__(self, has_on=True, bus=None):
+        self.subs = []
+        self.self_id = "20001"
+        self._bus = bus if bus is not None else _FakeBus()
+        if has_on:
+            def on(name):
+                def deco(func):
+                    self.subs.append((name, func))
+                    self._bus.subscribe(name, func)
+                    return func
+                return deco
+            self.on = on
+
+
+def test_echo_subscription_and_handler_isolation():
+    """回显订阅：只订阅一次、订阅名正确、回调绝不外抛。
+
+    包错/重复订阅的表现是静默的：订阅名错了收不到回显（以为"平台没开"），
+    重复订阅则同一条发言写两遍；回调外抛会变成 asyncio 未处理任务异常刷日志。
+    """
+    p = _make_plugin()
+    p.shared_store_shadow = True
+    p._conversation_ids = {}
+
+    class _Db:
+        pass
+
+    p.db = _Db()
+    bot = _FakeBot()
+    async def subscribe_all():
+        assert p._ensure_echo_subscription("BOT1", bot) is True
+        assert p._ensure_echo_subscription("BOT1", bot) is False, "重复订阅必须被挡住"
+        assert p._ensure_echo_subscription("BOT2", _FakeBot(has_on=False)) is False
+        assert p._ensure_echo_subscription("BOT3", None) is False
+        await asyncio.sleep(0)      # 让订阅失败告警等后台动作跑完
+
+    asyncio.run(subscribe_all())
+    assert [name for name, _ in bot.subs] == ["message_sent"], bot.subs
+    assert len(bot.subs) == 1
+
+    # 订阅本身抛异常（平台总线形状变了）：告警一次（只一次），且不带异常正文
+    class _RaisingBot:
+        self_id = "20001"
+
+        def on(self, _name):
+            raise RuntimeError("bus broken")
+
+    warnings = []
+    real_logger = _mod_ns["logger"]
+
+    class _RecLogger:
+        def debug(self, *a, **k):
+            pass
+
+        def info(self, *a, **k):
+            pass
+
+        def warning(self, *a, **k):
+            warnings.append(str(a[0]) if a else "")
+
+        def exception(self, *a, **k):
+            warnings.append(str(a[0]) if a else "")   # 失败带 traceback，走 exception
+
+        def error(self, *a, **k):
+            pass
+
+    p2 = _make_plugin()
+    p2.shared_store_shadow = True
+    p2.db = p.db
+    _mod_ns["logger"] = _RecLogger()
+    try:
+        async def failing():
+            assert p2._ensure_echo_subscription("BOT1", _RaisingBot()) is False
+            assert p2._ensure_echo_subscription("BOT1", _RaisingBot()) is False
+            await asyncio.sleep(0)
+
+        asyncio.run(failing())
+    finally:
+        _mod_ns["logger"] = real_logger
+    assert len(warnings) == 1, f"订阅失败只告警一次：{warnings}"
+    assert "RuntimeError" in warnings[0], "告警要写明异常类型，否则失败无从判断"
+    assert "bus broken" not in warnings[0], "告警不得带异常正文"
+
+    # 回调内部异常：必须被吞掉（总线用 gather 并发跑订阅者）
+    bot2 = _FakeBot()
+    p._ensure_echo_subscription("BOT1", bot2)
+    handler = bot2.subs[0][1]
+
+    async def boom(platform_id, raw):
+        raise RuntimeError("boom")
+
+    p._capture_push_echo = boom
+    asyncio.run(handler({"post_type": "message_sent"}))     # 不抛即通过
+
+    # 重载交接：上一个实例（或旧版本）的回调还挂在总线上时必须摘掉并换成本实例的。
+    # 守的静默失效：新实例看到"标记在 + 总线上有回调"就跳过订阅 → 新代码一条回显都收不到，
+    # 事件继续被**旧实例**按老代码处理（线上表现：重载后 push 依旧 no_cid、DB 里 origin=echo 零行）
+    async def handover():
+        p3 = _make_plugin()
+        p3.shared_store_shadow = True
+        p3._conversation_ids = {}
+        p3.db = _Db()
+        p3._echo_owner = "inst-new"
+        handover_bot = _FakeBot()
+        stale = p3._make_echo_handler("BOT1")
+        stale._chat_memory_echo_owner = "inst-old"          # 上一个实例留下的
+        handover_bot.on("message_sent")(stale)
+        setattr(handover_bot, "_chat_memory_echo_subscribed", "inst-old")
+        bus_subs = lambda: handover_bot._bus._subscribers.get("message_sent", set())
+        assert p3._ensure_echo_subscription("BOT1", handover_bot) is True, "必须重订"
+        assert stale not in bus_subs(), "旧实例的回调必须从总线摘掉（否则它还会收事件）"
+        assert len(bus_subs()) == 1 and p3._echo_owner_of(next(iter(bus_subs()))) == "inst-new"
+        assert getattr(handover_bot, "_chat_memory_echo_subscribed") == "inst-new"
+        # 已经是自己的订阅：不得重复订
+        assert p3._ensure_echo_subscription("BOT1", handover_bot) is False
+        assert len(bus_subs()) == 1
+        # 卸载交接：摘掉自己的回调、清标记，下一个实例才能干净接管
+        p3._platform_bots = {"BOT1": handover_bot}
+        assert p3._release_echo_subscriptions() == 1
+        assert not bus_subs(), "卸载必须摘掉自己的回调"
+        assert not getattr(handover_bot, "_chat_memory_echo_subscribed")
+        await asyncio.sleep(0)
+
+    asyncio.run(handover())
+    # 总线没有 unsubscribe 接口：退回直接摘订阅表（同样要摘掉）
+    async def fallback():
+        p4 = _make_plugin()
+        p4.shared_store_shadow = True
+        p4._conversation_ids = {}
+        p4.db = _Db()
+        p4._echo_owner = "inst-new"
+        bus_bot = _FakeBot(bus=_BareBus())
+        stale2 = p4._make_echo_handler("BOT1")
+        stale2._chat_memory_echo_owner = "inst-old"
+        bus_bot.on("message_sent")(stale2)
+        assert p4._ensure_echo_subscription("BOT1", bus_bot) is True
+        assert stale2 not in bus_bot._bus._subscribers.get("message_sent", set())
+        # 退订接口存在但报错（平台 API 变形）：必须回退直接摘订阅表，旧回调不能留下
+        class _RaisingUnsubBus(_FakeBus):
+            def unsubscribe(self, event, func):
+                raise RuntimeError("no unsubscribe")
+
+        broken_bot = _FakeBot(bus=_RaisingUnsubBus())
+        stale3 = p4._make_echo_handler("BOT1")
+        stale3._chat_memory_echo_owner = "inst-old"
+        broken_bot.on("message_sent")(stale3)
+        assert p4._ensure_echo_subscription("BOT1", broken_bot) is True
+        assert stale3 not in broken_bot._bus._subscribers.get("message_sent", set())
+        await asyncio.sleep(0)
+
+    asyncio.run(fallback())
+    print("[T85] echo_subscription_and_handler_isolation ✓")
+
+
+def test_capture_push_echo_contract():
+    """推送回显落库契约：只认自己发的、要平台 uid、要 cid，写 origin=echo 的平台键行。
+
+    任一条件放松都会静默写错：别人的发言被记成自己说的、没有 real_seq 的行永远
+    合并不上观察侧、cid 缺失的行在读者视图里凭空消失。
+
+    另守一处"通道看着正常、实际一行没落"的静默失效：归一必需的接收时刻漏传会被
+    ``normalize_record`` 整条拒收；影子写被跳过时不得当成功上报。
+    """
+    p = _make_plugin()
+    p.shared_store_shadow = True
+    p.max_len = 0
+    p.log_with_bot_id = False
+    p._conversation_ids = {("BOT1", "GroupMessage", "group_demo"): "cid1"}
+    recorded = []
+    db_cid = {"value": ""}
+    insert_ok = {"value": True}
+
+    async def fake_shadow_insert(umo, cid, user_id, role, content, **kwargs):
+        recorded.append((umo, cid, user_id, role, content, kwargs))
+        return insert_ok["value"]
+
+    class _Db:
+        async def shadow_conversation_id(self, **_kwargs):
+            return db_cid["value"]
+
+    p._safe_insert_shadow_only = fake_shadow_insert
+    p.db = _Db()
+    p._platform_name_of = lambda platform_id: "aiocqhttp"
+
+    base = {
+        "post_type": "message_sent", "message_sent_type": "self",
+        "self_id": 20001, "user_id": 20001, "message_type": "group",
+        "group_id": "group_demo", "time": 1756900000, "real_seq": "9101",
+        "sender": {"user_id": 20001, "nickname": "BOT"},
+        "message": [
+            {"type": "text", "data": {"text": "晚上好"}},
+            {"type": "image", "data": {"file": "x.jpg"}},
+        ],
+    }
+
+    async def run():
+        assert await p._capture_push_echo("BOT1", "不是字典") is False
+        assert await p._capture_push_echo("BOT1", {**base, "post_type": "message"}) is False
+        # 别人的发言（sender != self_id）不得记成自己发的
+        assert await p._capture_push_echo(
+            "BOT1", {**base, "sender": {"user_id": 10001}}
+        ) is False
+        assert await p._capture_push_echo("BOT1", {**base, "real_seq": ""}) is False
+        assert await p._capture_push_echo(
+            "BOT1", {**base, "group_id": "group_unknown"}
+        ) is False
+
+        # 冷启动：内存表没这个会话 → 必须按会话回查 DB 拿到 cid（线上 18/18 条都死在这）
+        p._conversation_ids.clear()
+        db_cid["value"] = "cid-from-db"
+        recorded.clear()
+        assert await p._capture_push_echo("BOT1", base) is True
+        assert recorded and recorded[0][1] == "cid-from-db", recorded
+        # 内存表里有的优先用内存（不再回查）
+        p._conversation_ids[("BOT1", "GroupMessage", "group_demo")] = "cid1"
+        db_cid["value"] = ""
+        recorded.clear()
+        assert await p._capture_push_echo("BOT1", base) is True
+        assert recorded and recorded[0][1] == "cid1", recorded
+        # 内存与 DB 都没有：不落库，交给拉取通道
+        p._conversation_ids.clear()
+        recorded.clear()
+        assert await p._capture_push_echo("BOT1", base) is False
+        assert not recorded, "拿不到 cid 时不得落库"
+
+        # 收尾：恢复一条能落库的调用，供下面校验落库字段
+        p._conversation_ids[("BOT1", "GroupMessage", "group_demo")] = "cid1"
+        recorded.clear()
+        assert await p._capture_push_echo("BOT1", base) is True
+
+    asyncio.run(run())
+    assert len(recorded) == 1, f"只有合格的一条回显才落库：{recorded}"
+    umo, cid, target, role, content, kwargs = recorded[0]
+    assert umo == "BOT1:GroupMessage:group_demo" and cid == "cid1"
+    assert role == "assistant" and target == "20001" and content == "晚上好"
+    # 到货渠道不进取义（表里也没有 origin 列了）：回显行同样是平台消息，
+    # 是不是本实例发出的形态由 claim_turn 表达（有活跃轮次时才认领）
+    assert "origin" not in kwargs and kwargs["post_type"] == "message_sent"
+    assert kwargs["claim_turn"] in (True, False)
+    assert kwargs["platform_uid"] == "9101", "回显必须带平台共享 id"
+    assert kwargs["platform_timestamp"] == 1756900000
+    assert kwargs["raw_timestamp"] == 1756900000, (
+        "回显必须带接收时刻：归一缺 rts 会整条拒收，push 通道会静默一条不落"
+    )
+    assert kwargs["content_kind"] == ["text", "image"]
+    assert kwargs["message_type"] == "GroupMessage" and kwargs["session_id"] == "group_demo"
+
+    # 影子写被跳过（归一拒收/写异常）时不得当成功：否则"通道正常"是假象
+    insert_ok["value"] = False
+    assert asyncio.run(p._capture_push_echo("BOT1", base)) is False
+
+    # 影子写返回值必须原样透传：insert 报"数据不足被跳过"时不能当成功
+    class _InsertDb:
+        def __init__(self, value):
+            self.value = value
+
+        async def insert(self, *_a, **_k):
+            return self.value
+
+    p2 = _make_plugin()
+    p2.log_with_bot_id = False
+    p2.db = _InsertDb(False)
+    assert asyncio.run(p2._safe_insert_shadow_only("u", "c", "1", "assistant", "x")) is False
+    p2.db = _InsertDb(True)
+    assert asyncio.run(p2._safe_insert_shadow_only("u", "c", "1", "assistant", "x")) is True
+    print("[T86] capture_push_echo_contract ✓")
+
+
+def test_echo_subscribe_poll_is_eager():
+    """订阅巡检不依赖消息：一轮巡检就把所有平台实例订上（测试端没有消息也要能验）。
+
+    守的静默失效：改成"收到消息才订阅"后，测试端与冷启动环境永远订不上，
+    表现为"平台没给回显"，实际是我们没订。
+    """
+    p = _make_plugin()
+    p.shared_store_shadow = True
+    p._conversation_ids = {}
+    p._echo_subscribe_failed = set()
+    p._echo_poll_rounds = 0
+    p._echo_poll_last = ""
+    p._platform_bots = {}
+
+    class _Db:
+        pass
+
+    class _Meta:
+        def __init__(self, pid):
+            self.id = pid
+            self.name = "aiocqhttp"
+
+    class _Inst:
+        def __init__(self, pid, bot):
+            self._pid = pid
+            self.bot = bot
+
+        def meta(self):
+            return _Meta(self._pid)
+
+    p.db = _Db()
+    bots = {pid: _FakeBot() for pid in ("BOT1", "BOT2", "BOT3")}
+
+    class _PM:
+        def get_insts(self):
+            return [_Inst(pid, bot) for pid, bot in bots.items()]
+
+    class _Ctx:
+        platform_manager = _PM()
+
+    p.context = _Ctx()
+
+    async def run():
+        assert await p._poll_echo_subscriptions() == 3
+        assert await p._poll_echo_subscriptions() == 3   # 幂等：第二轮不重复订阅
+
+    asyncio.run(run())
+    for pid, bot in bots.items():
+        assert [n for n, _ in bot.subs] == ["message_sent"], (pid, bot.subs)
+    # 幂等标记可能失真（平台重载换过总线）：总线里没有我们的回调时要能自愈重订
+    bus = bots["BOT1"]._bus
+    bus._subscribers.clear()
+    async def heal():
+        assert p._ensure_echo_subscription("BOT1", bots["BOT1"]) is True, "标记在、总线没了 → 必须重订"
+
+    asyncio.run(heal())
+    assert any(
+        getattr(h, "_chat_memory_echo_handler", False)
+        for h in bots["BOT1"]._bus._subscribers.get("message_sent", ())
+    ), "重订后总线上必须真的挂着回调"
+    assert p._echo_poll_rounds == 2, p._echo_poll_rounds
+
+    # 平台还没加载完时返回 0（巡检下一轮再试），不得抛错
+    class _Empty:
+        def get_insts(self):
+            return []
+
+    p.context = type("_Ctx2", (), {"platform_manager": _Empty()})()
+    assert asyncio.run(p._poll_echo_subscriptions()) == 0
+    print("[T88] echo_subscribe_poll_is_eager ✓")
+
+
+def test_terminate_hands_over_echo_subscription():
+    """卸载/重载必须摘掉自己的回显订阅：总线不会随插件卸载自动退订。
+
+    守的静默失效：旧回调留在总线上（被总线强引用着继续收事件、按老代码处理），
+    下一个实例又因为"标记在 + 总线上有回调"跳过订阅 → 新代码永远收不到回显。
+    """
+    p = _make_plugin()
+    p.shared_store_shadow = True
+    p.log_with_bot_id = False
+    p._conversation_ids = {}
+    p._cleanup_task = None
+    p._media_cleanup_task = None
+    p._echo_watch_task = None
+    p._shadow_tasks = set()
+    p._echo_owner = "inst-a"
+
+    class _Db:
+        pass
+
+    class _Engine:
+        async def dispose(self):
+            pass
+
+    class _Archiver:
+        async def stop(self):
+            pass
+
+    p.db = _Db()
+    p.db.engine = _Engine()
+    p.media_archiver = _Archiver()
+    bot = _FakeBot()
+    p._platform_bots = {"BOT1": bot}
+    assert p._ensure_echo_subscription("BOT1", bot) is True
+    assert bot._bus._subscribers.get("message_sent"), "先把订阅装上"
+    asyncio.run(p.terminate())
+    assert not bot._bus._subscribers.get("message_sent"), "卸载后不得留下自己的回调"
+    assert not getattr(bot, "_chat_memory_echo_subscribed"), "标记要清掉，别让下一个实例误判"
+
+
+def test_media_dedup_migration():
+    """老库媒体文件改名去重（内容寻址迁移）：同内容只留一份，文件已不在的行要标掉。
+
+    守的静默失效：① 「文件已不在」的行永远占着待迁移集合前排 → 后面的行永久不迁移，
+    迁移看起来在跑却永远跑不完；② 重复文件删了、行仍指着旧名 → 读路径取不到文件。
+    """
+    from chat_memory.media_archive import MediaArchiver
+
+    class _Db:
+        def __init__(self, rows):
+            self.rows = rows
+            self.updates = []
+
+        async def query_media_without_hash(self, limit=200):
+            return list(self.rows)
+
+        async def update_media_content_hash(self, media_id, *, content_hash, file_name=""):
+            self.updates.append((media_id, content_hash, file_name))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "data"
+        created_at = datetime(2026, 9, 1, 12, 0, 0)
+        month_dir = data_dir / "media" / "202609"        # _dest: <data>/media/<YYYYMM>/
+        month_dir.mkdir(parents=True)
+        first = month_dir / ("a" * 32 + ".jpg")
+        second = month_dir / ("b" * 32 + ".jpg")
+        first.write_bytes(b"same-bytes")
+        second.write_bytes(b"same-bytes")
+        rows = [
+            {"media_id": "a" * 32, "file_name": first.name, "ext": "jpg",
+             "created_at": created_at, "size_bytes": 10},
+            {"media_id": "b" * 32, "file_name": second.name, "ext": "jpg",
+             "created_at": created_at, "size_bytes": 10},
+            {"media_id": "c" * 32, "file_name": "c" * 32 + ".jpg", "ext": "jpg",
+             "created_at": created_at, "size_bytes": 10},   # 文件已不在
+        ]
+        db = _Db(rows)
+        archiver = MediaArchiver(db, data_dir, enabled=True, include_video=False,
+                                 retention_days=30, max_total_mb=64)
+        assert asyncio.run(archiver.dedup_existing(limit=10)) == 3, "三行都要被处理掉"
+        assert len(list(month_dir.iterdir())) == 1, "同内容只留一份文件"
+        updates = {mid: (h, name) for mid, h, name in db.updates}
+        assert updates["a" * 32][0] and updates["a" * 32][0] == updates["b" * 32][0]
+        assert updates["a" * 32][1] == updates["b" * 32][1], "同内容的两行指向同一个文件"
+        assert updates["a" * 32][1] == f"{updates['a' * 32][0]}.jpg", "文件名＝内容哈希+扩展名"
+        assert updates["c" * 32][0] == "", "文件已不在的行标成无需迁移（空哈希）"
+        # 单轮读取量上限：预算用尽就停手，剩下的行留给下一轮（否则视频库一轮读几十 GB），
+        # 而且不能被当成"已迁移"标掉——否则那些行就再也不会被处理了。
+        fresh = month_dir / ("d" * 32 + ".jpg")
+        fresh.write_bytes(b"another-bytes")
+        db2 = _Db([{"media_id": "d" * 32, "file_name": fresh.name, "ext": "jpg",
+                    "created_at": created_at, "size_bytes": 10}])
+        archiver2 = MediaArchiver(db2, data_dir, enabled=True, include_video=False,
+                                  retention_days=30, max_total_mb=64)
+        assert asyncio.run(archiver2.dedup_existing(limit=10, max_bytes=0)) == 0
+        assert db2.updates == [], "没轮到的行不得标记成已迁移"
+        assert fresh.is_file(), "没轮到的行不得动文件"
+        print("[T23b] media_dedup_migration ✓")
+
+
+def test_echo_turn_attribution_ledger():
+    _ECHO_CLAIM_GRACE_SEC = _mod_ns["_ECHO_CLAIM_GRACE_SEC"]
+    """push 回显的轮次归属靠发送侧记账（不再用正文+时间窗猜）。
+
+    守的静默失效：记账失效时回显仍会落库（看着一切正常），但**归不到轮次**——
+    表现为"自己发言只剩计划全文"、按轮取用时缺实际形态。
+    """
+    p = _make_plugin()
+    audit = {
+        "platform_id": "BOT1", "platform_name": "aiocqhttp",
+        "message_type": "GroupMessage", "session_id": "ledger_demo",
+    }
+    assert p._claim_turn_for_echo(audit) == {}, "没记过账就没有可归的轮次"
+    p._note_active_turn(
+        turn_id="t1", cid="c1", persona_id="p_demo", audit=audit, target_id="10001",
+        llm_status="llm_success",
+    )
+    # persona 必须一起带出来：回显事件里没有 persona，只能靠记账——丢了它，回显那一段在
+    # 按 persona 过滤的读路径里会整段消失（线上 111 行就是这样空的）。
+    # target_id 同理：回显事件里"发送者"是 BOT 自己，拿它当 target 会让这一段落不进
+    # "当前用户"的读范围（切读后只剩计划全文）。
+    # llm_status 同理：回显事件里没有这个状态，只能在发送侧记账时带过来，否则查询台高级
+    # 模式把每一轮回复都显示成 no_llm。
+    assert p._claim_turn_for_echo(audit) == {
+        "turn_id": "t1", "cid": "c1", "persona_id": "p_demo", "target_id": "10001",
+        "llm_status": "llm_success",
+    }
+    # 发送流程结束 → 宽限期内仍算本轮（多段回显在发送后才陆续到齐）
+    p._close_active_turn(turn_id="t1", audit=audit)
+    entry = p._turn_ledger()[("BOT1", "GroupMessage", "ledger_demo")]
+    assert entry["closed_at"] > 0
+    assert p._claim_turn_for_echo(audit)["turn_id"] == "t1", "宽限期内仍归本轮"
+    # 超过宽限 → 不再认领（迟到回显只落物理行）
+    entry["closed_at"] -= _ECHO_CLAIM_GRACE_SEC + 5
+    assert p._claim_turn_for_echo(audit) == {}
+    assert ("BOT1", "GroupMessage", "ledger_demo") not in p._turn_ledger(), "过期条目要清掉"
+    # 新的一轮覆盖旧轮（同一个会话里后一轮的段必须归到后一轮）
+    p._note_active_turn(turn_id="t2", cid="c2", audit=audit)
+    assert p._claim_turn_for_echo(audit) == {
+        "turn_id": "t2", "cid": "c2", "persona_id": "", "target_id": "",
+        "llm_status": "",
+    }
+    # 别的会话互不干扰
+    other = {**audit, "session_id": "other_demo"}
+    assert p._claim_turn_for_echo(other) == {}
+
+
+def test_push_missing_declaration():
+    _PUSH_DECLARE_ROUNDS = _mod_ns["_PUSH_DECLARE_ROUNDS"]
+    """没订上 push 时只声明一次（用户唯一能知道"为什么只剩计划全文"的地方）。
+
+    守的静默失效：条件写错 → 要么永远不提醒（用户只能看到功能降级却不知原因），
+    要么每次巡检都刷屏。订上了必须永不打扰。
+    """
+    p = _make_plugin()
+    p._echo_poll_rounds = 1
+    assert p._declare_push_missing(bot_ready=1) is False, "前几轮先不说话"
+    p._echo_poll_rounds = _PUSH_DECLARE_ROUNDS
+    assert p._declare_push_missing(bot_ready=0) is False, "没有就绪的客户端时不说"
+    assert p._declare_push_missing(bot_ready=1) is True, "有客户端但没订上 → 声明一次"
+    assert p._declare_push_missing(bot_ready=1) is False, "重复巡检不得刷屏"
+    q = _make_plugin()
+    q._echo_poll_rounds = _PUSH_DECLARE_ROUNDS
+    q._push_subscribed_platforms = {"BOT1"}
+    assert q._declare_push_missing(bot_ready=1) is False, "订上了就永不打扰"
+
+def test_takeover_v2_read_source():
+    """takeover 选读源：source="v2" 必须走影子层读方法，V1 一字不改。
+
+    守的静默失效：开关写错或漏传时仍读旧表——对拍/灰度会得出"V2 没问题"的错误结论，
+    而用户看到的仍是旧数据。
+    """
+    _SHADOW_READ_MIN_DAYS = _mod_ns["_SHADOW_READ_MIN_DAYS"]
+    p = _make_plugin()
+    p.ct_enable = True
+    p.ct_llm_status_filter = ["llm_success"]
+    p.ct_limit_rounds = 3
+    p.ct_include_kinds = {"text"}
+    p.ct_include_all_match = False
+    p.ct_filter_by_persona = False
+    p.ct_cross_session = False
+    p.ct_full_group = False
+    p.ct_recall_skip_context = False
+    calls: list[str] = []
+
+    class _Db:
+        async def query_rounds_raw(self, *a, **k):
+            calls.append("v1-rounds")
+            return []
+
+        async def query_rounds_raw_v2(self, *a, **k):
+            calls.append("v2-rounds")
+            return []
+
+        async def query_messages_raw(self, *a, **k):
+            calls.append("v1-messages")
+            return []
+
+        async def query_messages_raw_v2(self, *a, **k):
+            calls.append("v2-messages")
+            return []
+
+    p.db = _Db()
+    umo = "BOT1:GroupMessage:group_demo"
+    asyncio.run(p._takeover_query(umo, "cid_demo", "10001"))
+    asyncio.run(p._takeover_query(umo, "cid_demo", "10001", source="v2"))
+    # 非 llm_success 白名单 → 混合模式（消息级切片），也要跟着切源
+    p.ct_llm_status_filter = ["llm_success", ""]
+    asyncio.run(p._takeover_query(umo, "cid_demo", "10001", source="v2"))
+    assert calls == ["v1-rounds", "v2-rounds", "v2-messages"], calls
+
+    # 单开关 × 门槛：没勾 → 旧表；勾了但窗口没满 → 旧表；勾了且满 7 天 → 合并存储
+    cases = [
+        (False, False, "v1-rounds"),
+        (True, False, "v1-rounds"),
+        (True, True, "v2-rounds"),
+    ]
+    for enabled, ready, want in cases:
+        calls.clear()
+        p.ct_llm_status_filter = ["llm_success"]
+        p.shadow_read = enabled
+        p._shadow_read_ready = ready
+        asyncio.run(p._takeover_query(umo, "cid_demo", "10001"))
+        assert calls == [want], (enabled, ready, calls)
+    # 门槛判定：按双写窗口天数解锁；配置了但没到日子要能在日志里看见
+    class _WindowDb:
+        def __init__(self, days):
+            self.days = days
+
+        async def dual_write_window_days(self):
+            return self.days
+
+    class _CaptureLogger:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def _add(self, level, msg, *a, **k):
+            self.lines.append(f"{level}: {msg}")
+
+        def debug(self, msg, *a, **k):
+            self._add("debug", msg)
+
+        def info(self, msg, *a, **k):
+            self._add("info", msg)
+
+        def warning(self, msg, *a, **k):
+            self._add("warning", msg)
+
+        def error(self, msg, *a, **k):
+            self._add("error", msg)
+
+    captured = _CaptureLogger()
+    _original_logger = _mod_ns["logger"]
+    _mod_ns["logger"] = captured
+    # 守的是"正式门槛"：用例内把调试开关临时关掉（它只用于本机预览），
+    # 这样无论仓库里那个常量当前取值如何，"未满必须锁定"都被硬断言，不会因开关打开而静默跳过。
+    original_flag = _mod_ns["_DEBUG_IGNORE_CUTOVER_WINDOW"]
+    _mod_ns["_DEBUG_IGNORE_CUTOVER_WINDOW"] = False
+    try:
+        p.db = _WindowDb(3.0)
+        p.shadow_read = True
+        asyncio.run(p._refresh_shadow_read_gate())
+        assert p._shadow_read_ready is False, "双写未满 7 天必须锁定"
+        assert p._shadow_read_source() == "v1", "未满门槛只能读旧表"
+        assert any("还需约 4.0 天" in line for line in captured.lines), captured.lines
+        captured.lines.clear()
+        p.db = _WindowDb(_SHADOW_READ_MIN_DAYS + 0.5)
+        asyncio.run(p._refresh_shadow_read_gate())
+        assert p._shadow_read_ready is True, "满门槛必须解锁"
+        assert p._shadow_read_source() == "v2"
+        assert any("切读已生效" in line for line in captured.lines), captured.lines
+        # 显式 source="v2" 不受门槛限制（对拍/灰度用的程序化开关）
+        assert p._resolve_read_source("v2") == "v2"
+    finally:
+        _mod_ns["logger"] = _original_logger
+        _mod_ns["_DEBUG_IGNORE_CUTOVER_WINDOW"] = original_flag
+
+    # 影子层读失败 → 回退旧表，绝不返回空上下文（这是切读的兜底）
+    class _Broken(_Db):
+        async def query_rounds_raw_v2(self, *a, **k):
+            calls.append("v2-rounds-boom")
+            raise RuntimeError("shadow broken")
+        async def query_rounds_raw(self, *a, **k):
+            calls.append("v1-rounds")
+            return [[{"role": "user", "content": "提问"}, {"role": "assistant", "content": "回答"}]]
+
+    calls.clear()
+    p.shadow_read = True
+    p._shadow_read_ready = True
+    p.db = _Broken()
+    out, actual_src = asyncio.run(p._takeover_query(umo, "cid_demo", "10001"))
+    assert calls == ["v2-rounds-boom", "v1-rounds"], calls
+    assert [r["content"] for r in out] == ["提问", "回答"], out
+    assert actual_src == "v1", "回退后必须汇报实际读源（Reply 目标/工具段靠它保持同源）"
+    assert p._shadow_read_failures == 1, "回退要计数（日志据此限流、统计据此对账）"
+    p.db = _Db()
+    p.shadow_read = False
+    # 公开入口：build_takeover_contexts_v2 必须把 source 透传下去
+    seen: list[str] = []
+
+    async def _fake_takeover(umo, cid, user_id, persona_id="", exclude_turn_id="",
+                             force_current_session=False, source="v1"):
+        seen.append(source)
+        return [], source
+
+    p._takeover_query = _fake_takeover
+    p.ct_enable = True
+    asyncio.run(p.build_takeover_contexts_v2(umo, "10001", "cid_demo"))
+    assert seen == ["v2"], seen
+    # 空 source 跟随配置：勾了切读 → v2
+    p.shadow_read = True
+    asyncio.run(p.build_takeover_contexts(umo, "10001", "cid_demo"))
+    assert seen == ["v2", "v2"], seen
+    # 显式 source 覆盖配置
+    asyncio.run(p.build_takeover_contexts(umo, "10001", "cid_demo", source="v1"))
+    assert seen == ["v2", "v2", "v1"], seen
+
+    # 公开查询 API：勾了切读后内部切 V2，失败回退 V1（方法名不变）
+    class _ApiDb:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.boom = False
+
+        async def query_latest_v2(self, *a, **k):
+            self.calls.append("latest_v2")
+            if self.boom:
+                raise RuntimeError("boom")
+            return [{"content": "来自合并存储"}]
+
+        async def query_latest(self, *a, **k):
+            self.calls.append("latest_v1")
+            return [{"content": "来自旧表"}]
+
+        async def query_rounds_v2(self, *a, **k):
+            self.calls.append("rounds_v2")
+            if self.boom:
+                raise RuntimeError("boom")
+            return [[{"content": "u"}, {"content": "a"}]]
+
+        async def query_rounds(self, *a, **k):
+            self.calls.append("rounds_v1")
+            return [[{"content": "u1"}, {"content": "a1"}]]
+
+    api_db = _ApiDb()
+    p._shadow_read_ready = True
+    p.db = api_db
+    p.shadow_read = True
+    assert asyncio.run(p.query_history(umo, "cid_demo"))[0]["content"] == "来自合并存储"
+    assert api_db.calls == ["latest_v2"], api_db.calls
+    api_db.boom = True
+    assert asyncio.run(p.query_rounds(umo, "cid_demo"))[0][0]["content"] == "u1"
+    assert api_db.calls == ["latest_v2", "rounds_v2", "rounds_v1"], api_db.calls
+
+    # 工具段与历史必须同源：v2 时读影子工具表，读失败回退旧表（不能一半新一半旧）
+    class _ToolDb:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.boom = False
+
+        async def query_tool_records_v2(self, *a, **k):
+            self.calls.append("tools_v2")
+            if self.boom:
+                raise RuntimeError("boom")
+            return [{
+                "turn_id": "t1", "call_index": 1, "tool_name": "draw",
+                "tool_args": "{}", "tool_result": "ok",
+                "created_at": "2026-01-01 00:00:00",
+            }]
+
+        async def query_tool_records(self, *a, **k):
+            self.calls.append("tools_v1")
+            return []
+
+    tool_db = _ToolDb()
+    p.db = tool_db
+    p.ct_keep_tool_turns = 2
+    p.shadow_read = False
+    assert asyncio.run(p._query_tool_contexts(umo, "cid_demo")) == []
+    assert tool_db.calls == ["tools_v1"], tool_db.calls
+    tool_db.calls.clear()
+    p.shadow_read = True
+    p._shadow_read_ready = True
+    contexts = asyncio.run(p._query_tool_contexts(umo, "cid_demo"))
+    assert tool_db.calls == ["tools_v2"] and contexts, tool_db.calls
+    tool_db.calls.clear()
+    tool_db.boom = True
+    asyncio.run(p._query_tool_contexts(umo, "cid_demo"))
+    assert tool_db.calls == ["tools_v2", "tools_v1"], tool_db.calls
+    print("[T90] takeover_v2_read_source ✓")
+
 
 
 if __name__ == "__main__":

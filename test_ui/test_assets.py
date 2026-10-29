@@ -51,7 +51,7 @@ class AssetsTestCase(unittest.TestCase):
         self.assertIsNotNone(collect_deleted, "collectQuery 未找到")
         self.assertIn("deleted_state", collect_deleted.group(0))
         self.assertIn("filter-deleted", html)
-        for option in ('value="all">All<', 'value="visible" selected>未删除<',
+        for option in ('value="all">all<', 'value="visible" selected>未删除<',
                        'value="deleted">已删除<'):
             self.assertIn(option, html, option)
         self.assertIn("id=\"mode-toggle\"", html)
@@ -64,6 +64,13 @@ class AssetsTestCase(unittest.TestCase):
         self.assertIn("write_enabled", javascript)
         # 工具调用表同样支持单条软删除：同一下拉 + 同一套图标/chip
         self.assertIn("tool-filter-deleted", html)
+        # 下拉统一口径：首项是全集（all / group + private / user + assistant）
+        self.assertIn('<option value="">all</option>', html)
+        self.assertIn('<option value="">group + private</option>', html)
+        self.assertIn('<option value="">user + assistant</option>', html)
+        self.assertIn('<option value="1">仅看配对</option>', html)
+        # 工具页不再有 turn_id 精确搜索
+        self.assertNotIn("tool-filter-turn", html)
         collect_tools = _re.search(
             r"function collectToolQuery\b[\s\S]*?\n}", javascript
         )
@@ -75,24 +82,34 @@ class AssetsTestCase(unittest.TestCase):
         set_mode = _re.search(r"function setDeleteMode\b[\s\S]*?\n}", javascript)
         self.assertIsNotNone(set_mode, "setDeleteMode 未找到")
         self.assertIn("runToolQuery", set_mode.group(0))
-        # 工具卡片区分"轮内序号"与"记录 ID"
-        self.assertIn("轮内 #${record.call_index} · 记录 #${record.tool_id}", javascript)
-        # 展示层不再预截断：UMO/CID/turn_id 全部输出完整值（列表徽章 title 亦为完整值）
+        # 工具卡片只留"第几步"与可读会话；技术值（轮次/UMO/CID/记录 ID）收进详情
+        self.assertIn("function toolStepLabel", javascript)
+        self.assertIn("轮 ${short} · 第 ${index} 次调用", javascript)
+        self.assertIn("function toolTurnShort", javascript)
+        self.assertNotIn("turn_no", javascript, "轮次编号不再另算")
+        self.assertIn("function toolCallerAvatar", javascript)
+        self.assertIn("['BOT', record.platform_id || '（未知）']", javascript)
+        self.assertIn("data-tool-detail-id", javascript)
+        self.assertIn("function openToolDetail", javascript)
+        self.assertNotIn("轮内 #", javascript, "卡片上不再出现轮内编号")
+        self.assertNotIn("记录 #${record.tool_id}", javascript, "卡片上不再出现记录 ID")
+        # 技术值仍完整输出，只是位置在详情字段表里
         self.assertNotIn("compactId", javascript)
-        self.assertIn('>${escapeHtml(record.umo)}</span>', javascript)
-        self.assertIn("cid:${escapeHtml(record.conversation_id", javascript)
-        self.assertIn('title="轮次 turn_id">turn:${escapeHtml(record.turn_id)}</span>', javascript)
-        self.assertIn('title="Conversation ID">cid:${escapeHtml(record.conversation_id)}</span>', javascript)
+        self.assertIn("['轮次 turn_id', record.turn_id || '（无）']", javascript)
+        self.assertIn("['会话 UMO', record.umo]", javascript)
+        self.assertIn("['Conversation ID', record.conversation_id]", javascript)
 
-        # 小节：查询台 about 版本与 metadata.yaml 一致（防双处漂移）
+        # 小节：查询台 about 版本必须来自 metadata.yaml（版本单源），不得在代码里写死
         import re as _re
 
         meta = (PLUGIN_ROOT / "metadata.yaml").read_text(encoding="utf-8")
         version_match = _re.search(r"^version:\s*(\S+)\s*$", meta, _re.M)
         self.assertIsNotNone(version_match, "metadata.yaml 缺少 version")
-        version = version_match.group(1)
         web_api = (PLUGIN_ROOT / "ui" / "web_api.py").read_text(encoding="utf-8")
-        self.assertIn(f'"version": "{version}"', web_api, "about 版本与 metadata 不一致")
+        self.assertIn('"version": self.plugin_version', web_api, "about 版本必须由 main 从 metadata 传入")
+        self.assertNotRegex(
+            web_api, r'"version":\s*"\d', "about 版本号不得写死（升版后会静默显示旧版本）"
+        )
 
         # 小节：配置 schema 为合法 JSON
         import json

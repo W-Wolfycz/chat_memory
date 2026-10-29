@@ -132,7 +132,7 @@ def _media_source_ref(comp, kind: str) -> Optional[dict]:
 
 def extract_user_template(
     event: AstrMessageEvent,
-) -> tuple[str, list[dict], list, Optional[dict]]:
+) -> tuple[str, list[dict], list, Optional[dict], list]:
     """按 MessageChain 顺序构建正文模板、media 条目（含元信息/归档 id）、
     媒体来源引用和 Reply 快照种子。"""
     try:

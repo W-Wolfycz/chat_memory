@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 from quart import request
 
+from ..shared_store import SHADOW_SCHEMA_VERSION
 from .repository import ChatMemoryRepository, DatabaseUnavailableError
 
 
@@ -39,9 +40,14 @@ class ChatMemoryUiWebApi:
         repository_updater: RepositoryUpdater | None = None,
         media_root: str | Path | None = None,
         export_dir: str | Path | None = None,
+        group_names_loader: Callable[[], Awaitable[dict[str, str]]] | None = None,
+        plugin_version: str = "",
     ) -> None:
         self.context = context
         self.repository = repository
+        # 版本号单源是 metadata.yaml（main 读后传入）；读不到就显示 unknown，
+        # 不再在这里写死字面量——升版后页脚会静默停在旧版本号。
+        self.plugin_version = str(plugin_version or "") or "unknown"
         self.default_database_path = Path(
             default_database_path or repository.db_path
         ).resolve(strict=False)
@@ -52,13 +58,19 @@ class ChatMemoryUiWebApi:
         self.export_dir = (
             Path(export_dir).resolve(strict=False) if export_dir else None
         )
+        # 群名读取器（插件注入）：现查 get_group_list，不落库
+        self.group_names_loader = group_names_loader
+
+    async def snapshot(self):
+        """锁定当前库快照（进页面/点刷新各调一次）。"""
+        return await self._call(self.repository.snapshot)
 
     async def about(self):
         return _ok(
             {
                 "name": PLUGIN_NAME,
                 "display_name": "ChatMemory 查询台",
-                "version": "1.5.4",
+                "version": self.plugin_version,
                 "read_only": True,
                 # 查询台仍只读；软删除/恢复是唯一写入口（单条记录，仅插件实时库）
                 "write_enabled": bool(self.repository.writable),
@@ -97,19 +109,24 @@ class ChatMemoryUiWebApi:
         return await self._call(self.repository.overview)
 
     async def facets(self):
+        # 与 POST /query 的筛选键保持一致（旧键名 umo/cid/role/llm_status 已下线）
         filters = {
             key: request.args.get(key, None)
             for key in (
-                "umo",
-                "conversation_id",
-                "user_id",
-                "persona_id",
-                "role",
-                "llm_status",
+                "keyword",
+                "chat_type",
+                "session_id",
+                "sender",
                 "content_kind",
-                "platform_name",
-                "message_type",
+                "event_type",
+                "since",
+                "until",
                 "deleted_state",
+                "persona_id",
+                "advanced",
+                "persona_role",
+                "persona_llm_status",
+                "paired_only",
             )
         }
         return await self._call(self.repository.facets, filters)
@@ -155,15 +172,29 @@ class ChatMemoryUiWebApi:
             payload.get("target") or "record",
         )
 
+    async def personas(self):
+        """高级只读模式：可选 persona 列表（参与行上出现过的）。"""
+        return await self._call(self.repository.personas)
+
+    async def group_names(self):
+        """群号 → 群名（现查，不落库）；拿不到就返回空表，前端保持原样。"""
+        if self.group_names_loader is None:
+            return _ok({"groups": {}})
+        try:
+            mapping = await self.group_names_loader()
+        except Exception:  # noqa: BLE001 - 群名只是展示糖：拿不到就返回空表
+            return _ok({"groups": {}})
+        return _ok({"groups": dict(mapping or {})})
+
     async def media(self, media_id):
         """媒体二进制端点：默认返回原始字节；``?as=base64`` 返回内联 JSON。"""
         try:
             row = await self.repository.media_file(media_id)
         except ValueError as exc:
             return _error(str(exc), 400)
-        except Exception as exc:
+        except Exception:
             logger.exception("[ChatMemoryUI] 媒体查询失败")
-            return _error(f"查询失败：{exc}", 500)
+            return _error("查询失败（内部错误，详见服务端日志）", 500)
         if self.media_root is None:
             return _error("媒体目录不可用", 503)
         created_at = str(row.get("created_at") or "")
@@ -171,7 +202,7 @@ class ChatMemoryUiWebApi:
         if not month.isdigit() or len(month) != 6:
             return _error("归档记录时间异常", 500)
         file_name = str(row.get("file_name") or "")
-        # 纵深防御：归档写入侧已限定 <media_id>.<ext>，读侧仍拒绝路径分隔符/穿越
+        # 纵深防御：归档写入侧已限定 <内容哈希>.<ext>，读侧仍拒绝路径分隔符/穿越
         if not file_name or Path(file_name).name != file_name:
             return _error("归档记录文件名异常", 500)
         path = self.media_root / month / file_name
@@ -327,17 +358,21 @@ class ChatMemoryUiWebApi:
         if self.export_dir is None:
             return _error("导出目录不可用", 503)
         self.export_dir.mkdir(parents=True, exist_ok=True)
-        file_name = f"chat_memory_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.db"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"chat_memory_{stamp}_{uuid.uuid4().hex[:6]}.db"
         dest = self.export_dir / file_name
         try:
             size = await asyncio.to_thread(self.repository.export_snapshot, dest)
         except DatabaseUnavailableError as exc:
             dest.unlink(missing_ok=True)
-            return _error(str(exc), 503)
+            # 同样只回固定文案：这条异常的文案里带库绝对路径与 SQLite 原始报错。
+            logger.warning("[ChatMemoryUI] 导出快照不可用: %s", exc)
+            return _error("数据库当前不可读，无法导出快照", 503)
         except Exception as exc:
             dest.unlink(missing_ok=True)
+            # 异常串可能带绝对路径/SQLite 内部文案：只回固定文案，细节进服务端日志。
             logger.exception("[ChatMemoryUI] 导出快照失败")
-            return _error(f"导出失败：{exc}", 500)
+            return _error("导出失败（内部错误，详见服务端日志）", 500)
         try:
             await asyncio.to_thread(self._cleanup_exports)
         except Exception:
@@ -414,11 +449,17 @@ class ChatMemoryUiWebApi:
             return _error(str(exc), 503)
         except Exception as exc:
             logger.exception("[ChatMemoryUI] 查询 API 异常")
-            return _error(f"查询失败：{exc}", 500)
+            return _error("查询失败（内部错误，详见服务端日志）", 500)
 
     def register(self) -> None:
         endpoints = (
             ("about", self.about, ["GET"], "ChatMemory UI plugin info"),
+            (
+                "snapshot",
+                self.snapshot,
+                ["POST"],
+                "Lock a read snapshot of the database (rebuilt on refresh)",
+            ),
             ("settings", self.settings, ["GET"], "ChatMemory UI settings"),
             (
                 "settings",
@@ -444,6 +485,8 @@ class ChatMemoryUiWebApi:
                 "Restore a soft-deleted ChatMemory record",
             ),
             ("tools", self.query_tools, ["POST"], "Query ChatMemory tool calls"),
+            ("group-names", self.group_names, ["GET"], "ChatMemory group names"),
+            ("personas", self.personas, ["GET"], "ChatMemory personas"),
             (
                 "media/<media_id>",
                 self.media,
@@ -462,7 +505,7 @@ class ChatMemoryUiWebApi:
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}/{path}", handler, methods, description
             )
-        logger.info("[ChatMemoryUI] 已注册 %d 个只读 Web API", len(endpoints))
+        logger.info("[ChatMemoryUI] 已注册 %d 个 Web API", len(endpoints))
 
 
 async def _json_body() -> dict[str, Any] | None:

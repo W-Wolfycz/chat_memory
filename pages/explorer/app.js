@@ -1,7 +1,5 @@
 const PLUGIN_NAME = 'chat_memory';
 const bridge = window.AstrBotPluginPage || null;
-// 前端版本标记：F12 控制台能看到这行说明页面已加载最新 JS（沙箱 base64 桥接版）
-console.info('[chat_memory] 查询台已加载（video-gate v3：base64 桥接 + 16MB/HEVC 闸门）');
 
 const state = {
   about: null,
@@ -22,26 +20,27 @@ const state = {
   lastToolQuery: null,
   mediaObjectUrls: [],
   listMediaUrls: [],
+  groupNames: {},
+  groupNamesLoaded: false,
   voiceAudio: null,
   voiceUrls: [],
   voicePlayingId: null,
   detailRequestToken: 0,
   detailRecordId: null,
-  // 删除模式：点击「只读模式」切换；仅在该模式下出现单条软删除/恢复图标
+  // 列表是"第几条"（跨页连续），详情标题沿用这个编号；真实 id 只用于跳转
+  // 三种模式：只读（默认）/ 高级只读（加轮次 chip）/ 删除（出现单条软删除图标）
   deleteMode: false,
+  advancedMode: false,
+  personaOptions: [],
+  pairIndex: new Map(),
+  toolItems: new Map(),
 };
 
+// 下拉改动即重查的控件（文本类走"查询记录"按钮）
 const FACET_SELECTORS = [
-  '#filter-umo',
-  '#filter-conversation',
-  '#filter-user',
-  '#filter-persona',
-  '#filter-role',
-  '#filter-status',
+  '#filter-chat-type',
   '#filter-kind',
   '#filter-event-type',
-  '#filter-platform',
-  '#filter-message-type',
   '#filter-deleted',
 ];
 
@@ -55,6 +54,15 @@ async function apiGet(endpoint, params = {}) {
   });
   const suffix = search.toString() ? `?${search}` : '';
   const response = await fetch(`/api/plug/${PLUGIN_NAME}/${endpoint}${suffix}`);
+  return readJson(response);
+}
+
+async function readJson(response) {
+  // 401/网关错误会返回 HTML，直接 response.json() 只会抛 "Unexpected token '<'"
+  const type = (response.headers.get('content-type') || '').toLowerCase();
+  if (!response.ok || !type.includes('json')) {
+    throw new Error(`请求失败（HTTP ${response.status}）`);
+  }
   return response.json();
 }
 
@@ -65,7 +73,7 @@ async function apiPost(endpoint, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  return response.json();
+  return readJson(response);
 }
 
 function unwrap(response) {
@@ -115,25 +123,22 @@ async function fetchMediaObjectUrl(mediaId) {
 
 const ARCHIVE_MEDIA_KINDS = new Set(['image', 'video', 'voice', 'file']);
 
+// 会话类型是消息表自己的列（message_type），列表里给一个可读标签
+const CHAT_TYPE_LABELS = {
+  GroupMessage: '群聊',
+  FriendMessage: '私聊',
+  GroupTempMessage: '群临时会话',
+};
+
 function subtypeBadges(record) {
-  // 子类徽章：完全动态——event·<type> 读 relation_data.event.type，
-  // media·<kind> 读 media_view 里实际出现的每个 kind，不写死任何清单。
-  const badges = [];
+  // 只保留消息自身派生的信息：事件子类（relation_data.event.type）。
+  // media·<kind> 与上面的 kinds 徽章重复，媒体实际内容看缩略图/详情，不再重复标。
   const eventType = record.relation_data
     && record.relation_data.event
     && record.relation_data.event.type;
-  if (eventType) {
-    badges.push(`<span class="badge sub">event·${escapeHtml(eventType)}</span>`);
-  }
-  const mediaKinds = new Set(
-    (Array.isArray(record.media_view) ? record.media_view : [])
-      .map((item) => (item && item.kind) || '')
-      .filter(Boolean)
-  );
-  mediaKinds.forEach((kind) => {
-    badges.push(`<span class="badge sub">media·${escapeHtml(kind)}</span>`);
-  });
-  return badges;
+  return eventType
+    ? [`<span class="badge sub">event·${escapeHtml(eventType)}</span>`]
+    : [];
 }
 
 function downloadMedia(mediaId, name) {
@@ -517,6 +522,20 @@ function bindVoiceBubbles(root) {
   });
 }
 
+const PERSONA_EMPTY = '__empty__';
+
+function personaFilterValue() {
+  const value = $('#filter-persona').value;
+  return value === PERSONA_EMPTY ? PERSONA_EMPTY : value;
+}
+
+// 工具页的 persona 下拉与记录页同构：空串=all（不发送）、哨兵=「未标记 persona」。
+function toolPersonaValue() {
+  const value = $('#tool-filter-persona').value;
+  if (!value) return undefined;          // all：不带该键
+  return value === PERSONA_EMPTY ? PERSONA_EMPTY : value;
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -636,7 +655,13 @@ function renderOverview(data) {
 function renderActivity(daily) {
   const chart = $('#activity-chart');
   if (!daily.length) {
-    chart.innerHTML = '<div class="empty-state compact">近 30 天没有记录</div>';
+    // 空图必须能区分"最近 30 天确实没数据"和"统计坏了"：把库里实际的最新/最旧时间写出来
+    const summary = (state.overview && state.overview.summary) || {};
+    const newest = summary.newest_at || '—';
+    const oldest = summary.oldest_at || '—';
+    chart.innerHTML =
+      '<div class="empty-state compact">近 30 天没有记录' +
+      `<p>库里最新一条：${escapeHtml(newest)} · 最旧：${escapeHtml(oldest)}</p></div>`;
     $('#activity-total').textContent = '0 条';
     return;
   }
@@ -704,6 +729,9 @@ function resetDataSourceState() {
   state.requestToken += 1;
   state.facetRequestToken += 1;
   state.toolRequestToken += 1;
+  // 群名是"按库现查"的：换库后不清会继续显示上一个库的群名（同一群号在别的库里可能不存在）
+  state.groupNames = {};
+  state.groupNamesLoaded = false;
   state.lastQuery = null;
   state.lastToolQuery = null;
   state.page = 1;
@@ -714,16 +742,15 @@ function resetDataSourceState() {
   state.toolTotal = 0;
   $('#query-form').reset();
   $('#tool-query-form').reset();
-  $('#filter-umo').value = '';
-  $('#filter-conversation').value = '';
-  $('#filter-user').value = '';
-  $('#filter-persona').value = '__all__';
-  $('#filter-role').value = '';
-  $('#filter-status').value = '__all__';
+  $('#filter-chat-type').value = '';
+  $('#filter-session').value = '';
+  $('#filter-sender').value = '';
   $('#filter-kind').value = '';
   $('#filter-event-type').value = '';
-  $('#filter-platform').value = '';
-  $('#filter-message-type').value = '';
+  $('#filter-persona').value = '';
+  $('#filter-persona-role').value = '';
+  $('#filter-persona-status').value = '__all__';
+  $('#filter-paired-only').value = '';
   $('#filter-deleted').value = 'visible';
   $('#tool-filter-deleted').value = 'visible';
   $('#filter-page-size').value = '50';
@@ -806,85 +833,10 @@ function facetOptions({ allValue, allLabel, items, current, valueOf, labelOf, mi
 
 function populateFacets(data) {
   state.facets = data;
-  const current = {
-    umo: $('#filter-umo').value,
-    conversation: $('#filter-conversation').value,
-    user: $('#filter-user').value,
-    persona: $('#filter-persona').value,
-    role: $('#filter-role').value,
-    status: $('#filter-status').value,
-    kind: $('#filter-kind').value,
-    event_type: $('#filter-event-type').value,
-    platform: $('#filter-platform').value,
-    messageType: $('#filter-message-type').value,
-  };
-  $('#filter-umo').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部 UMO', items: data.umos || [], current: current.umo,
-    valueOf: (item) => item.value,
-    labelOf: (item) => {
-      const suffix = item.message_type || item.platform_name || '';
-      return `${item.value} · ${formatNumber(item.count)}${suffix ? ` · ${suffix}` : ''}`;
-    },
-    missingLabel: (value) => value,
-  });
-  $('#filter-conversation').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部 CID', items: data.conversations || [], current: current.conversation,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-  $('#filter-user').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部用户', items: data.users || [], current: current.user,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.nickname || '未命名'} · ${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-  $('#filter-persona').innerHTML = facetOptions({
-    allValue: '__all__', allLabel: '全部 Persona', items: data.personas || [], current: current.persona,
-    valueOf: (item) => item.value ? item.value : '__empty__',
-    labelOf: (item) => `${item.value || '未标记 Persona'} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value === '__empty__' ? '未标记 Persona' : value,
-  });
-  $('#filter-role').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部 Role', items: data.roles || [], current: current.role,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-  $('#filter-status').innerHTML = facetOptions({
-    allValue: '__all__', allLabel: '全部状态', items: data.statuses || [], current: current.status,
-    valueOf: (item) => item.value ? item.value : '__empty__',
-    labelOf: (item) => `${item.value || 'no_llm（空值）'} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value === '__empty__' ? 'no_llm（空值）' : value,
-  });
+  // 现在只有「内容类型」需要候选；其余是手填或固定选项
   $('#filter-kind').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部类型', items: data.kinds || [], current: current.kind,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-  $('#filter-platform').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部平台', items: data.platforms || [], current: current.platform,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-  $('#filter-message-type').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部消息类型', items: data.message_types || [], current: current.messageType,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-
-  // 工具调用页复用主表的 UMO / CID 下拉（不参与级联，仅静态选项）
-  $('#tool-filter-umo').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部 UMO', items: data.umos || [], current: $('#tool-filter-umo').value,
-    valueOf: (item) => item.value,
-    labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
-    missingLabel: (value) => value,
-  });
-  $('#tool-filter-conversation').innerHTML = facetOptions({
-    allValue: '', allLabel: '全部 CID', items: data.conversations || [], current: $('#tool-filter-conversation').value,
+    allValue: '', allLabel: 'all', items: data.kinds || [],
+    current: $('#filter-kind').value,
     valueOf: (item) => item.value,
     labelOf: (item) => `${item.value} · ${formatNumber(item.count)}`,
     missingLabel: (value) => value,
@@ -901,22 +853,23 @@ async function loadFacets() {
 }
 
 function collectQuery(page = state.page) {
+  // 只有这一组条件：聊天类型 / QQ号 / 发言者 / 内容类型 / 事件子类 / 时间 / 删除状态
   return {
     keyword: $('#filter-keyword').value.trim(),
-    umo: $('#filter-umo').value,
-    conversation_id: $('#filter-conversation').value,
-    user_id: $('#filter-user').value,
-    persona_id: $('#filter-persona').value,
-    role: $('#filter-role').value,
-    llm_status: $('#filter-status').value,
+    chat_type: $('#filter-chat-type').value,
+    session_id: $('#filter-session').value.trim(),
+    sender: $('#filter-sender').value.trim(),
     content_kind: $('#filter-kind').value,
     event_type: $('#filter-event-type').value,
-    platform_name: $('#filter-platform').value,
-    message_type: $('#filter-message-type').value,
     since: $('#filter-since').value,
     until: $('#filter-until').value,
-    paired_only: $('#filter-paired').checked,
     deleted_state: $('#filter-deleted').value,
+    // 高级模式必须选中 persona 才带这些参数；"未标记"用哨兵值原样发给后端
+    persona_id: (state.advancedMode && personaFilterValue()) || undefined,
+    advanced: state.advancedMode && Boolean(personaFilterValue()),
+    persona_role: (state.advancedMode && $('#filter-persona-role').value) || undefined,
+    persona_llm_status: (state.advancedMode && $('#filter-persona-status').value) || undefined,
+    paired_only: Boolean(state.advancedMode && $('#filter-paired-only').value),
     page,
     page_size: Number($('#filter-page-size').value),
   };
@@ -952,31 +905,127 @@ async function runQuery(page = 1) {
   }
 }
 
+function speakerAvatarHtml(record, sender) {
+  // 头像直接用 QQ 现成接口（按 QQ 号），不落库、不经插件；取不到就退回首字母
+  const senderId = String(record.sender_id || record.user_id || '').trim();
+  const initial = escapeHtml((String(sender || '').trim() || '?').slice(0, 1));
+  const title = escapeHtml(sender);
+  if (!/^[0-9]{5,12}$/.test(senderId)) {
+    return `<div class="speaker-avatar" title="${title}"><span class="avatar-initial">${initial}</span></div>`;
+  }
+  const url = `https://q1.qlogo.cn/g?b=qq&nk=${senderId}&s=100`;
+  return `<div class="speaker-avatar" title="${title}">`
+    + `<img src="${url}" alt="" loading="lazy" referrerpolicy="no-referrer"`
+    + ` onerror="this.style.display='none';this.nextElementSibling.style.display='grid'">`
+    + `<span class="avatar-initial" style="display:none">${initial}</span></div>`;
+}
+
+async function hydrateGroupNames(root) {
+  // 群名不落库：一次请求拿全量映射（插件侧 get_group_list + 6 小时缓存），
+  // 页面内缓存住，chip 上补成 群聊·群号（群名）
+  const chips = Array.from(root.querySelectorAll('[data-group-id]'));
+  if (!chips.length) return;
+  if (!state.groupNamesLoaded) {
+    state.groupNamesLoaded = true;
+    try {
+      const data = unwrap(await apiGet('group-names'));
+      state.groupNames = (data && data.groups) || {};
+    } catch (error) {
+      // 失败要回滚标记：否则一次网络抖动会让本页后续所有列表都不再补群名。
+      state.groupNames = {};
+      state.groupNamesLoaded = false;
+    }
+  }
+  chips.forEach((chip) => {
+    const name = state.groupNames[chip.dataset.groupId];
+    if (name && !chip.dataset.named) {
+      chip.dataset.named = '1';
+      chip.textContent = `${chip.dataset.label}（${name}）`;
+      chip.title = `${chip.dataset.label} · ${name}`;
+    }
+  });
+}
+
+// 高级模式：同一轮的消息共用一个配对号（列表里第几个轮次），user/assistant 一致
+function pairIndexOf(note) {
+  const turn = String((note && note.turn_id) || '');
+  if (!turn) return 0;
+  if (!state.pairIndex.has(turn)) state.pairIndex.set(turn, state.pairIndex.size + 1);
+  return state.pairIndex.get(turn);
+}
+
+// 高级只读模式的状态配色：成功=青、主动=琥珀、等待=蓝、孤儿/单边=红、空=none
+const STATUS_CLASS = {
+  llm_success: 'status-success',
+  proactive: 'status-proactive',
+  llm_pending: 'status-pending',
+  orphan: 'status-orphan',
+};
+
+function advancedBadges(record) {
+  // 高级只读模式：这条消息在所选 persona 下的逻辑轮次与状态（数据来自参与行）
+  if (!state.advancedMode) return [];
+  const kinds = Array.isArray(record.content_kind) ? record.content_kind : [];
+  if (kinds.includes('event') || kinds.includes('system_event')) {
+    // 事件不是"某一轮的提问或回答"：角色/配对/LLM 状态对它都没有意义。
+    // 是谁触发的看头像+昵称就够了，这里不再加任何 chip。
+    return [];
+  }
+  const note = record.advanced;
+  if (!note) return [];
+  const turn = String(note.turn_id || '');
+  const pairNo = note.paired ? pairIndexOf(note) : 0;
+  // 状态取"这一轮回复的状态"：本条若是 user 行，它自己的 llm_status 本来就是空的
+  const status = note.turn_llm_status || note.llm_status || '';
+  const sendStatus = note.turn_send_status || note.send_status || '';
+  const role = String(note.role || '');
+  return [
+    note.paired
+      ? pairNo
+        ? `<span class="badge ok" title="轮次 ${escapeHtml(turn)}（第 ${pairNo} 对）">已配对#${pairNo}</span>`
+        : ''
+      : '<span class="badge warn" title="这一轮没有 assistant 行（或不是轮次消息）">未配对</span>',
+    role
+      ? `<span class="badge ${role === 'assistant' ? 'kind' : 'role-user'}">${escapeHtml(role)}</span>`
+      : '',
+    `<span class="badge ${STATUS_CLASS[status] || 'status-none'}">${escapeHtml(status || 'no_llm')}</span>`,
+    sendStatus
+      ? `<span class="badge ${sendStatus === 'send_attempted' ? 'send-attempted' : 'send-prepared'}">${escapeHtml(sendStatus)}</span>`
+      : '',
+  ].filter(Boolean);
+}
+
 function renderRecords(items, keyword) {
-  // 无论结果是否为空，都先回收上一批列表资源（语音播放、缩略图 objectURL）
   stopVoicePlaying();
   state.listMediaUrls.forEach((url) => {
     try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
   });
   state.listMediaUrls = [];
+  state.pairIndex = new Map();
   if (!items.length) {
     $('#records-list').innerHTML = '<div class="empty-state"><strong>没有匹配记录</strong><p>尝试减少筛选条件或扩大时间范围</p></div>';
     return;
   }
   $('#records-list').innerHTML = items.map((record) => {
-    const assistant = record.role === 'assistant';
-    const sender = assistant ? 'Assistant' : (record.sender_nickname || record.user_id || 'User');
-    const status = record.llm_status || 'no_llm';
+    // 不区分"自己发的/别人发的"：role 在合并后不可靠，界面上一律同等对待
+    const sender = record.sender_nickname || record.user_id || record.sender_id || '未知成员';
     const kinds = Array.isArray(record.content_kind) ? record.content_kind : [];
+    const chatType = CHAT_TYPE_LABELS[String(record.message_type || '')] || '';
+    const sessionId = String(record.session_id || '').trim();
+    // 会话类型和会话号绑在一起显示（群聊·群号 / 私聊·对方号）：单看"群聊"没有信息量
+    const chatLabel = sessionId ? `${chatType}·${sessionId}` : chatType;
+    const chatChip = chatType
+      ? `<span class="badge"${sessionId && chatType === '群聊' ? ` data-group-id="${escapeHtml(sessionId)}" data-label="${escapeHtml(chatLabel)}"` : ''} title="${escapeHtml(`${chatType} ${sessionId || '（无会话号）'}`)}">${escapeHtml(chatLabel)}</span>`
+      : '';
+    // chip 只放「消息表自己的东西」：内容类型、事件子类、会话、撤回状态。
+    // llm_status / persona / umo / cid 属于参与行（哪个实例看到的、归哪一轮），
+    // 合并存储之后同一条消息它们的值各不相同，展示出来只会误导。
     const badges = [
-      `<span class="badge status">${escapeHtml(status)}</span>`,
       ...kinds.map((kind) => `<span class="badge kind">${escapeHtml(kind)}</span>`),
       ...subtypeBadges(record),
+      chatChip,
       record.recalled ? '<span class="badge recalled">已撤回</span>' : '',
-      record.persona_id ? `<span class="badge">persona:${escapeHtml(record.persona_id)}</span>` : '',
-      `<span class="badge" title="${escapeHtml(record.umo)}">${escapeHtml(record.umo)}</span>`,
-      // CID 也进列表：排查"reset 后残留"时要能直接比对（完整值，title 同样给全）
-      `<span class="badge" title="${escapeHtml(record.conversation_id || '')}">cid:${escapeHtml(record.conversation_id || '')}</span>`,
+      ...advancedBadges(record),
     ].filter(Boolean).join('');
     const replyView = record.reply_view;
     const replyBlock = replyView
@@ -996,8 +1045,8 @@ function renderRecords(items, keyword) {
     } else {
       contentBlock = `<div class="record-content">${highlight(record.content || '(空消息)', keyword)}${record.content_truncated ? '\n… 列表预览已截断，打开详情查看完整内容' : ''}</div>`;
     }
-    return `<article class="record-card ${assistant ? 'assistant' : 'user'}" data-card-id="${record.record_id}">
-      <div class="role-avatar">${assistant ? 'AI' : 'U'}</div>
+    return `<article class="record-card" data-card-id="${record.record_id}">
+      ${speakerAvatarHtml(record, sender)}
       <div class="record-main">
         <div class="record-header"><span class="record-sender" title="${escapeHtml(sender)}">${escapeHtml(sender)}</span><span class="record-time">${escapeHtml(record.created_at || record.created_at_utc || '—')}</span></div>
         ${replyBlock}
@@ -1007,11 +1056,12 @@ function renderRecords(items, keyword) {
       </div>
       <div class="record-actions">
         ${recordModeButton(record)}
-        <button class="record-detail-button" data-record-id="${record.record_id}">详情 #${record.record_id} ›</button>
+        <button class="record-detail-button" data-record-id="${record.record_id}">详情 ›</button>
       </div>
     </article>`;
   }).join('');
   hydrateInlineThumbs($('#records-list'), state.listMediaUrls, false);
+  hydrateGroupNames($('#records-list'));
   bindVoiceBubbles($('#records-list'));
   document.querySelectorAll('[data-record-id]').forEach((button) => {
     button.addEventListener('click', () => openDetail(button.dataset.recordId));
@@ -1035,19 +1085,19 @@ function bindModeButtons(root) {
           const result = unwrap(response) || {};
           const deleted = Boolean(result.deleted);
           const what = target === 'tool' ? '工具调用' : '记录';
-          showToast(
-            deleted ? `已软删除${what} #${recordId}` : `已恢复${what} #${recordId}`,
-            'ok'
-          );
+          // 提示里的编号也用列表位置编号（真实 id 只在详情括号里出现）
+          showToast(deleted ? `已软删除${what}` : `已恢复${what}`, 'ok');
           if (target === 'tool') {
             // 工具卡片没有独立详情页：原地更新该卡片（chip + 删除时间 + 图标）
             applyToolDeletedState(recordId, deleted, result.deleted_at || '');
           } else {
             applyDeletedState(recordId, deleted);
             const modal = $('#detail-modal');
-            if (modal && !modal.classList.contains('hidden')) openDetail(recordId);
+            if (modal && !modal.classList.contains('hidden')) {
+              openDetail(recordId);
+            }
           }
-          loadDashboardData();
+          lockSnapshot().then(() => loadDashboardData());
         })
         .catch((error) => {
           button.disabled = false;
@@ -1088,7 +1138,8 @@ async function openDetail(id) {
 }
 
 function renderDetail(record) {
-  $('#detail-title').textContent = `记录 #${record.record_id}`;
+  // 标题不再带编号：数据库 id 已在下面的字段表里（record_id），列表也不再显示它
+  $('#detail-title').textContent = '记录详情';
   const omitted = new Set(['content', 'content_template', 'relation_data', 'reply_view', 'media_view']);
   const fields = Object.entries(record).filter(([key]) => !omitted.has(key));
   const relation = record.relation_data ? JSON.stringify(record.relation_data, null, 2) : 'null';
@@ -1130,13 +1181,51 @@ function renderDetail(record) {
   attachDetailMedia($('#detail-content'));
   bindModeButtons($('#detail-content'));
   bindModeButtons($('#detail-title-row'));
-  // 识图描述注入在另一条分支（feat/media-insight），本线不做
   hydrateInlineThumbs($('#detail-content'), state.mediaObjectUrls, true);
+}
+
+async function loadPersonaOptions() {
+  if (state.personaOptions.length) return;
+  try {
+    const data = unwrap(await apiGet('personas'));
+    state.personaOptions = (data && data.personas) || [];
+  } catch (error) {
+    state.personaOptions = [];
+  }
+  const select = $('#filter-persona');
+  const current = select.value;
+  select.innerHTML = ['<option value="">请选择 persona</option>']
+    .concat(state.personaOptions.map((item) => {
+      const label = item.value ? `${item.value}（${formatNumber(item.count)} 条）` : '未标记 persona';
+      // 空串在这里会被 `value || undefined` 吞掉，所以"未标记"用显式哨兵值
+      const optionValue = item.value || PERSONA_EMPTY;
+      return `<option value="${escapeHtml(optionValue)}">${escapeHtml(label)}</option>`;
+    }))
+    .join('');
+  select.value = current;
+}
+
+function setAdvancedMode(enabled) {
+  state.advancedMode = Boolean(enabled);
+  $('#advanced-toggle').classList.toggle('active', state.advancedMode);
+  $('#advanced-filters').classList.toggle('hidden', !state.advancedMode);
+  if (state.advancedMode && state.deleteMode) setDeleteMode(false);
+  if (state.advancedMode) {
+    showToast('高级只读模式：先选 persona；「配对」可选 all 或仅看配对');
+    loadPersonaOptions();
+  }
+}
+
+async function toggleAdvancedMode() {
+  setAdvancedMode(!state.advancedMode);
+  await loadFacets();
+  runQuery(1);
 }
 
 function setDeleteMode(enabled) {
   // 只读模式 ↔ 删除模式：进入后每条记录（列表与详情）出现单条软删除/恢复图标
   state.deleteMode = Boolean(enabled);
+  if (state.deleteMode && state.advancedMode) setAdvancedMode(false);
   const pill = $('#mode-toggle');
   pill.classList.toggle('active', state.deleteMode);
   $('#mode-toggle-label').textContent = state.deleteMode ? '删除模式' : '只读模式';
@@ -1164,9 +1253,10 @@ function toggleDeleteMode() {
 function collectToolQuery(page = state.toolPage) {
   return {
     tool_name: $('#tool-filter-name').value.trim(),
-    umo: $('#tool-filter-umo').value,
-    conversation_id: $('#tool-filter-conversation').value,
-    turn_id: $('#tool-filter-turn').value.trim(),
+    chat_type: $('#tool-filter-chat-type').value,
+    session_id: $('#tool-filter-session').value.trim(),
+    platform_id: $('#tool-filter-platform').value.trim(),
+    persona_id: toolPersonaValue(),
     since: $('#tool-filter-since').value,
     until: $('#tool-filter-until').value,
     deleted_state: $('#tool-filter-deleted').value,
@@ -1210,6 +1300,13 @@ function toolDeletedBlock(record) {
 
 function applyToolDeletedState(toolId, deleted, deletedAt) {
   // 原地更新该工具卡片：chip/删除时间出现或消失 + 图标 times ↔ backup
+  // 同时更新缓存的原始对象：详情抽屉直接复用它渲染，只改 DOM 会让详情里的
+  // 删除状态停在旧值，与卡片上的 chip 自相矛盾。
+  const cached = state.toolItems && state.toolItems.get(Number(toolId));
+  if (cached) {
+    cached.deleted = Boolean(deleted);
+    cached.deleted_at = deleted ? (deletedAt || '') : '';
+  }
   const card = document.querySelector(`article[data-tool-card-id="${toolId}"]`);
   if (!card) return;
   const head = card.querySelector('.tool-card-head');
@@ -1227,7 +1324,71 @@ function applyToolDeletedState(toolId, deleted, deletedAt) {
   bindModeButtons(card);
 }
 
+// 工具记录的会话标识：从 umo 拆 平台:类型:会话号，只显示"群聊·群号"这类人话
+// 只有"一轮调了多次"才值得标位置；单次调用什么都不显示。
+// 轮次标识直接用 turn_id 的前 8 位（uuid 唯一、跨页稳定），不另做编号。
+function toolTurnShort(record) {
+  return String(record.turn_id || '').slice(0, 8);
+}
+
+function toolStepLabel(record) {
+  const total = Number(record.turn_total) || 0;
+  const index = Number(record.call_index) || 1;
+  if (total <= 1) return '';
+  const short = toolTurnShort(record);
+  return short ? `轮 ${short} · 第 ${index} 次调用` : `第 ${index} 次调用`;
+}
+
+// 调用者头像：BOT 自己的 QQ（self_id）现查头像，拿不到退首字母
+function toolCallerAvatar(record) {
+  const who = String(record.self_id || '').trim();
+  const label = String(record.platform_id || '').trim();
+  if (!who && !label) return '';
+  const initial = escapeHtml(label.slice(0, 1) || '?');
+  if (!/^[0-9]{5,12}$/.test(who)) {
+    return `<div class="speaker-avatar small" title="${escapeHtml(label)}"><span class="avatar-initial">${initial}</span></div>`;
+  }
+  const url = `https://q1.qlogo.cn/g?b=qq&nk=${who}&s=100`;
+  return `<div class="speaker-avatar small" title="${escapeHtml(label)}">`
+    + `<img src="${url}" alt="" loading="lazy" referrerpolicy="no-referrer"`
+    + ` onerror="this.style.display='none';this.nextElementSibling.style.display='grid'">`
+    + `<span class="avatar-initial" style="display:none">${initial}</span></div>`;
+}
+
+function toolSessionChip(record) {
+  const parts = String(record.umo || '').split(':');
+  const kind = parts.length >= 2 ? parts[1] : '';
+  const session = parts.length >= 3 ? parts[2] : '';
+  const label = CHAT_TYPE_LABELS[kind];
+  if (!label || !session) return '';
+  const text = `${label}·${session}`;
+  const groupAttr = label === '群聊'
+    ? ` data-group-id="${escapeHtml(session)}" data-label="${escapeHtml(text)}"`
+    : '';
+  return `<span class="badge"${groupAttr} title="会话">${escapeHtml(text)}</span>`;
+}
+
+async function loadToolPersonaOptions() {
+  const select = $('#tool-filter-persona');
+  if (select.dataset.loaded === '1') return;
+  await loadPersonaOptions();
+  const current = select.value;
+  // 「未标记 persona」的 option value 是空串，与「all」同值：直接用 value 会让它被
+  // 前端当成"没选"（后端归一成 all），选了等于没筛。给空值加哨兵，与记录页同一口径。
+  select.innerHTML = ['<option value="">all</option>']
+    .concat(state.personaOptions.map((item) => {
+      const label = item.value ? `${item.value}（${formatNumber(item.count)} 条）` : '未标记 persona';
+      const value = item.value || PERSONA_EMPTY;
+      return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
+    }))
+    .join('');
+  select.value = current;
+  select.dataset.loaded = '1';
+}
+
 function renderToolRecords(items) {
+  // 详情按钮只靠 tool_id 找记录：当前页的原始对象存一份，避免再发一次请求
+  state.toolItems = new Map(items.map((item) => [Number(item.tool_id), item]));
   if (!items.length) {
     $('#tools-list').innerHTML = '<div class="empty-state"><strong>没有匹配的工具调用</strong><p>尝试减少筛选条件或扩大时间范围；旧版数据库（schema &lt; v4）没有工具表</p></div>';
     return;
@@ -1242,20 +1403,70 @@ function renderToolRecords(items) {
     return `<article class="tool-card" data-tool-card-id="${record.tool_id}">
       <div class="tool-card-head">
         <span class="badge tool-name">${escapeHtml(record.tool_name || '(empty)')}</span>
-        <span class="tool-card-time">${escapeHtml(record.created_at || record.created_at_utc || '—')} · 轮内 #${record.call_index} · 记录 #${record.tool_id}</span>
-        <span class="tool-card-mode">${modeButtonHtml(record.tool_id, record.deleted, 'tool')}</span>
+        <span class="tool-card-time">${escapeHtml(record.created_at || record.created_at_utc || '—')}</span>
+        <span class="tool-card-mode">
+          ${modeButtonHtml(record.tool_id, record.deleted, 'tool')}
+          <button class="record-detail-button" data-tool-detail-id="${record.tool_id}">详情 ›</button>
+        </span>
       </div>
       ${toolDeletedBlock(record)}
       <div class="record-meta tool-card-chips">
-        <span class="badge" title="轮次 turn_id">turn:${escapeHtml(record.turn_id)}</span>
-        <span class="badge" title="会话来源 UMO">${escapeHtml(record.umo)}</span>
-        <span class="badge" title="Conversation ID">cid:${escapeHtml(record.conversation_id)}</span>
+        ${toolCallerAvatar(record)}
+        ${toolStepLabel(record) ? `<span class="badge step" title="这一轮共 ${record.turn_total} 次工具调用">${escapeHtml(toolStepLabel(record))}</span>` : ''}
+        ${record.platform_id ? `<span class="badge tool-bot" title="发起调用的 BOT">${escapeHtml(record.platform_id)}</span>` : ''}
+        ${record.persona_id ? `<span class="badge tool-persona" title="这一轮的人设">${escapeHtml(record.persona_id)}</span>` : ''}
+        ${toolSessionChip(record)}
       </div>
       <div class="tool-block"><div class="tool-block-title">参数</div><pre class="tool-json">${escapeHtml(argsPreview)}</pre></div>
       <div class="tool-block"><div class="tool-block-title">返回</div><pre class="tool-json">${escapeHtml(record.tool_result || '(空)')}</pre></div>
     </article>`;
   }).join('');
   bindModeButtons($('#tools-list'));
+  $('#tools-list').querySelectorAll('[data-tool-detail-id]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const record = (state.toolItems || new Map()).get(Number(button.dataset.toolDetailId));
+      if (record) openToolDetail(record);
+    });
+  });
+  hydrateGroupNames($('#tools-list'));
+}
+
+// 工具调用详情：技术值（轮次/UMO/CID/记录 id）都在这里，卡片上不再出现
+function openToolDetail(record) {
+  const modal = $('#detail-modal');
+  const stepLabel = toolStepLabel(record);
+  const step = stepLabel || `第 ${Number(record.call_index) || 1} 次（本轮仅此一次）`;
+  const fields = [
+    ['工具', record.tool_name || '(empty)'],
+    ['BOT', record.platform_id || '（未知）'],
+    ['人设', record.persona_id || '（未标记）'],
+    ['BOT 号码 self_id', record.self_id || '（未知）'],
+    ['这一步', step],
+    ['时间', record.created_at || record.created_at_utc || '—'],
+    ['轮次 turn_id', record.turn_id || '（无）'],
+    ['会话 UMO', record.umo],
+    ['Conversation ID', record.conversation_id],
+    ['记录 ID', String(record.tool_id)],
+    ['删除状态', record.deleted ? `已删除（${record.deleted_at || '未知时间'}）` : '未删除'],
+  ];
+  $('#detail-title').textContent = '工具调用详情';
+  const modeSlot = $('#detail-mode-slot');
+  if (modeSlot) modeSlot.innerHTML = '';
+  $('#detail-content').innerHTML = `
+    <div class="record-meta tool-card-chips">
+      <span class="badge tool-name">${escapeHtml(record.tool_name || '(empty)')}</span>
+      <span class="badge step">${escapeHtml(step)}</span>
+      ${toolSessionChip(record)}
+    </div>
+    ${toolDeletedBlock(record)}
+    <section class="detail-section"><h3>参数</h3><pre class="detail-json">${escapeHtml(record.tool_args || '(空)')}</pre></section>
+    <section class="detail-section"><h3>返回</h3><pre class="detail-json">${escapeHtml(record.tool_result || '(空)')}</pre></section>
+    <section class="detail-section"><h3>字段</h3><div class="detail-grid">${fields
+      .filter(([, value]) => value === null || typeof value !== 'object')
+      .map(([key, value]) => `
+      <div class="detail-item"><div class="detail-key">${escapeHtml(key)}</div><div class="detail-value">${escapeHtml(value)}</div></div>`).join('')}</div></section>`;
+  modal.classList.remove('hidden');
+  hydrateGroupNames($('#detail-content'));
 }
 
 function renderToolPagination() {
@@ -1272,6 +1483,7 @@ function renderToolPagination() {
 
 function resetToolFilters() {
   $('#tool-query-form').reset();
+  $('#tool-filter-persona').value = '';
   $('#tool-filter-page-size').value = '50';
   runToolQuery(1);
 }
@@ -1296,13 +1508,20 @@ function switchSection(target) {
   };
   $('#page-title').textContent = titles[target] || '数据概览';
   if (target === 'query-section' && !state.lastQuery) runQuery(1);
-  if (target === 'tools-section' && !state.lastToolQuery) runToolQuery(1);
+  // 高级只读模式是"消息 + 轮次"的视角：只有记录查询页需要它，
+  // 数据概览（统计口径）与工具调用页都没有这条查询路径 → 那两页不显示入口
+  const advancedPill = $('#advanced-toggle');
+  if (advancedPill) {
+    advancedPill.classList.toggle('hidden', target !== 'query-section');
+  }
+  if (target === 'tools-section') {
+    loadToolPersonaOptions().catch(() => {});
+    if (!state.lastToolQuery) runToolQuery(1);
+  }
 }
 
 function resetFilters() {
   $('#query-form').reset();
-  $('#filter-persona').value = '__all__';
-  $('#filter-status').value = '__all__';
   $('#filter-page-size').value = String(state.about?.default_page_size || 50);
   loadFacets().then(() => runQuery(1)).catch((error) => showToast(error.message, 'error'));
 }
@@ -1364,6 +1583,10 @@ function bindEvents() {
   $('#page-prev').addEventListener('click', () => state.page > 1 && runQuery(state.page - 1));
   $('#page-next').addEventListener('click', () => state.page < state.pageCount && runQuery(state.page + 1));
   $('#tool-query-form').addEventListener('submit', (event) => { event.preventDefault(); runToolQuery(1); });
+  ['#tool-filter-chat-type', '#tool-filter-persona', '#tool-filter-deleted',
+    '#tool-filter-page-size'].forEach((selector) => {
+    $(selector).addEventListener('change', () => runToolQuery(1));
+  });
   $('#reset-tool-filters').addEventListener('click', resetToolFilters);
   $('#tool-page-prev').addEventListener('click', () => state.toolPage > 1 && runToolQuery(state.toolPage - 1));
   $('#tool-page-next').addEventListener('click', () => state.toolPage < state.toolPageCount && runToolQuery(state.toolPage + 1));
@@ -1374,11 +1597,35 @@ function bindEvents() {
   $('#reload-button').addEventListener('click', initialize);
   $('#export-button').addEventListener('click', exportSnapshot);
   $('#mode-toggle').addEventListener('click', toggleDeleteMode);
+  $('#advanced-toggle').addEventListener('click', () => {
+    toggleAdvancedMode().catch((error) => showToast(error.message, 'error'));
+  });
+  $('#filter-persona').addEventListener('change', () => runQuery(1));
+  $('#filter-persona-role').addEventListener('change', () => runQuery(1));
+  $('#filter-persona-status').addEventListener('change', () => runQuery(1));
+  $('#filter-paired-only').addEventListener('change', () => runQuery(1));
   $('#database-settings-form').addEventListener('submit', saveDatabaseSettings);
   $('#restore-database-path').addEventListener('click', restoreDefaultDatabasePath);
   FACET_SELECTORS.forEach((selector) => $(selector).addEventListener('change', async () => {
-    try { await loadFacets(); } catch (error) { showToast(error.message, 'error'); }
+    // 下拉改动既要刷候选（计数随筛选变化），也要重查列表——只刷候选会让结果停在上一次
+    try {
+      await loadFacets();
+      runQuery(1);
+    } catch (error) {
+      showToast(error.message, 'error');
+    }
   }));
+  $('#filter-page-size').addEventListener('change', () => runQuery(1));
+}
+
+async function lockSnapshot() {
+  // 进页面/点刷新时锁定当前库状态：之后翻页、筛选都读同一份快照，
+  // 不会因为群里在聊天而反复重建（重建一次约 0.6 秒）。
+  try {
+    return unwrap(await apiPost('snapshot', {}));
+  } catch (error) {
+    return null;      // 锁不上就退回按需重建，功能不受影响
+  }
 }
 
 async function initialize() {
@@ -1396,6 +1643,7 @@ async function initialize() {
     $('#version-label').textContent = `${state.about.name} · v${state.about.version}`;
     $('#filter-page-size').value = String(state.about.default_page_size || 50);
     setSettingsMessage('路径设置保存在 AstrBot 插件存储中。');
+    await lockSnapshot();
     try {
       await loadDashboardData();
     } catch (error) {

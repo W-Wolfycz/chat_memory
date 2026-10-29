@@ -142,6 +142,9 @@ class RepositoryTestCase(unittest.TestCase):
         )
 
     def tearDown(self):
+        # 查询台复用一条只读连接（旧历史去重缓存在它的 TEMP 表里）：
+        # Windows 上不先关掉，临时目录就删不掉。
+        self.repository.close()
         self.temp_dir.cleanup()
 
     def test_overview_and_health(self):
@@ -204,10 +207,13 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(first["tool_args"], '{"prompt": "狗"}')
         self.assertEqual(first["created_at"], "2026-08-11 10:00:02")
 
-        by_turn = asyncio.run(
-            self.repository.tool_records({"turn_id": "turn-a", "page_size": 50})
+        # turn_id 精确搜索已取消：按 BOT + QQ 号筛更符合人的用法
+        by_bot = asyncio.run(
+            self.repository.tool_records(
+                {"platform_id": "bot", "session_id": "u1", "page_size": 50}
+            )
         )
-        self.assertEqual([item["call_index"] for item in by_turn["items"]], [2, 1])
+        self.assertEqual([item["call_index"] for item in by_bot["items"]], [2, 1])
 
         scoped = asyncio.run(
             self.repository.tool_records(
@@ -231,12 +237,11 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(result["items"], [])
 
     def test_query_filters_and_edges(self):
-        # 小节：关键词/状态/类型过滤 + relation 渲染
+        # 小节：关键词 + 内容类型
         result = asyncio.run(
             self.repository.query(
                 {
                     "keyword": "Bob",
-                    "llm_status": "llm_success",
                     "content_kind": "text",
                     "page": 1,
                     "page_size": 20,
@@ -247,24 +252,27 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(result["items"][0]["content"], "你好 @Bob")
         self.assertEqual(result["items"][0]["created_at"], "2026-08-10 09:00:00")
 
-        # 小节：空状态/persona 与 paired_only 过滤
-        no_llm = asyncio.run(
-            self.repository.query({"llm_status": "__empty__", "page_size": 50})
-        )
-        self.assertEqual([item["record_id"] for item in no_llm["items"]], [3])
+        # 小节：聊天类型（群/私/全部）
+        group = asyncio.run(self.repository.query({"chat_type": "group"}))
+        self.assertEqual(group["total"], 2)
+        private = asyncio.run(self.repository.query({"chat_type": "private"}))
+        self.assertEqual(private["total"], 2)
+        both = asyncio.run(self.repository.query({"chat_type": ""}))
+        self.assertEqual(both["total"], 4)
 
-        legacy_persona = asyncio.run(
-            self.repository.query({"persona_id": "__empty__", "page_size": 50})
-        )
-        self.assertEqual(legacy_persona["total"], 2)
+        # 小节：QQ 号（群号/好友号）精确匹配会话
+        by_session = asyncio.run(self.repository.query({"session_id": "g1"}))
+        self.assertEqual(by_session["total"], 2)
+        self.assertEqual({item["turn_id"] for item in by_session["items"]},
+                         {"turn-b", "turn-c"})
 
-        paired = asyncio.run(
-            self.repository.query({"paired_only": True, "page_size": 50})
-        )
-        self.assertEqual(paired["total"], 2)
-        self.assertEqual({item["turn_id"] for item in paired["items"]}, {"turn-a"})
+        # 小节：发言者——数字按 id 精确、其它按昵称模糊（这份 fixture 的 id 不是纯数字）
+        by_nick = asyncio.run(self.repository.query({"sender": "Car"}))
+        self.assertEqual({item["record_id"] for item in by_nick["items"]}, {3, 4})
+        by_id = asyncio.run(self.repository.query({"sender": "10001"}))
+        self.assertEqual(by_id["total"], 0, "纯数字按 id 精确匹配，昵称里没有就不命中")
 
-        # 小节：非法时间范围拒绝
+        # 小节：非法时间范围与非法枚举值拒绝
         with self.assertRaisesRegex(ValueError, "起始时间"):
             asyncio.run(
                 self.repository.query(
@@ -274,41 +282,30 @@ class RepositoryTestCase(unittest.TestCase):
                     }
                 )
             )
+        with self.assertRaisesRegex(ValueError, "聊天类型"):
+            asyncio.run(self.repository.query({"chat_type": "channel"}))
 
     def test_facets_scoped(self):
-        # 小节：按会话范围返回用户/会话
-        facets = asyncio.run(
-            self.repository.facets(
-                {"umo": "bot:FriendMessage:u1", "conversation_id": "cid-a"}
-            )
-        )
-        self.assertEqual(len(facets["users"]), 1)
-        self.assertEqual(facets["users"][0]["nickname"], "Alpha-new")
-        self.assertEqual(facets["conversations"][0]["value"], "cid-a")
-
-        # 小节：按 role 互斥范围，昵称跟踪最新匹配
-        user_facets = asyncio.run(
-            self.repository.facets({"umo": "bot:FriendMessage:u1", "role": "user"})
-        )
-        self.assertEqual(user_facets["users"][0]["nickname"], "Zulu-old")
+        # 筛选项现在只剩「内容类型」候选；其余条件都不再需要下拉
+        facets = asyncio.run(self.repository.facets({}))
         self.assertEqual(
-            {item["value"] for item in user_facets["roles"]},
-            {"user", "assistant"},
+            {item["value"] for item in facets["kinds"]}, {"text", "image"}
         )
         self.assertEqual(
-            {item["value"] for item in user_facets["statuses"]},
-            {"llm_success"},
+            sorted(set(facets) - {"database"}), ["kinds"], "不再返回别的候选集合"
         )
 
-        assistant_facets = asyncio.run(
-            self.repository.facets(
-                {"umo": "bot:FriendMessage:u1", "role": "assistant"}
-            )
+        # 按条件收窄：只看 g1 会话时，图片/文本各一条
+        scoped = asyncio.run(self.repository.facets({"session_id": "g1"}))
+        counts = {item["value"]: item["count"] for item in scoped["kinds"]}
+        self.assertEqual(counts, {"image": 1, "text": 1})
+
+        # 自己这个维度不参与收窄（选了 text 之后候选里仍有 image）
+        still_complete = asyncio.run(
+            self.repository.facets({"session_id": "g1", "content_kind": "text"})
         )
-        self.assertEqual(assistant_facets["users"][0]["nickname"], "Alpha-new")
         self.assertEqual(
-            {item["value"] for item in assistant_facets["kinds"]},
-            {"text"},
+            {item["value"] for item in still_complete["kinds"]}, {"image", "text"}
         )
 
     def test_corrupt_database_fallback(self):
@@ -809,12 +806,22 @@ class RepositoryTestCase(unittest.TestCase):
         base["media"] = [{"kind": "poke", "id": "10002", "type": "126"}]
         set_event(base, "10001", "10001")
         self.assertEqual(rendered(), "10001 戳了戳 10002")
-        # 非 poke 事件（ban）operator 缺失：不做 ID 回退
+        # operator 缺失的其它事件同样用发送者补主语：自己贴表情时平台只给 self_id，
+        # 不给 operator，不补就渲染成「用 X 回应了 Y 的消息」（历史行就是这么坏的）。
         ban = {"v": 1, "mentions": [], "media": [],
                "event": {"type": "ban", "action": "群禁言", "detail": "10分钟",
                          "target": "长风", "operator": ""}}
         set_event(ban, "10001", "10001")
-        self.assertEqual(rendered(), "长风 被禁言了 10分钟")
+        self.assertIn("10001", rendered())
+        self.assertIn("长风", rendered())
+
+        # operator 本来就有值时不要被发送者覆盖
+        ban_named = {"v": 1, "mentions": [], "media": [],
+                     "event": {"type": "ban", "action": "群禁言", "detail": "10分钟",
+                               "target": "长风", "operator": "管理员甲"}}
+        set_event(ban_named, "10001", "10001")
+        self.assertIn("管理员甲", rendered())
+        self.assertNotIn("10001", rendered())
 
     def test_recalled_serialization(self):
         """撤回标记：recalled_at 非空 → recalled=True 且带本地时间；未标记为 False。"""

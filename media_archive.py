@@ -4,11 +4,13 @@
 - 管线零阻塞：捕获同步段只做本地文件拷贝（毫秒级）与队列入队；
 - 失败不影响主存档：下载失败/超时/队列满均静默，不落归档行；
 - 归档行只在文件真正落盘后写入；文件路径不落库（由 file_name + created_at
-  推导为 media/<YYYYMM>/<media_id>.<ext>），文件名随机化、无隐私标识；
+  推导为 media/<YYYYMM>/<内容哈希>.<ext>），文件名不含隐私标识；
+- 内容寻址：同字节文件跨实例/跨行只留一份，删除按引用计数（还有行在用就不删）；
 - 不存原始 URL、绝对路径；日志脱敏。
 """
 
 import asyncio
+import hashlib
 import os
 import re
 import shutil
@@ -16,7 +18,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote, urlparse
 
 from astrbot.api import logger
 
@@ -70,6 +71,23 @@ def _parse_created_at(value) -> Optional[datetime]:
         except ValueError:
             return None
     return None
+
+
+def _parse_month_dir(name: str) -> Optional[datetime]:
+    """月份目录名（YYYYMM）→ 该月 1 号的 UTC naive datetime；不合法返回 None。"""
+    try:
+        return datetime.strptime(f"{name}01", "%Y%m%d")
+    except (TypeError, ValueError):
+        return None
+
+
+def _hash_file(path: Path) -> str:
+    """文件内容哈希（sha256 前 32 位十六进制）：内容寻址的文件名与去重键。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:32]
 
 
 def _sanitize_ext(ext: str) -> str:
@@ -145,6 +163,8 @@ class MediaArchiver:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._workers: list[asyncio.Task] = []
         self._started = False
+        # 归档/下载失败计数：前几次 WARNING，之后 DEBUG（不静默也不刷屏）
+        self._failures = 0
 
     # ── 生命周期 ──────────────────────────────────────
 
@@ -262,12 +282,22 @@ class MediaArchiver:
             if kind == "file" and not name:
                 name = f"file.{ext}"
             now = _utc_now()
-            dest = self._dest(f"{media_id}.{ext}", now)
+            # 内容寻址：文件名＝内容哈希（不是 media_id）。多 BOT 各自归档同一张图时，
+            # 平台 file id 不同但字节相同 → 落到同一个文件；同月内天然去重，
+            # 也让人一眼看出"这两个 media_id 是同一张图"。
+            content_hash = await asyncio.to_thread(_hash_file, tmp)
+            dest = self._dest(f"{content_hash}.{ext}", now)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp, dest)
+            # 只有**本次真正落位**的文件才允许在登记失败时回删：dest 已存在说明它正被
+            # 别的归档行引用（多实例同图共用），删掉就是不可逆地毁掉别人的媒体。
+            created_here = not dest.is_file()
+            if created_here:
+                os.replace(tmp, dest)
+            else:
+                tmp.unlink(missing_ok=True)      # 已有同内容文件：复用，不重写
             try:
                 size = dest.stat().st_size
-                await self.db.insert_media_archive(
+                stored = await self.db.insert_media_archive(
                     media_id=media_id,
                     umo=umo,
                     conversation_id=conversation_id,
@@ -278,10 +308,15 @@ class MediaArchiver:
                     mime_type=_MIME_BY_EXT.get(ext),
                     size_bytes=size,
                     created_at=now,
+                    content_hash=content_hash,
                 )
+                if not stored:
+                    # media_id 冲突（行早已存在）也会走到这里：INSERT OR IGNORE 是空操作。
+                    # 复用共用文件时不能回删，只把这次当失败上报。
+                    raise RuntimeError("media archive row not inserted")
             except Exception:
-                # 文件已落位但登记失败：回删文件，不留无行孤儿
-                dest.unlink(missing_ok=True)
+                if created_here:
+                    dest.unlink(missing_ok=True)
                 raise
             logger.debug(
                 "[ChatMemory] 媒体归档完成 kind=%s ext=%s size=%d",
@@ -289,9 +324,11 @@ class MediaArchiver:
             )
             return True
         except Exception as exc:
-            logger.debug(
-                "[ChatMemory] 媒体归档登记失败 %s: %s",
-                media_id, type(exc).__name__,
+            self._failures += 1
+            log_fn = logger.warning if self._failures <= 3 else logger.debug
+            log_fn(
+                "[ChatMemory] 媒体归档登记失败 %s（累计 %d 次）: %s",
+                media_id, self._failures, type(exc).__name__,
             )
             tmp.unlink(missing_ok=True)
             return False
@@ -317,9 +354,12 @@ class MediaArchiver:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug(
-                    "[ChatMemory] 媒体下载失败 kind=%s id=%s: %s",
-                    item.get("kind"), str(item.get("media_id") or ""), exc,
+                self._failures += 1
+                log_fn = logger.warning if self._failures <= 3 else logger.debug
+                log_fn(
+                    "[ChatMemory] 媒体下载失败 kind=%s id=%s（累计 %d 次）: %s",
+                    item.get("kind"), str(item.get("media_id") or ""),
+                    self._failures, type(exc).__name__,
                 )
             finally:
                 self._queue.task_done()
@@ -369,8 +409,13 @@ class MediaArchiver:
     # ── 清理 ─────────────────────────────────────────
 
     async def delete_files(self, rows) -> int:
-        """删除 ``rows``（file_name + created_at）对应的媒体文件。"""
+        """删除 ``rows``（file_name + created_at）对应的媒体文件。
+
+        内容寻址后多个归档行可能指向同一个文件——**还有别的行引用时保留**（引用计数），
+        返回真正删掉的文件数。
+        """
         deleted = 0
+        kept = 0
         for row in rows or []:
             file_name = row.get("file_name")
             created_at = _parse_created_at(row.get("created_at"))
@@ -378,80 +423,151 @@ class MediaArchiver:
                 continue
             path = self._dest(file_name, created_at)
             try:
-                if path.is_file():
-                    path.unlink()
-                    deleted += 1
+                if not path.is_file():
+                    continue
+                # 内容寻址后一个文件可能被多个 media_id 共用（多实例各存一份同一张图）：
+                # 还有别的行引用它就不能删，否则删掉自己的会把别人的图删没。
+                if await self.db.media_file_referenced(
+                    file_name=file_name, created_at=created_at
+                ):
+                    kept += 1
+                    continue
+                path.unlink()
+                deleted += 1
             except OSError:
                 pass
+        if kept:
+            logger.debug("[ChatMemory] 媒体文件被其它归档行共用，保留 %d 个", kept)
         return deleted
+
+    async def dedup_existing(
+        self, limit: int = 1000, *, max_bytes: int = 1 << 30
+    ) -> int:
+        """把老库里的媒体文件改成内容寻址并顺手去重，返回处理行数（断点续跑）。
+
+        老库文件名是 ``<media_id>.<ext>``（每个实例一份），这里逐批换成
+        ``<内容哈希>.<ext>``：同内容的第二份直接删掉重复文件、把行指过去。
+        按 ``content_hash IS NULL`` 取批，天然可断点续跑；全部处理完就是空转。
+        ``max_bytes`` 限制单轮读取量（几十 GB 的视频库也不会一小时搬完），
+        本轮没轮到的行留到下一轮。文件已不在的行标成"无需迁移"，否则它们会
+        永远占着待迁移集合的前排、把后面真正要改名的行堵死。
+        """
+        if not self.enabled:
+            return 0
+        rows = await self.db.query_media_without_hash(limit=limit)
+        done = 0
+        read_bytes = 0
+        for row in rows or []:
+            media_id = str(row.get("media_id") or "")
+            file_name = str(row.get("file_name") or "")
+            ext = str(row.get("ext") or "bin")
+            created_at = _parse_created_at(row.get("created_at"))
+            if not (media_id and file_name and created_at is not None):
+                continue
+            path = self._dest(file_name, created_at)
+            try:
+                if not path.is_file():
+                    # 文件已被删（保留期/人工清理）：标成"无需迁移"（空哈希）。
+                    # 不标的话这些行每轮都被重新取出来，把后面要处理的行永久挡住。
+                    await self.db.update_media_content_hash(media_id, content_hash="")
+                    done += 1
+                    continue
+                if read_bytes >= max_bytes:
+                    break                       # 本轮读取量已够，剩下的下一轮继续
+                read_bytes += int(row.get("size_bytes") or 0)
+                content_hash = await asyncio.to_thread(_hash_file, path)
+                new_name = f"{content_hash}.{ext}"
+                new_path = self._dest(new_name, created_at)
+                if new_path != path:
+                    if new_path.is_file():
+                        path.unlink(missing_ok=True)      # 已有同内容文件：删重复
+                    else:
+                        os.replace(path, new_path)
+                await self.db.update_media_content_hash(
+                    media_id, content_hash=content_hash, file_name=new_name
+                )
+                done += 1
+            except Exception as exc:  # noqa: BLE001 - 单个失败不影响整批
+                logger.debug(
+                    "[ChatMemory] 媒体去重跳过 %s: %s", media_id, type(exc).__name__
+                )
+        return done
 
     async def cleanup_cycle(self) -> dict:
         """一轮清理：保留期 → 总量上限 → 孤儿文件。返回统计（日志用）。"""
-        stats = {"retention": 0, "quota": 0, "orphan": 0}
+        stats = {"retention": 0, "quota": 0, "orphan": 0, "dedup": 0}
         if not self.enabled:
             return stats
         cutoff = _utc_now() - timedelta(days=self.retention_days)
         try:
             rows = await self.db.query_media_archive_for_cleanup(limit=1000)
-            expired_ids = [
-                r["media_id"]
+            expired_rows = [
+                r
                 for r in rows
                 if _parse_created_at(r.get("created_at")) is not None
                 and _parse_created_at(r["created_at"]) < cutoff
             ]
-            if expired_ids:
-                await self.db.delete_media_archive_by_ids(expired_ids)
-                stats["retention"] = len(expired_ids)
-                await self._delete_by_ids(expired_ids)
+            if expired_rows:
+                await self.db.delete_media_archive_by_ids(
+                    [r["media_id"] for r in expired_rows]
+                )
+                stats["retention"] = await self.delete_files(expired_rows)
         except Exception as exc:
             logger.warning("[ChatMemory] 媒体保留期清理失败: %s", exc)
         try:
             total = await self.db.media_archive_total_size()
             if total > self.max_total_bytes:
                 rows = await self.db.query_media_archive_for_cleanup(limit=1000)
-                to_delete: list[str] = []
+                # 一个物理文件可能被多行引用（内容寻址）：只有删掉**最后一行**才真的腾出
+                # 磁盘，中间那些行不该计入释放量，否则会按"每行都腾空间"的错觉删过头。
+                counts = await self.db.media_archive_file_counts()
+                freed = 0
+                to_delete: list[dict] = []
                 for row in rows:
-                    total -= int(row.get("size_bytes") or 0)
-                    to_delete.append(row["media_id"])
-                    if total <= self.max_total_bytes:
+                    created_at = _parse_created_at(row.get("created_at"))
+                    key = (
+                        str(row.get("file_name") or ""),
+                        created_at.strftime("%Y%m") if created_at else "",
+                    )
+                    counts[key] = counts.get(key, 0) - 1
+                    if counts[key] <= 0:
+                        freed += int(row.get("size_bytes") or 0)
+                    to_delete.append(row)
+                    if total - freed <= self.max_total_bytes:
                         break
                 if to_delete:
-                    await self.db.delete_media_archive_by_ids(to_delete)
-                    stats["quota"] = await self._delete_by_ids(to_delete)
+                    await self.db.delete_media_archive_by_ids(
+                        [r["media_id"] for r in to_delete]
+                    )
+                    stats["quota"] = await self.delete_files(to_delete)
         except Exception as exc:
             logger.warning("[ChatMemory] 媒体总量清理失败: %s", exc)
+        try:
+            stats["dedup"] = await self.dedup_existing(limit=1000)
+            if stats["dedup"]:
+                # 迁移进度写 INFO：回传日志时能看出"内容寻址迁移跑到哪了 / 有没有在跑"。
+                logger.info(
+                    "[ChatMemory] 媒体内容寻址迁移：本轮处理 %d 行", stats["dedup"]
+                )
+        except Exception as exc:
+            logger.warning("[ChatMemory] 媒体去重失败: %s", exc)
         try:
             stats["orphan"] = await self._orphan_scan(cutoff)
         except Exception as exc:
             logger.warning("[ChatMemory] 媒体孤儿文件清理失败: %s", exc)
         return stats
 
-    async def _delete_by_ids(self, media_ids: list[str]) -> int:
-        deleted = 0
-        # 按 id 找文件：file_name 为 <media_id>.<ext>，逐月目录查找成本可控，
-        # 优先直接扫目录而不是逐 id 猜扩展名。
-        wanted = set(media_ids)
-        for month_dir in self.media_dir.glob("[0-9][0-9][0-9][0-9][0-9][0-9]"):
-            if not month_dir.is_dir():
-                continue
-            for path in month_dir.iterdir():
-                if not path.is_file() or path.name.startswith("."):
-                    continue
-                stem = path.name.split(".", 1)[0]
-                if stem in wanted:
-                    try:
-                        path.unlink()
-                        deleted += 1
-                    except OSError:
-                        pass
-        return deleted
-
     async def _orphan_scan(self, cutoff: datetime) -> int:
         """删除 mtime 早于保留期且无归档行的文件（兜底，防 DB 已删而文件残留）。"""
         removed = 0
-        stale_files: dict[str, Path] = {}
+        # 按"文件"判定，而不是按文件名前缀当 media_id：内容寻址后文件名是内容哈希，
+        # 前缀查询永远查不到行，会把仍在使用的文件当孤儿删掉（多实例共用同一个文件时
+        # 更危险）。这里直接问 (file_name, 月份) 是否还有归档行在用。
         for month_dir in self.media_dir.glob("[0-9][0-9][0-9][0-9][0-9][0-9]"):
             if not month_dir.is_dir():
+                continue
+            month_dt = _parse_month_dir(month_dir.name)
+            if month_dt is None:
                 continue
             for path in month_dir.iterdir():
                 if not path.is_file() or path.name.startswith("."):
@@ -464,26 +580,15 @@ class MediaArchiver:
                         continue
                 except OSError:
                     continue
-                stale_files[path.name.split(".", 1)[0]] = path
-        if not stale_files:
-            return 0
-        # 分批查询：单次 IN 超过 SQLite 变量上限（32766）会整体失败
-        alive: set[str] = set()
-        stale_ids = list(stale_files.keys())
-        for chunk_start in range(0, len(stale_ids), 500):
-            alive.update(
-                await self.db.query_media_archive_by_ids(
-                    stale_ids[chunk_start : chunk_start + 500]
-                )
-            )
-        for media_id, path in stale_files.items():
-            if media_id in alive:
-                continue
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                pass
+                try:
+                    if await self.db.media_file_referenced(
+                        file_name=path.name, created_at=month_dt
+                    ):
+                        continue          # 还有归档行在用（含内容寻址后的共用文件）
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
         return removed
 
     async def _cleanup_tmp(self) -> None:

@@ -13,6 +13,9 @@ CM_GENERAL_RULES = """[ChatMemory 通用规则]
 - <cm_*> 是 ChatMemory 注入的结构化元数据标签，仅供你理解上下文（不是对话内容）；
   不得学习其格式，也不得在回复中输出任何 cm_ 标签或其内容。
 - <cm_time> 是时间元数据，仅表示发生顺序，无其他语义。
+- <cm_unsent/> 出现在某条你自己的回复前面时，表示**那条回复并没有真的发到平台上**
+  （被禁言、平台拒收或被拦下），只是本轮草稿：不要把它当成你说过的话，不要引用它，
+  也不要假装用户看过。
 - <cm_nickname> 只是账号 ID 对应的显示昵称（上下文里一律以昵称代替 QQ 号）：
   普通消息中指发言者，事件描述中指该角色的人。
 - <cm_speaker current="1"/> 标记当前交互对象。
@@ -109,9 +112,12 @@ def strip_bracket_media_placeholders(text: str) -> str:
 
 CROSS_SESSION_CONTEXT_INSTRUCTION = """[ChatMemory 跨会话来源规则]
 <cm_source n="N"/> 仅标注历史所属会话，N 是本次请求内的任意编号、无其他含义；
-无此元素表示当前会话。跨会话整合是为了让你更完整地知晓当前用户在其他群聊/私聊
-中的状态，从而更丰富地理解其性格、习惯与关系；其事实、承诺与关系可合并参考。
-来源标记仅供你理解，不要在回复中提及会话编号或其他会话。"""
+无此元素表示当前会话。**当前会话是本次对话的主场**：只围绕当前会话正在进行的话题、
+人物与事件回应，不要因为别处聊过就把话题带过去。带 <cm_source> 的内容只是背景参考，
+用于了解当前用户在其他群聊/私聊中的性格、习惯与长期关系；不得主动提起、延续、追问
+或引用其他会话的话题、事件、人物与承诺，也不得据此改变当前会话的语气、立场或称呼。
+当前会话与其他来源冲突时，一律以当前会话为准。来源标记仅供你理解，不要在回复中
+提及会话编号，也不要暗示存在其他会话。"""
 
 
 
@@ -255,6 +261,8 @@ class TakeoverContextBuilder:
         if max_records is not None:
             records = records[-max(1, int(max_records)):]
         formatted = self._format_records(records)
+        if not formatted:
+            return formatted
         if max_chars > 0:
             # 从尾部向前取，把 [user, assistant] 配对作为不可拆分单元：
             # 取到配对 assistant 时其 user 必须一起取（超预算则整体不取）；
@@ -329,6 +337,10 @@ class TakeoverContextBuilder:
                 and llm_status in (self.proactive_status, self.orphan_status)
             )
 
+            if role == "assistant" and record.get("delivery_unknown"):
+                # 这一轮实际上没有发到平台上（禁言/拒收/结果被清空），却只剩计划全文。
+                # 不标的话模型会把这句当成"已经说过了"，之后可能引用或因此不再重复。
+                content = "<cm_unsent/>" + content
             if role == "user":
                 event_xml = self._render_event(record)
                 if event_xml is not None:
@@ -397,13 +409,16 @@ class TakeoverContextBuilder:
     def _with_media_placeholders(self, record: dict, content: str) -> str:
         """给媒体内容补可读占位。
 
-        纯媒体消息（内容为空或只有旧英文占位）直接输出占位串，如 ``[图片]``；
+        纯媒体消息（内容为空或只有旧英文占位）直接输出占位标签，如 ``<cm_image/>``；
         混合消息在文本末尾追加缺失的占位（已含同款占位则不重复），如
         ``指挥官，你看这张图 [图片]``。
         """
+        # media_kinds 决定"哪些媒体形态要补占位"：之前这个形参只赋值不读取，
+        # 等于一个被静默忽略的配置（改它没有任何效果）。
+        allowed = self.media_kinds or set(MEDIA_PLACEHOLDER_LABELS)
         kinds = [
             kind for kind in (record.get("content_kind") or [])
-            if kind in MEDIA_PLACEHOLDER_LABELS
+            if kind in MEDIA_PLACEHOLDER_LABELS and kind in allowed
         ]
         if not kinds:
             return content
@@ -497,7 +512,10 @@ class TakeoverContextBuilder:
         if not target_name:
             target_name = "未知成员"
         target_name = _xml_escape(target_name, quote=True)
-        target_text = _xml_escape(target_text, quote=True)
+        # turn 分支的正文来自已渲染的记录（`&` 已转成 `&amp;`），再转一次会变成
+        # `&amp;lt;`；只有快照分支的原始正文需要在这里补转义。
+        if reply.get("resolution") != "turn":
+            target_text = _xml_escape(target_text, quote=True)
 
         if target_name and target_text:
             relation_line = f'<cm_reply target="{target_name}">{target_text}</cm_reply>'
@@ -537,7 +555,10 @@ class TakeoverContextBuilder:
             if speaker_tag:
                 parts.append(speaker_tag)
         # 昵称缺失时不回退 user_id：账号 ID 不得进入 LLM 上下文（README 隐私承诺）。
-        sender = str(record.get("sender_nickname") or "").strip() or "?"
+        # 落库侧允许把 QQ 号作为最后一档昵称，这里再拦一次，保证上下文里不出现号码。
+        sender = str(record.get("sender_nickname") or "").strip()
+        if not sender or sender.isdigit():
+            sender = "未知成员"
         parts.append(f'<cm_nickname>{_xml_escape(str(sender), quote=True)}</cm_nickname>')
         prefix = " ".join(parts)
         return f"{prefix} {content}" if content else prefix

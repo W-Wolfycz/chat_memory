@@ -1,503 +1,474 @@
 # ChatMemory
 
-以 `UMO + conversation_id + user_id` 为维度的对话存档插件。所有进入 ProcessStage 的消息立即落库 SQLite，每条记录带两个独立维度的状态字段（`llm_status` + `content_kind`）。默认纯旁路存档；开启上下文接管后可让 CM 成为唯一上下文源。
+全量对话记录存档 + 合并存储（跨实例去重）+ 可切读的上下文源 + 自带查询台。
 
-当前发布版本：`1.5.4`。此前版本统一视为内部 `0.x` 测试版；插件版本与数据库 schema 版本相互独立，当前数据库 `PRAGMA user_version=7`。
+- 版本：`2.0.0-beta`；AstrBot `>=4.16,<5`；平台：`aiocqhttp`（NapCat）、`qq_official`
+- 数据库：SQLite；旧表 schema `user_version = 8`；合并存储结构线 `SHADOW_SCHEMA_VERSION = 6`
+- 仓库：<https://github.com/W-Wolfycz/chat_memory>
 
-## 特性
+本文件按**当前代码**写，面向要在此基础上接入别的插件的人：数据模型、对外 API、读源切换规则、查询台契约都在这里。
 
-- **全量捕获**：所有进入 ProcessStage 的 user 消息 + BOT 回复立即落库（命令、闲聊、纯媒体、混合消息都存）
-- **配对存储**：新记录用 `turn_id` 配对，旧记录兼容 assistant `pair_id`（= 对应 user 的 `message_id`）
-- **双列状态**：`llm_status` 描述 LLM 路径，`content_kind` 描述内容形态，正交独立
-- **可选接管上下文**：开启 `context_takeover` 后接管 LLM 的 contexts 注入
-- **命令感知**：自动识别 `/reset`（清空当前 CID 存档，与 AstrBot 语义一致）与 `/new`（保留旧 CID 记录）
-- **自动清理**：`auto_cleanup_days > 0` 时启动周期清理任务
-- **输出防污染**：LLM 回复泄漏的 `<cm_*>` 结构（含内文）在发送与落库前统一清洗，用户不会看到；用户伪造的 cm_ XML 进上下文前清除
-- **只读查询台**：自带 Plugin Page（原 chat_memory_ui，1.4.0 起并入），记录检索筛选、工具调用查询、历史媒体回看与数据库健康诊断
+---
 
-## WebUI 查询台（1.4.0 起内置）
+## 1. 它做什么
 
-插件卡片中打开 `explorer` 页面即可使用。默认以 `mode=ro` 只读连接打开本插件数据库，
-不修改、清理、迁移或修复 `chat_memory.db`；数据源设置中可改为服务器上的其他绝对路径
-（快照回退策略随之保存）。历史媒体（图片/语音/视频/文件）需 1.3.0+ 的媒体归档，
-未归档显示占位。原 chat_memory_ui 插件已停止维护，请停用并移除。
+| 能力 | 说明 |
+|---|---|
+| **全量落库** | 每条进入 ProcessStage 的消息立即写 SQLite：正文、发送者、会话、平台时间、内容形态（`content_kind`）、关系（@/引用/转发）、人格、轮次 |
+| **强制双写** | 本版起旧表照旧写，同时镜像到 **7 张**合并存储表（6 张数据表：`messages` / `message_bots` / `reply_messages` / `tool_calls` / `session_seq` / `group_names`，外加 1 张结构元信息表 `shadow_meta`；一条物理消息一行：三个 BOT 看到同一条群消息也只存一份）。**没有关闭开关** |
+| **切读** | 双写满 **7 天** 后，配置里的 `shadow_read` 才生效：上下文接管、公开查询 API **与查询台**一起改读合并存储；没满之前配置照收不生效（只写不读） |
+| **上下文接管** | 可让 ChatMemory 成为唯一上下文源：按轮取数、跨会话/整群/按 persona、工具段回放、原生历史清除 |
+| **查询台** | 自带 Plugin Page（数据概览 / 记录查询 / 工具调用），三种模式（只读 / 高级只读 / 删除），软删除与快照导出 |
+| **媒体归档** | 图片/语音/视频/文件落盘，按保留期与总量上限清理 |
 
-**软删除（1.5.3）**：软删除只在查询台开放，一次只处理**一条**记录（记录与工具调用同一套逻辑）。
+---
 
-1. 点击顶栏「只读模式」切换到「**删除模式**」（仅当数据源是插件实时库；指向其他路径/快照库时会被拒绝）
-2. 删除模式下，每条记录（列表与详情页）后面出现 **times 图标**，点击即软删除该条
-3. 删除后该条下方出现 `deleted` chip，图标变为 **backup 图标**，点击即恢复
-4. **展示不做截断**：UMO / Conversation ID / turn_id / 昵称等标识字段一律显示完整值（徽章可换行，`title` 也是完整值），引用原文与列表正文不再按字符或高度裁剪；仅列表正文有 4000 字符的预览上限（超过会明确标注「列表预览已截断，打开详情查看完整内容」，详情返回 20 万字符）
-5. 筛选栏「删除状态」下拉：`All` / `未删除`（默认） / `已删除`（记录查询与工具调用查询各有一个）；已删除记录在详情页显示**删除时间**，工具调用卡片则在卡片内直接显示
-6. 「工具调用」页签同样支持：删除模式下每个工具卡片右上角有 times/backup 图标，删除后卡片内出现 `deleted` chip 与删除时间；被软删的工具记录不再参与接管回放
-7. 概览与健康检查的总数是**未删除**口径，另有 `已删除` 计数（记录与工具调用分别统计）
+## 2. 安装
 
-软删除只标记行本身（`deleted_at`），**不动媒体文件**：记录与媒体的物理删除仍走原有配置
-（记录按 `auto_cleanup_days`，媒体按 `media_archive` 的保留期/总量上限）。查询台其余部分仍是只读。
+1. 插件目录放到 `data/plugins/chat_memory/`，重载插件。
+2. 首次加载自动建库：`data/plugin_data/chat_memory/chat_memory.db`（查询台的「数据库路径」可切到别的只读副本）。
+3. 依赖见 `requirements.txt`：`sqlalchemy[asyncio]`、`aiosqlite`、`aiohttp`、`Pillow`、`quart`、`tzdata`（Windows）。
 
-## 双列状态体系
+---
 
-| 字段 | 取值 | 含义 |
-|---|---|---|
-| `llm_status` | `""` | 默认，未走 LLM（命令、`set_result`、无回复、纯媒体） |
-| | `llm_pending` | LLM 触发但 assistant 未成功 |
-| | `llm_success` | LLM 路径且 assistant 成功回复 |
-| | `proactive` | 主动消息（assistant 单边，含 cron） |
-| | `orphan` | user 漏存（DB 写入失败） |
-| `content_kind` | `text` / `image` / `video` / `voice` / `file` / `emoji` / `forward` / `event` | JSON 数组，可多值；`system_event` / `poke` 为 1.5.0 前旧值，仅兼容读取 |
-| | `[]` 空数组 | empty（如纯 @BOT 无文字、纯 Reply 无文字） |
+## 3. 配置（`_conf_schema.json`）
 
-`at` / `reply` 不入 `content_kind`。`reply_id` 保留平台引用 ID；`at_id` 已弃用但在
-1.x 继续双写第一个普通 At，以兼容旧调用方。新消息通过 `relation_data` 保存完整有序 At
-参数与 Reply 关系，正文在库内使用 `⟦CM_AT:n⟧` 模板，查询返回的 `content` 会渲染为
-`<cm_mention target="昵称"/>`，并额外提供原始 `content_template`。
+顶层平铺，无隐藏开关。
 
-**配对规则**：新记录用内部 `turn_id` 关联 user-assistant；旧记录继续用 `pair_id` 关联 user `message_id`。`proactive` / `orphan` 仍由 `llm_status` 表达单边语义。平台无 `message_id` 时新记录也能配对。
-
-## 配置
-
-| 字段 | 类型 | 默认值 | 说明 |
+| 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `max_content_length` | int | 0 | 单条记录最大字符数。**0 = 不限制** |
-| `auto_cleanup_days` | int | 0 | 自动清理天数，**0 = 不清理**；>0 启动周期任务（24h 一次） |
-| `log_with_bot_id` | bool | false | 日志前缀附加机器人实例 ID，多 Bot 环境便于定位 |
-| `context_takeover` | object | — | 上下文接管配置，详见 [上下文接管](#上下文接管) |
-| `media_archive` | object | — | 媒体归档：`enabled`(true) / `include_video`(false) / `retention_days`(30) / `max_total_mb`(2048)。关闭时只存元信息不落盘 |
+| `max_content_length` | int | `0` | 单条正文落库上限（0＝不截断） |
+| `auto_cleanup_days` | int | `0` | 自动清理阈值（0＝不清理） |
+| `log_with_bot_id` | bool | `false` | 日志前缀加 `[platform:{platform_id}]` |
+| `shadow_read` | bool | `false` | 切读开关（**受 7 天门槛约束**） |
+| `sent_capture_history` | bool | `false` | 拉取通道：发送后拉群历史补自己发言（push 回显的兜底） |
+| `context_takeover.enable` | bool | `false` | 接管上下文 |
+| `context_takeover.cross_session` | bool | `false` | 跨 UMO 取数（群私聊互通） |
+| `context_takeover.cross_session_blacklist` | list | `[]` | 黑名单，`G:<群号>` 或 `F:<用户号>` |
+| `context_takeover.full_group` | bool | `false` | 整群取数（不限当前用户） |
+| `context_takeover.limit_rounds` | int | `30` | 取多少轮 |
+| `context_takeover.max_context_chars` | int | `0` | 上下文字符上限（0＝不限） |
+| `context_takeover.llm_status_filter` | list | `["llm_success"]` | 取哪些 LLM 状态（`["no_llm"]` 表示空值） |
+| `context_takeover.include_content_kinds` | list | `["text"]` | 内容类型白名单：`text` / `image` / `video` / `voice` / `emoji` / `poke` / `file` / `forward` / `event` |
+| `context_takeover.event_kinds` | list | 全部 8 类 | 事件子类白名单 |
+| `context_takeover.recall_skip_context` | bool | `false` | 撤回消息不进上下文 |
+| `context_takeover.include_all_match` | bool | `false` | 白名单"全含"还是"任一" |
+| `context_takeover.clear_native_history` | bool | `true` | 清原生历史，避免两套上下文并存 |
+| `context_takeover.fallback_to_native_on_empty` | bool | `false` | 取不到时回退原生历史（默认严格清空） |
+| `context_takeover.filter_by_persona` | bool | `false` | 按当前生效 persona 过滤 |
+| `context_takeover.keep_tool_turns` | int | `2` | 保留最近几轮的工具段回放 |
+| `media_archive.enabled` | bool | `true` | 归档开关 |
+| `media_archive.include_video` | bool | `false` | 是否归档视频 |
+| `media_archive.retention_days` | int | `30` | 保留天数 |
+| `media_archive.max_total_mb` | int | `2048` | 归档总量上限 |
 
-> **日志等级**：插件不再提供"日志提级"配置——AstrBot >= 4.26.8 已内置运行期修改插件日志等级的能力（WebUI 插件详情页选择等级，写入 `config/plugin_log_levels.json` 即时生效，无需重启），需要 debug 日志时在那里把 `chat_memory` 调到 DEBUG 即可。
+---
 
-## 数据存储
+## 4. 数据模型
 
-数据库：`data/plugin_data/chat_memory/chat_memory.db`
+### 4.1 两套表
 
-```sql
-CREATE TABLE chat_memory_records (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    umo             TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    user_id         TEXT NOT NULL,
-    role            TEXT NOT NULL,                  -- 'user' 或 'assistant'
-    content         TEXT NOT NULL DEFAULT '',
-    message_id      TEXT,                           -- 平台消息 id（NULL 表示平台未给；assistant 恒为 NULL）
-    pair_id         TEXT,                           -- 仅 assistant：绑定的 user.message_id
-    llm_status      TEXT NOT NULL DEFAULT '',
-    content_kind    TEXT NOT NULL DEFAULT '[]',     -- JSON 数组：内容形态
-    platform_id     TEXT,                           -- 平台实例 ID
-    platform_name   TEXT,                           -- 平台类型（aiocqhttp / lark / ...）
-    message_type    TEXT,                           -- FriendMessage / GroupMessage / OtherMessage
-    session_id      TEXT,                           -- 会话标识（QQ 号 / 群号）
-    self_id         TEXT,                           -- 机器人自身 ID
-    group_id        TEXT,                           -- 群号（仅群聊）
-    sender_nickname TEXT,
-    raw_timestamp   INTEGER,                        -- 消息原始 Unix 时间戳（秒）
-    at_id           TEXT,                           -- At 目标 ID
-    reply_id        TEXT,                           -- Reply 引用消息 ID
-    forward_id      TEXT,                           -- Forward 平台 ID
-    persona_id      TEXT,                           -- 生效 persona，用于可选隔离
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    turn_id         TEXT,                           -- ChatMemory 内部轮次 ID，不依赖平台 message_id
-    send_status     TEXT NOT NULL DEFAULT '',       -- assistant: prepared / send_attempted
-    relation_data   TEXT,                            -- v1 At 模板参数 + Reply turn/snapshot
-    recalled_at     DATETIME,                        -- 非空=该消息已被撤回
-    deleted_at      DATETIME                         -- 非空=软删除（仅查询台单条入口可写，默认不出现在检索与界面）
-);
+**旧表（V1，仍在双写）**
+
+| 表 | 粒度 | 关键列 |
+|---|---|---|
+| `chat_memory_records` | 每实例每轮一行（user / assistant 各一行） | `umo`、`conversation_id`、`user_id`、`role`、`content`、`message_id`、`pair_id`、`llm_status`、`content_kind`、`persona_id`、`turn_id`、`send_status`、`deleted_at`、`relation_data` |
+| `chat_memory_tool_records` | 每次工具调用一行 | `umo`、`conversation_id`、`turn_id`、`call_index`、`tool_name`、`tool_args`、`tool_result` |
+| `chat_memory_media_archive` | 每个归档文件一行 | `media_id`、`file_name`、`kind`、`size_bytes`、`content_hash` |
+
+**合并存储（V2，`SHADOW_SCHEMA_VERSION = 6`）**
+
+| 表 | 粒度 | 说明 |
+|---|---|---|
+| `chat_memory_messages` | **一条物理消息一行** | `msg_uid` 主键（平台键 `p:…` / 本地键 `l:…`）、`seq`（会话内递增）、`platform_timestamp`、`platform_seq`、`content`（模板，读前须按 `relation_data` 渲染）、`content_kind`、`sender_id`、`sender_nickname`、`recalled_at`、`deleted_at` |
+| `chat_memory_message_bots` | 每实例的参与行 | `(msg_uid, platform_id, self_id, conversation_id)` 唯一；`role`、`llm_status`、`send_status`、`persona_id`、`target_id`、`turn_id`、`platform_message_id`、`raw_timestamp` |
+| `chat_memory_reply_messages` | **一轮一条计划**（主键 `turn_id`） | 发送前抓到的正文与轮次状态；`content_kind`/`send_status` 带 CHECK |
+| `chat_memory_tool_calls` | 每次工具调用一行 | 幂等键 `(turn_id, call_index)`；按会话取用 `ix_cmtc_umo_turn` |
+| `chat_memory_session_seq` | 会话序号计数器 | `(platform_name, message_type, session_id)` → `last_seq`，**只增不减**（会话删空也不回退） |
+| `chat_memory_group_names` | 群名快照 | `(platform_name, session_id)` → 最近一次读到的群名（不保留改名历史） |
+| `chat_memory_shadow_meta` | 元信息 | `schema_version`、`dual_write_started_at`、`shadow_migrate`（键白名单由 CHECK 约束） |
+
+### 4.2 三个必须分清的概念
+
+- **物理消息**：平台上真实存在的一条（`chat_memory_messages`）。三个实例看到同一条群消息 → **一行**。
+- **参与行**：某个实例看到这条消息时的视角（`chat_memory_message_bots`）。`role` 表示"属于谁的轮次侧"：`user`＝入站观察（含别人做的动作、系统事件），`assistant`＝我们发出的回复。
+- **逻辑轮次**：`turn_id`（uuid4）把"一条提问 + 它的回复 + 这轮工具调用"绑在一起。一轮的 assistant 侧可能是 1 条计划成员 + N 条实发段。
+
+### 4.3 状态字段
+
+- `llm_status`：`""`（未走 LLM）/ `llm_pending` / `llm_success` / `proactive`（主动消息）/ `orphan`（用户消息漏存）
+- `send_status`：`""` / `prepared`（发送前的计划）/ `send_attempted`（AstrBot 发送流程结束）
+- `content_kind`：JSON 数组，如 `["text"]`、`["image"]`、`["event"]`、`["text","image"]`
+
+---
+
+## 5. 读源切换（切读）
+
+```
+dual_write_started_at + 7 天 <= now   →  允许读合并存储
 ```
 
-工具调用独立存档（schema v4 起，`chat_memory_tool_records`）：
+- **三个读侧共用同一个判据**（`shared_store.SHADOW_READ_MIN_DAYS = 7`）：上下文接管、公开查询 API、查询台。同时切或同时不切。
+- 未满 7 天：配置照收但不生效，启动日志写"还需约 N 天"，此时只写不读。
+- 合并存储结构不认识（`schema_version` ≠ 3）→ 加载时丢弃重建（只清镜像，`dual_write_started_at` 沿用，窗口不清零）。
+- 查询台读源额外要求：3 张核心影子表齐 + `schema_version` 等于写入侧常量 + 窗口已满；否则读旧表（旧表**不去重**）。
 
-```sql
-CREATE TABLE chat_memory_tool_records (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    umo             TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    turn_id         TEXT NOT NULL,
-    call_index      INTEGER NOT NULL,               -- 同轮内第几次工具调用
-    tool_name       TEXT NOT NULL,
-    tool_args       TEXT NOT NULL DEFAULT '',       -- JSON 字符串
-    tool_result     TEXT NOT NULL DEFAULT '',       -- 纯文本（图片等二进制用占位符）
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (turn_id, call_index)
-);
-```
+---
 
-工具记录不进 user/assistant 配对与查询 API，只在接管时按轮次回放成 OpenAI 格式（自造 id 为
-`cm_tool_<完整 turn_id>_<序号>`）；同样带 `deleted_at`（v8），被查询台软删的工具记录不再回放。
+## 6. 对外查询 API（Python）
 
-媒体归档（schema v5 起，`chat_memory_media_archive`）：
-
-```sql
-CREATE TABLE chat_memory_media_archive (
-    media_id        TEXT PRIMARY KEY,              -- relation_data.media 条目中的 id（32 位随机 hex）
-    umo             TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    turn_id         TEXT NOT NULL,
-    kind            TEXT NOT NULL,                 -- image / video / voice / file
-    file_name       TEXT NOT NULL,                 -- <media_id>.<ext>，路径不落库
-    ext             TEXT NOT NULL,
-    mime_type       TEXT,
-    size_bytes      INTEGER NOT NULL,
-    created_at      DATETIME NOT NULL              -- UTC naive，与主表一致
-);
-```
-
-user 侧媒体落盘到 `data/plugin_data/chat_memory/media/<YYYYMM>/<media_id>.<ext>`：本地源（已存在的 path/file://）在捕获时同步拷贝（毫秒级），远程 URL 交给后台 worker 下载（2 并发、短超时、失败静默）；**管线零阻塞，归档尽力而为**，失败不影响记录存档。只在落盘成功时写归档行；emoji/poke/forward 只有元信息不落盘。清理按 `media_archive` 配置（保留天数 + 总量上限），`/reset` 与自动清理级联删除归档行与文件。
-
-> **platform_id vs platform_name**：自 AstrBot v4.0 起 umo 第一段是实例 ID（多 aiocqhttp 实例时每个不同），`platform_name` 才是类型。
->
-> **raw_timestamp vs created_at**：`raw_timestamp` 是消息到达 AstrBot 的时间（Unix 秒，平台给出，本地时区），`created_at` 是落库时间（**UTC naive 存储**，与 schema default `CURRENT_TIMESTAMP` 对齐；**查询返回时按 AstrBot `timezone` 配置转成配置时区 naive 字符串**）。
->
-> **数据库升级**：启动时使用 `PRAGMA table_info` 校验必需列。**1.4.0 之前的旧 schema 不再自动迁移**（市场首发 1.4.0）：缺列时直接抛出可诊断错误（列出缺失列，提示先用 1.4.0 升级或移走旧库），不会静默补列或重建表。1.5.0 起 schema v5 新增媒体归档表；1.5.1 起 schema v6 主表新增 `recalled_at`（可空，非空=该消息已被撤回），升级时按需 `ALTER TABLE ADD COLUMN`；1.5.3 起 schema v7 主表与工具表新增 `deleted_at`（软删除标记，旧库按需 `ALTER TABLE`，各加一个 `(umo, deleted_at)` 索引）。
-
-> **turn_id 与发送状态**：1.0.0 的实时写入和状态升级统一使用内部 `turn_id`；历史记录查询仍保留 `message_id` / `pair_id` 回退，确保现有数据库中的旧轮次可读。`send_status=prepared` 表示 assistant 已写入、准备发送；`send_attempted` 仅表示 AstrBot 发送流程结束/已尝试，不等价于平台送达回执。
-
-### 升级与备份
-
-- 支持范围：**1.4.0 及以后**的数据库（schema ≥ v4）。1.4.0 之前的旧库不会被自动迁移，插件启动时会给出明确错误提示。
-- schema 演进：1.2.2 起 v4 新增独立工具表 `chat_memory_tool_records`；1.5.0 起 v5 新增媒体归档表 `chat_memory_media_archive`；1.5.1 起 v6 主表新增 `recalled_at`（撤回标记）；1.5.3 起 v7 主表与工具表新增 `deleted_at` 软删除标记（查询台单条软删除/恢复）。v5 → v6 仅补一列，v6 → v7 各补一列 + 各建一个索引，既有记录零迁移（存量行 `deleted_at` 为 NULL = 未删除）；结构化标签与当前轮焦点锚只改变请求时展示，不修改表结构或既有记录。
-- 数据库启用 WAL。AstrBot 运行时不要只复制 `chat_memory.db` 主文件，否则可能漏掉 `.db-wal` 中尚未 checkpoint 的记录；应先停止 AstrBot，或使用 SQLite `backup()` API。
-- 升级前仍建议保留一次独立备份。插件不会自动删除历史备份表。
-
-## 供其他插件调用
-
-> ⚠️ **不要直接 `from chat_memory.main import ...`**：AstrBot 的插件加载机制不保证模块级 import 可用。统一用 `get_registered_star`。
+从别的插件里调：`cm = context.get_registered_star("chat_memory")`。
 
 ```python
-def _resolve_chat_memory(context):
-    try:
-        star = context.get_registered_star("chat_memory")
-        if star is not None:
-            for candidate in (star, getattr(star, "star", None), getattr(star, "star_cls", None)):
-                if candidate is not None and hasattr(candidate, "query_history"):
-                    return candidate
-    except Exception:
-        pass
-    return None
-
-
-cm = _resolve_chat_memory(context)
-```
-
-### API
-
-| 函数 | 参数 | 返回 |
-|---|---|---|
-| `query_history` | `umo, conversation_id, user_id=None, limit=20, llm_status=None, content_kind=None, role_filter=None, persona_id=None, since=None, until=None, from_oldest=False, after_id=None, content_kind_all_match=False` | `list[dict]`，按时间正序 |
-| `query_rounds` | `umo, conversation_id, user_id=None, limit_rounds=10, llm_status=None, content_kind=None, persona_id=None, since=None, until=None, from_oldest=False, after_id=None, content_kind_all_match=False` | `list[list[dict]]`，按 `turn_id` 配对；旧数据回退 `pair_id` |
-| `build_takeover_contexts` | `umo, user_id, conversation_id=None, persona_id="", exclude_turn_id=""` | `list[dict] \| None`，按当前接管配置构建可直接传给 LLM 的 contexts |
-
-**参数行为**
-
-- `user_id` 为空时不按用户过滤，返回该会话所有用户混合记录（群聊场景）
-- `llm_status` 支持 str 或 list[str]（list 走 SQL `IN`）。空串过滤用 `[""]`
-- `content_kind` ANY 语义：返回数组中任一包含指定值的记录
-- `query_rounds` 的 `llm_status` / `content_kind` 只过滤 user 侧；persona 和时间条件同时作用于 user、assistant 及配对检查
-- `query_rounds` 只返回严格完整的 `[user, assistant]`；旧数据存在重复 assistant 时按最早 `created_at + id` 取一条
-- `persona_id`：`None` 不过滤；非空按值过滤；空串 `""` 严格过滤 `IS NULL OR ''`
-- `since` / `until` 给定时按 `created_at` 过滤时间窗口（含端点）；`datetime` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 `CURRENT_TIMESTAMP` 对齐）
-- 返回记录同时提供 `created_at`（配置时区 naive 字符串）和明确的 `created_at_utc`（UTC ISO 8601 字符串）。新调用方应使用 `created_at_utc` 作为 UTC 游标。
-- `from_oldest=false` 保持原行为：选最新 N 条/轮后按时间正序返回；设为 `true` 时从最旧记录开始选 N 条/轮，返回顺序仍为正序。
-- 每条公开查询结果包含内部只读 `record_id`。`since + after_id` 同时提供时使用严格 `(created_at, id)` keyset 下界，适合稳定分页；只传 `since` 时仍保持原有含端点语义。
-- `content_kind_all_match=true` 将 ALL 白名单直接下推 SQLite；默认 `false` 保持原有 ANY 语义。
-- 新关系记录的 `content` 是渲染后的可读文本，`content_template` 是库内原始模板，`relation_data` 是结构化 At/Reply 数据；旧记录的 `relation_data` 为 `None`，不会推测性回填。
-- `query_rounds` 的配对检查会复用 persona / 时间条件，避免过滤后返回孤立 user
-
-### 群聊 At / Reply 关系
-
-- At 按 MessageChain 原始位置写成 `⟦CM_AT:0⟧` 等带索引模板；`relation_data.mentions` 按出现顺序保存参数，重复 At 不去重，AtAll 使用 `{"all": true}`。
-- 统一规则：凡与文字同时出现的媒体/动作组件，一律按原始位置写成类型化 token（`⟦CM_IMAGE:n⟧` / `⟦CM_VIDEO:n⟧` / `⟦CM_FILE:n⟧` / `⟦CM_POKE:n⟧` 等，n 为 `relation_data.media` 数组下标），`media` 附带元信息（表情 `id`、戳一戳目标）；查询返回的 `content` 渲染为 `<cm_image/>` / `<cm_file/>` 等类型化占位标签（标签名即媒体类型），保持正文中的原始位置。纯媒体/纯动作消息（消息链中无文本组件，判定看组件 kind）不走 token，正文直接存英文占位（`[image]` 等），元信息仍在 `media` 数组。
-- 普通成员 Reply 只用同一平台实例、同一 UMO 下唯一的 `reply_id → user.message_id` 精确解析为 `target_turn_id`；零命中或多命中都不猜测。
-- 引用 Bot/assistant 时不做时间或内容启发式匹配，直接保存 AstrBot Reply 组件提供的昵称与最多 300 字符文本快照；其他无法精确解析的 Reply 同样降级为快照。
-- 跨会话历史中的 Reply 仍按该消息原本所在的 UMO 查询 `target_turn_id`，不会拿当前请求所在群替代，也不会跨群猜测引用关系。
-- takeover 会把关系渲染为 `<cm_reply target="昵称">原文</cm_reply>` 与正文中的 `<cm_mention target="昵称"/>`。旧记录没有 `relation_data` 时完全保持旧格式。
-
-**`build_takeover_contexts` 返回语义**
-
-- `context_takeover.enable=false` 时返回 `None`
-- 接管已启用但 CID、用户范围、查询记录或规整结果为空时返回 `[]`
-- 完整复用 CM 当前接管查询与规整逻辑，自动遵循 scope、状态、内容白名单、Persona、固定身份前缀、条数和字符预算
-- `cross_session=true` 且结果实际包含其他会话时，使用请求内中性 XML 元数据：当前会话不加标记，其他来源统一为 `<cm_source n="1"/>` / `<cm_source n="2"/>`；同一请求内稳定复用，来源类型、真实群号、群名和 UMO 不进入 contexts
-- 只读构建 contexts：不清理 AstrBot native history、不修改数据库，也不修改调用方请求对象
-- `conversation_id=None` 时读取该 UMO 的当前 CID；没有当前 CID 时返回 `[]`
-- `user_id=""` 仅在 `full_group=true` 且 UMO 确为群聊时允许；此时忽略 `cross_session`，严格限制为当前 UMO + 当前 CID 的整群记录。其他情况返回 `[]`
-
-### 调用示例
-
-```python
-# LLM 配对历史
-history = await cm.query_history(umo, cid, uid, limit=20, llm_status="llm_success")
-
-# 按完整轮次取 LLM 配对
-rounds = await cm.query_rounds(umo, cid, uid, limit_rounds=10, llm_status="llm_success")
-
-# 非 LLM 路径（命令、set_result 等）
-cmds = await cm.query_history(umo, cid, uid, limit=50, llm_status=[""])
-
-# 群聊全量历史（不按用户过滤）
-group_all = await cm.query_history(umo, cid, limit=50)
-
-# 按 persona 过滤（只看 default persona 下的对话）
-history = await cm.query_history(umo, cid, uid, persona_id="default")
-
-# 按时间窗口查最近 24 小时
-from datetime import datetime, timedelta, timezone
-since = datetime.now(timezone.utc) - timedelta(days=1)
-recent = await cm.query_history(umo, cid, uid, since=since, limit=100)
-
-# persona + 时间窗口组合
-rounds = await cm.query_rounds(
-    umo, cid, uid, persona_id="default", since=since, limit_rounds=20,
+rows = await cm.query_history(
+    umo="BOT1:GroupMessage:10001", conversation_id="cid", user_id="10002",
+    limit=20, llm_status=["llm_success"], content_kind=["text"],
+    role_filter=None, persona_id=None, since=None, until=None,
+    from_oldest=False, after_id=None, content_kind_all_match=False,
 )
 
-# 为主动消息等独立 LLM 调用构建与 CM 接管完全一致的只读 contexts
-contexts = await cm.build_takeover_contexts(
-    umo=umo,
-    user_id=uid,
-    conversation_id=cid,
-    persona_id="default",
+rounds = await cm.query_rounds(umo, "cid", user_id="10002", limit_rounds=10)
+# → [[user_dict, assistant_dict], ...]
+```
+
+| 方法 | 读源 | 说明 |
+|---|---|---|
+| `query_history(...)` | 跟随 `shadow_read`（含门槛） | 消息级平铺 |
+| `query_rounds(...)` | 同上 | 轮次级，`[[user, assistant], ...]` |
+| `query_history_v2(...)` | **强制合并存储** | 对拍/灰度用，不受开关与门槛限制 |
+| `query_rounds_v2(...)` | **强制合并存储** | 同上 |
+
+要点：
+
+- `llm_status` / `content_kind` 接受字符串或列表。空值（从未走过 LLM 的行）在**配置项与查询台**里写作 `"no_llm"`；**进程内 API 直接传空串 `""`**——`"no_llm"` 这个别名只在配置解析与查询台做映射。
+- **`since` / `until` 一律按 UTC naive 解释**（库内 `created_at` 就是 UTC naive）；返回的 `created_at` 是**插件配置时区的 naive 字符串**，另有 `created_at_utc` 给需要做游标的调用方。直接把返回的 `created_at` 回传给 `since`（或配 `after_id` 翻页）会整体偏一个时区差，请改用 `created_at_utc`。
+- `query_rounds*` 的"配对"＝**这一轮有 assistant 侧**（计划成员或实发段），**不额外按 llm_status 过滤**（与旧表同名方法同语义）。
+- `storage.*` 底层方法（`query_latest` / `query_rounds` / `query_latest_v2` / `query_rounds_v2` / `query_tool_records` …）可直接用，但**不做 scope 与黑名单解析**。
+
+---
+
+## 7. 查询台（Plugin Page）
+
+入口：AstrBot → 插件 → ChatMemory。三页：
+
+| 页 | 内容 |
+|---|---|
+| **数据概览** | 记录/来源/会话/用户/工具/媒体计数、近 30 天活动、状态与工具分布、数据库诊断 |
+| **记录查询** | 筛选 + 结果列表 + 详情 + 软删除 |
+| **工具调用** | 工具筛选 + 调用卡片 + 详情 + 软删除 |
+
+### 7.1 三种模式
+
+| 模式 | 行为 |
+|---|---|
+| **只读**（默认） | 纯查看 |
+| **高级只读** | 仅记录查询页可见；选一个 persona 后按其轮次收窄，并给每条追加 chip |
+| **删除模式** | 列表与详情出现软删除/恢复图标（仅插件实时库开放） |
+
+### 7.2 记录筛选（8 项 + 关键词）
+
+| 控件 | 取值 | 查的列 |
+|---|---|---|
+| 聊天类型 | `group + private` / `group` / `private` | `message_type` |
+| QQ 号 | 群号或对方号（精确） | `session_id` |
+| 发言者 | 纯数字＝QQ 号精确；否则昵称模糊 | `sender_id` / `sender_nickname` |
+| 内容类型 | `all` / `text` / `image` / … | `content_kind` |
+| 事件子类 | `all` / `ban` / `member` / `title` / `recall` / `resource` / `poke` / `reaction` / `system` | `relation_data.event.type` |
+| 起止时间 | 本地时区 | `created_at` |
+| 删除状态 | `all` / 未删除 / 已删除 | `deleted_at` |
+| 每页数量 | 20 / 50 / 100 / 200 | — |
+| 关键词 | 正文 / 昵称 / user_id / message_id / turn_id | 多列 LIKE |
+
+高级模式额外三项：**角色**（`user + assistant` / `user` / `assistant`）、**该轮 LLM 状态**、**配对**（`all` / 仅看配对）。
+
+### 7.3 卡片 chip
+
+消息卡（后四项只在高级模式出现）：
+
+```
+[text] [event·reaction] [群聊·group_demo（群名）] [已撤回]
+[已配对#3] [assistant] [llm_success] [send_attempted]
+```
+
+- `群聊·群号（群名）`：群名走 OneBot `get_group_list` 现查（6 小时进程内缓存，**不落库**）
+- `已配对#N`：同一轮的所有消息共用同一个号（当前页第几对）
+- 状态 chip 按取值分色：`llm_success` 青 / `proactive` 琥珀 / `llm_pending` 蓝 / `orphan` 红 / `no_llm` 灰
+- 事件行**不加**角色与状态 chip（事件不是提问也不是回答）
+
+工具卡：
+
+```
+[头像] [轮 a92302f4 · 第 2 次调用] [BOT1] [persona_demo] [群聊·group_demo（群名）]
+```
+
+- 本轮只有 1 次调用时**不显示**步骤 chip
+- `轮 xxxx` 是 `turn_id` 前 8 位（uuid 唯一、跨页稳定）
+- `BOT1` 是 `umo` 第一段；`persona_demo` 是这一轮的人设；头像用该 BOT 的 `self_id` 现查
+- 技术值（`turn_id` / `umo` / `conversation_id` / 记录 ID）在「详情」里
+
+---
+
+## 8. 查询台 Web API
+
+前缀 `/api/plug/chat_memory/`，由 `ui/web_api.py` 注册。除软删除、恢复、导出与保存设置外全是只读。
+
+| 端点 | 方法 | 参数 | 返回 |
+|---|---|---|---|
+| `about` | GET | — | `name` / `display_name` / `version` / `read_only` / `write_enabled` / `writable_path` / `default_page_size` / `max_page_size` / `timezone` |
+| `settings` | GET | — | `database_path` / `using_default_path` / `default_database_path` / `immutable_fallback` |
+| `settings` | POST | `{database_path, immutable_fallback}` | 保存后的设置 |
+| `health` | GET | — | 数据库健康（路径、journal、WAL、schema 版本） |
+| `overview` | GET | — | `summary` / `daily` / `roles` / `statuses` / `tools` / `media` / `database` |
+| `facets` | GET | 与 `query` 同名的筛选参数 | `{kinds, database}` |
+| `query` | POST | §7.2 的筛选键 + `persona_id` / `advanced` / `persona_role` / `persona_llm_status` / `paired_only` / `page` / `page_size` | `{items, total, page, page_size, page_count, filters, database}` |
+| `record` | GET | `id` | `{record, database}` |
+| `soft-delete` | POST | `{id, target?}`（`target` = `record` / `tool`） | 更新后的状态 |
+| `restore` | POST | 同上 | 同上 |
+| `tools` | POST | `tool_name` / `chat_type` / `session_id` / `platform_id` / `persona_id` / `since` / `until` / `deleted_state` / `page` / `page_size` | `{items, total, …}` |
+| `group-names` | GET | — | `{groups: {群号: 群名}}`（现查，不落库） |
+| `personas` | GET | — | `{personas: [{value, count}]}` |
+| `media/<media_id>` | GET | `as=base64` 可选 | 文件字节或 base64 |
+| `export` | POST | — | `{file_name, size_bytes}`（SQLite backup 快照） |
+| `export/<file_name>` | GET | — | 下载快照 |
+
+`query.items[]` 关键字段：
+
+```text
+record_id（合并存储行 = rowid + 1_000_000_000）, umo, conversation_id, role, content,
+content_kind, relation_data, reply_view, media_view, sender_id, sender_nickname,
+session_id, message_type, created_at, created_at_utc, llm_status, send_status,
+persona_id, turn_id, message_id, recalled_at, deleted, deleted_at,
+advanced（仅高级模式：{turn_id, llm_status, send_status, turn_llm_status,
+                       turn_send_status, role, paired}）
+```
+
+---
+
+## 9. 媒体归档
+
+- 目录：`data/plugin_data/chat_memory/media/`（临时目录 `.tmp/`）
+- 命名：内容哈希前缀 + 扩展名；同一文件只存一份（内容哈希去重）
+- 清理：按 `retention_days` 与 `max_total_mb`；被多条记录共用的文件不删
+- 归档/下载失败：前 3 次 WARNING，之后 DEBUG（带累计次数）
+- 查询台按 `media_id` 回看与下载；`as=base64` 供沙箱 iframe 内桥接读取
+
+---
+
+## 10. 钩子与写入时机
+
+| Hook | 优先级 | 用途 |
+|---|---|---|
+| `event_message_type(ALL)` | 2000 | 入站消息捕获（user） |
+| `event_message_type(ALL)` | 1000 | 事件/通知类捕获 |
+| `on_llm_request` | 默认 / `-100` / `-1000` | 补捕获、`llm_status → llm_pending`、上下文注入 |
+| `on_llm_tool_respond` | — | 工具调用落库 |
+| `on_decorating_result` | 10000 | 发送前写计划成员（一轮一条）并记发送侧账本 |
+| `after_message_sent` | — | 标记 `send_status = send_attempted` |
+
+自己发言的实际形态靠两条通道补：**push 回显**（NapCat 自身消息上报，主通道）与 **pull 拉取**（`sent_capture_history`，兜底）。两条都依赖发送侧内存账本（60 秒宽限）认领轮次。
+
+---
+
+### 10.1 自己发言的昵称是怎么来的
+
+自己发出的消息，`sender_nickname` 有三条来源，按顺序兜底：
+
+1. **写行前主动查一次**：群聊 `get_group_member_info`（群名片优先）、私聊
+   `get_stranger_info`（备注 → QQ 昵称），拿到的名字直接写进这一行。结果缓存 6 小时；
+   收到 `group_card`（群名片变更）通知立即作废该会话缓存。
+2. 查不到时留空，`lookup_sender_nickname` 抄同会话、同发送者的最近一条**真名**（排除号码）。
+
+**历史行不改**：没有"回填既有行"的通道——名字是写入当时的快照，旧数据保持原样；
+只有新写入的行按当前规则取名。
+
+取名优先级**按会话类型分档**（都从原始事件里分别取 `card` 与 `nickname`，适配器给的
+`get_sender_name()` 分不出两者）：
+
+| 会话 | 优先级 |
+|---|---|
+| 群聊 | **群名片** → QQ 昵称 → 自己的登录昵称 → QQ 号 |
+| 私聊（含临时会话） | **好友备注** → QQ 昵称 → QQ 号（**不取群名片**） |
+
+备注只能从 `get_friend_list` 拿（消息事件里没有该字段），进程内缓存 6 小时；`remark` 等于
+`nickname` 时视为没设备注。号码只作最后一档用于查询台排障；上下文渲染时号码会被替换成
+「未知成员」，账号不进 LLM 上下文。
+
+**临时会话**（非好友私聊）会被记为私聊，并按私聊档位取名；来源群记在
+`relation_data`（`sub_type` / `temp_group_id` / `temp_source`，NapCat 查不到时的哨兵值
+`284840486` 会被丢弃），目前只存不用。
+
+> 某账号在群里仍显示 QQ 昵称，只说明它在这个群**没有设群名片**（`card` 为空）；把 DEBUG 打开
+> 就能看到接口返回的 `card` / `nickname` 原值。
+
+已有真名的行不会被改写（昵称是当时那一刻的快照）。
+
+## 11. 文件结构
+
+```
+chat_memory/
+├── main.py                 # 入口：钩子、捕获、切读门槛、查询台装配
+├── storage.py              # 旧表读写 + 迁移 + 软删除 + 媒体
+├── shared_store.py         # 合并存储 DDL/镜像/投影 + SHADOW_READ_MIN_DAYS
+├── shadow_read.py          # 合并存储读路径（消息级 / 轮次级 / 计划兜底）
+├── shadow_diag.py          # 计划成员写入与诊断
+├── context_builder.py      # 上下文组装（<cm_event>/<cm_mention>/<cm_solo>…）
+├── message_classifier.py   # 内容形态与事件分类
+├── relation_codec.py       # relation_data 编解码与模板渲染
+├── media_archive.py        # 媒体归档 worker 与清理
+├── qq_face.py              # QQ 表情/face 文本化
+├── group_names.py          # 群名现查缓存（get_group_list）
+├── models.py               # 枚举与校验集合
+├── ui/repository.py        # 查询台数据层（读源判定、筛选、软删除、导出）
+├── ui/web_api.py           # 查询台 Web API
+└── pages/explorer/         # 前端（app.js / index.html / styles.css）
+```
+
+---
+
+## 12. 已知限制
+
+- **查询台首次取数会慢约 0.6 秒**：合并读取的视图（v2 投影 + 旧历史去重）按库指纹物化到
+  TEMP 表，第一次查询要建一次（~0.6s）；之后取一页 70~140ms、概览 300ms 内且 30 秒缓存。
+  库有写入（含 WAL 追加）时指纹变化、下次查询重建一次。
+
+
+1. **历史 assistant 行的 `llm_status` 为空**：1.5.4 及更早的回显行只从内存账本抄状态，没命中就永久空。写入侧已修（账本带状态），历史数据不修复。影响：查询台高级模式的状态 chip、按状态筛 assistant 行；**不影响上下文内容**（回复按 `turn_id` 挂回，不看状态）。
+2. **切读只覆盖双写之后**：`shadow_read` 没有旧表 UNION，切读后上下文与公开 API 看不到双写起点前的历史（查询台有旧表段，两侧口径不同）。
+3. **自己发言的形状依赖账本**：60 秒宽限内没认领到轮次的回显段只写物理行（`turn_id` 为空），这一轮在配对读里会退回"计划全文"。
+4. **`pair_id` 只存在于旧表**：合并存储恒为 `None`，依赖它的旧式配对在切读后失效（新轮次一律用 `turn_id`）。
+5. **旧表退役不在本版范围**：单写新表是后续版本的事。
+
+---
+
+## 13. 外部只读读者契约（external reader）
+
+给**不 import 本插件、不注册 AstrBot**、只用 `mode=ro` 打开数据库的独立进程（例如画像守护进程）。它们消费的是**表契约**，下面是当前版本（`schema_version = 6`）承诺能用的部分。
+
+### 13.1 读哪些表
+
+```sql
+-- 物理消息：一条平台消息一行（多实例看到同一条也只一行）
+SELECT msg_uid, seq, platform_name, message_type, session_id,
+       sender_id, sender_nickname, platform_timestamp, content, content_kind,
+       relation_data, platform_seq, recalled_at, deleted_at, created_at
+  FROM chat_memory_messages
+ WHERE deleted_at IS NULL                       -- 软删除过滤（必须）
+ ORDER BY seq;
+
+-- 每实例视角：谁看到的、属于哪一轮、什么状态
+SELECT msg_uid, platform_id, self_id, conversation_id, umo, role,
+       platform_message_id, turn_id, llm_status, send_status,
+       persona_id, target_id, raw_timestamp
+  FROM chat_memory_message_bots
+ WHERE COALESCE(turn_id, '') <> '';
+```
+
+`role` 表示"属于谁的轮次侧"：`user`＝入站观察（含别人做的动作、系统事件），`assistant`＝本实例发出的回复。
+
+另有一张**按需**才读的辅助表（不是每条消息都有行）：
+
+```sql
+-- 本轮计划内容：一轮一行（发送前抓到的正文），不是消息
+SELECT umo, turn_id, conversation_id, content, content_kind,
+       llm_status, send_status, persona_id, created_at
+  FROM chat_memory_reply_messages WHERE deleted_at IS NULL;
+```
+
+「哪条消息属于哪一轮」不用单独的表：就是 `chat_memory_message_bots` 里
+`role = 'assistant'` 那一行的 `turn_id`（一条消息只有一个发送方，天然唯一）。
+用户消息反过来——被 N 个 BOT 看到就是 N 个轮次，所以 `turn_id` 只能是**每实例**的列。
+
+### 13.2 `content` 是模板，读之前必须渲染
+
+`content` 存的是**模板**，占位符指向 `relation_data`：
+
+| 占位符 | 含义 | 渲染来源 |
+|---|---|---|
+| `⟦CM_AT:n⟧` | @某人 | `relation_data.mentions[n].nickname`（`all:true` 时是全体） |
+| `⟦CM_IMAGE:n⟧` / `VIDEO` / `VOICE` / `FILE` / `EMOJI` / `FORWARD` | 媒体占位 | `relation_data.media[n]`（`kind` / `name` / `id`） |
+| `⦑…⦒` | 用户自己打的尖括号（转义对） | 原样还原成 `⟦…⟧` |
+
+实测分布（32,765 条中约 5,000 条带 token）：`⟦CM_AT:` 4,925、`⟦CM_IMAGE:` 112、`⟦CM_EMOJI:` 110。
+
+**不渲染的后果**：模型会看到 `⟦CM_AT:0⟧` 这种内部标记，既不认识 At 对象，还会学着模仿。渲染逻辑在 `relation_codec.render_content_template()`，纯函数、无依赖，可以照抄实现；遇到**不认识的 token 建议计数告警**而不是静默吞掉。
+
+### 13.3 消息表里没有「收/发」之分
+
+`chat_memory_messages` 只记录**平台上真实存在的消息**，一条一行。谁发的看
+`sender_id`，是不是本实例发出的看参与行的 `role`（`assistant`）——不需要一个
+`origin` 列来区分（历史上有过，恒为 `inbound`，已删除）。
+
+**发送前的计划全文不入消息表**：它没有平台事实，落在 `chat_memory_reply_messages`
+（一轮一行，主键 `(umo, turn_id)`），只在"这一轮实际发送的分段缺失"时作为兜底显示。
+
+### 13.4 `seq` 的语义（结构线 3 起）
+
+- **会话内递增**：`(platform_name, message_type, session_id)` 各自一条序列，不是全局；
+- **只增不减**：由 `chat_memory_session_seq` 表分配。会话被删空（`/reset`、保留期清理、孤儿回收）后**不会回到 1**，游标 `WHERE seq > :cursor` 永远向前；
+- **允许空洞**：删除、并发重复观察都会留下空号，不能假设连续；
+- **什么时候会重置**：只有影子层按"不认识的 schema_version"整体丢弃重建时，计数器才归零（`shadow_meta.shadow_migrate` 会记 `rebuild:unknown_version`；认识的旧版本走迁移，不丢数据）；
+- **不要用 `rowid` 代替**：`chat_memory_messages` 是普通 rowid 表且没有 `AUTOINCREMENT`，删掉最后一行后 rowid 会被复用。
+
+游标建议（会话维度）：
+
+```sql
+SELECT seq, msg_uid, content FROM chat_memory_messages
+ WHERE platform_name = ? AND message_type = ? AND session_id = ?
+   AND seq > ? AND deleted_at IS NULL
+ ORDER BY seq LIMIT 500;
+```
+
+### 13.5 计划兜底行（合成记录）
+
+一轮如果**没有**实际发到平台（被禁言/拒收/结果被清空），读路径会用 `chat_memory_reply_messages`
+里这一轮的计划行兜底，合成一条记录：它的 `msg_uid` 是 `l:plan`、`record_id` 恒为 `0`。
+外部消费者若要按 `record_id` 建索引，请把 `0` 当作"合成行"跳过——真实消息的 `record_id` 永远大于 0。
+
+### 13.5.1 群名快照表 `chat_memory_group_names`（结构线 5 起）
+
+```sql
+CREATE TABLE chat_memory_group_names (
+    platform_name TEXT NOT NULL,      -- 平台类型名（如 aiocqhttp），与 messages 同键
+    session_id    TEXT NOT NULL,      -- 群号
+    group_name    TEXT NOT NULL DEFAULT '',
+    updated_at    DATETIME NOT NULL,
+    PRIMARY KEY (platform_name, session_id)
 )
 ```
 
-## 上下文接管
+**语义（读之前先确认这一点）**：
 
-让 ChatMemory 成为唯一上下文源：每轮 LLM 请求时用 CM 数据覆盖 `req.contexts`，并清空 native `conversation.history` 防累积。
+- 这是**群名的当前快照**，不是消息事实。一个群一行，值是最近一次从平台读到的群名。
+- 消息表里**不存群名**。要用就按
+  `messages.platform_name = group_names.platform_name AND messages.session_id = group_names.session_id` 关联；历史消息也能拿到名字（表按群存，不按消息存）。
+- **不保存改名历史**：群改名会覆盖该行并更新 `updated_at`。要"当时的群名"请自己按时间增量采。
+- **可能为空**：插件还没连上平台、或从未读取过群列表时，这张表没有对应行。缺行是正常状态，
+  不是数据损坏——此时只能显示群号。
+- 值由插件在读取群列表时刷新（加载后首次查询台请求、或平台的群列表有变化），不是每条消息都写。
 
-默认采用**严格接管**：即使 CM 查询无数据或过滤后为空，也会显式把 `req.contexts` 替换为 CM 数据（空结果时仅保留原生工具段，见下），不会静默回退到 native history。若确实需要兼容回退，可开启 `fallback_to_native_on_empty`。
+### 13.6 幂等键
 
-**工具调用上下文保留**：LLM 的每次工具调用（`on_llm_tool_respond`）都会写入 CM 独立工具表；接管构建 contexts 时把最近 `keep_tool_turns`（默认 2，0 = 不回放）个轮次的工具记录回放成 OpenAI 格式（`assistant(tool_calls)` + `role=tool`）、**插入对应轮次内部**（该轮 user 之后、最终回复之前，与 AstrBot 原生历史顺序一致；轮次不在当前上下文中的段直接丢弃），让 LLM 跨轮继续看到上一轮的工具调用与工具返回（如"任务已创建，不要再次调用"），避免上下文缺口导致重复调用工具、重复扣费。工具段固定查当前会话，不参与 cross_session/full_group/persona 过滤；参数与返回文本跟随 `max_content_length` 截断（参数超限时替换为合法 JSON 占位）。接管关闭或 `fallback_to_native_on_empty` 开启时原生历史原样保留，AstrBot 自带工具记录不受影响。同轮工具循环内的多次 LLM 调用使用内存消息流，本轮工具结果天然可见。
+`msg_uid` 是稳定主键（平台键 `p:<platform>:<type>:<session>:<seq>`；无平台 id 的消息/事件用本地键 `l:<指纹>[:n]`）。跨实例去重请用 `msg_uid`，不要用 `(content, 时间)`。
 
-CM 的 contexts 接管在 `priority=-100` 执行；当前轮焦点锚另在晚阶段 `priority=-1000` 追加，尽量位于其他记忆/上下文注入之后。AstrBot 仍按 priority 从大到小执行，第三方插件若注册更低值仍可继续修改请求。CM 新增的焦点 part 使用 `mark_as_temp()`，不写入 native history。
+### 13.7 版本与兼容
 
-### 接管范围
+| 字段 | 说明 |
+|---|---|
+| `PRAGMA user_version` | 旧表 schema（当前 8） |
+| `chat_memory_shadow_meta.schema_version` | 合并存储结构线（当前 6） |
+| `chat_memory_shadow_meta.dual_write_started_at` | 双写起点（切读窗口用它算） |
 
-`cross_session` 与 `full_group` 是两个独立 checkbox：
+外部读者应把 `schema_version` 存进自己的状态里：**值变化就当"结构可能变了"，重新校验列清单**；数值回退或变成不认识的值，说明有人在跑旧构建，此时表可能已被重建。
 
-| `cross_session` | `full_group` | 数据范围 | 适用场景 |
-|---|---|---|---|
-| F | F | 当前 umo 当前 user | 默认，与 native 等价但走 CM 数据源 |
-| T | F | 跨 umo 当前 user | **群私聊互通**：同一用户在所有群 + 私聊的对话都进入上下文 |
-| F | T | 当前 umo 整群全员 | 群聊让 LLM 看到所有发言者 |
-| T | T | 当前 umo 整群 + 其他 umo 当前 user | 群私聊互通 + 整群 |
+**结构线 6 的对外影响（会打断直接消费这两个字段的读者）**
 
-> **full_group 仅群聊生效**：私聊自动降级为本用户。
-> **模型兼容性**：整群模式会保留群聊原始消息边界，因此 contexts 中可能出现连续的 `role=user`。部分模型或 Provider 不支持这种格式；如出现请求错误，请关闭 `full_group`。
-> **隐私**：full_group 开启后，群内其他人发言及昵称会注入 LLM。时间、发送者和身份前缀属于正确归因所需的协议字段，不提供关闭选项。
-> **跨会话来源**：无来源元数据表示当前会话；`<cm_source n="N"/>` 表示其他来源，同一编号只在本次请求内有效，`<cm_source n="?"/>` 表示来源字段不足。N 不编码群聊/私聊类型、人物、时间顺序或重要性。跨会话查询的其他来源 user 历史必定属于当前 `user_id`，不再重复添加“本人”标签，也不进行猜测或跨来源归并。
-> **跨会话黑名单（`cross_session_blacklist`）**：一行一个，两种写法——**`G:<群号>`**（群聊）、**`F:<用户号>`**（私聊，填对方用户号）。**双向生效**：名单内的会话① 不作为来源出现在别的会话的记忆里（跨会话查询在 SQL 层按 `(message_type, session_id)` 排除），② 自己也读不到任何其他会话（即便 `cross_session=true` 也强制只读本会话）。群与私聊**按类型区分**——拉黑一个群不会连带同号的私聊；名单内会话**自己的同会话记忆完全不受影响**，存档与查询台手动检索也不受影响（黑名单只作用于上下文/记忆注入）。命中的会话首次使用时打一条 INFO；写错的条目在插件加载时告警并忽略（不会被静默当成通配）。
-> **scope 实现**：storage 层 `_scope_filter(umo, user_id, cross_umo, full_group, blacklist)` 按 4 种组合构造 WHERE — F/F=`umo+user_id`、T/F=`platform_id+user_id`、F/T=`umo`、T/T=前两者 OR。跨 umo 时 EXISTS 子查的 `a.umo = chat_memory_records.umo` 保证 user/assistant 在同一 umo 内配对。空 `user_id` 不允许进入跨 UMO scope：仅 `full_group` 可降级到当前 UMO，公开 API 会进一步固定当前 CID。
+- `query_history_v2` / `query_rounds_v2` 的返回 dict **不再包含 `reply_group`**（该列已删；同轮多段请按 `turn_id` 自行归组）。用 `.get("reply_group")` 的读者不受影响，用 `row["reply_group"]` 的会 `KeyError`。
+- `chat_memory_messages` 不再有 `reply_group` 列；`chat_memory_reply_messages` 不再有 `instance_ts` 列、主键改为单列 `turn_id`（按会话取计划请用 `(umo, conversation_id)` 过滤，有索引）。
+- `chat_memory_tool_calls` 的幂等键改为 `(turn_id, call_index)`；只读消费者无感，写入方（如果有）不要再依赖 `(umo, cid, turn_id, call_index)` 的冲突语义。
+- 索引集合有增删（详见 `CHANGELOG` 的 2.0.0-beta 条目）。按索引名写死查询提示的读者要重新核对。
 
-### 状态过滤
+## 14. 版本
 
-选哪些状态的消息进入上下文，多选。各状态含义见 [双列状态体系](#双列状态体系)。
+变更记录见 [CHANGELOG.md](CHANGELOG.md)。插件版本与数据库结构版本相互独立：`user_version = 8`（旧表）、`shadow_meta.schema_version = 6`（合并存储）。
 
-| UI 选项 | DB 值 | 含义 |
-|---|---|---|
-| `llm_success` | `llm_success` | LLM 成功配对（默认） |
-| `llm_pending` | `llm_pending` | 触发 LLM 但失败（孤儿 user） |
-| `no_llm` | `""` | 非 LLM 路径（UI 占位符，DB 是空串） |
-| `proactive` | `proactive` | 主动消息（cron、插件主动） |
-| `orphan` | `orphan` | user 漏存但 assistant 来了 |
-
-开启 `proactive`/`orphan` 后，单边 assistant 会带 `<cm_solo active="1"/>`/`<cm_solo orphan="1"/>` 标记注入，让 LLM 知道这是 bot 单方面说的。
-
-混合状态模式会排除当前正在请求 LLM 的 `turn_id`，避免本轮 user 消息同时出现在历史 contexts 和当前 prompt 中。
-
-### 轮数 vs 消息数（limit_rounds 含义）
-
-`limit_rounds` 的语义随 `llm_status_filter` 选择动态变化：
-
-| `llm_status_filter` | limit_rounds 含义 | SQL 策略 |
-|---|---|---|
-| 仅 `llm_success` | **轮数**（user-assistant 一对为一轮） | 配对查询，按配对切 N 轮 |
-| 含其他状态（`proactive`/`no_llm`/...） | **消息数**（单条记录） | 全量查询，按条数切 N 条 |
-
-**例**：`limit_rounds=30`
-- 只选 `llm_success` → 30 轮配对（≈60 条记录）
-- 选了 `llm_success + proactive` → 30 条消息（可能是 14 user + 14 assistant + 2 proactive）
-
-**轮数精确**：内容白名单下沉到 SQL 层，被过滤的记录不占用 limit 名额。
-
-### 固定前缀与群聊身份
-
-每条消息独立成一条 context（拆分模式），所有消息统一带 `<cm_time>` 时间；`role=user` 额外带 `<cm_nickname>` 发送者标记，`role=assistant` 由角色字段表明是 assistant 自己的历史回复：
-
-```text
-<cm_time>MM/DD HH:MM:SS</cm_time> <cm_nickname>SenderName</cm_nickname> content
-```
-
-`full_group` 在群聊中生效时，仅当前用户的发言前带 `<cm_speaker current="1"/>` 标记，无标记的均属其他成员；每条消息保持独立边界、不做合并，允许连续 user（由通用规则提示"最后一条 user 才是当前请求"）。发送者或 Reply 目标昵称缺失时使用中性 `?` / `未知成员`，不回退为账号 ID。群聊身份标记：
-
-```text
-<cm_time>MM/DD HH:MM:SS</cm_time> <cm_speaker current="1"/> <cm_nickname>SenderName</cm_nickname> content
-<cm_time>MM/DD HH:MM:SS</cm_time> <cm_nickname>OtherSenderName</cm_nickname> content
-```
-
-已知当前 `user_id` 时，当前会话中只给当前用户添加 `<cm_speaker current="1"/>`，当前会话内未标记消息表示群内其他成员，减少重复 token；每段仍保留实际昵称。跨会话的 `<cm_source n="N"/>` 元数据只负责区分外部来源；带 `<cm_source>` 的 user 是当前用户在其他会话中的表现，即使昵称不同也视为当前用户本人。若公开 API 调用方未提供 `user_id`，则无法建立“当前”参照，继续给所有人使用中性的 `<cm_speaker/>`。ChatMemory 自身接管还会向 `system_prompt` 追加固定解释规则，明确 `<cm_speaker current="1"/>` 只是交互对象而非 assistant 应续写扮演的角色，`role=assistant` 才是 assistant 自己的历史回复；当前用户的新 `prompt` 仍由 AstrBot 在历史 contexts 之后追加。
-
-### 当前轮焦点与 Reply / At
-
-AstrBot 仍把本轮用户正文放在 `req.prompt`，CM 不把它搬进历史 `contexts`。1.2.0 会在本轮 user 的所有既有临时内容之后，追加一个最短的当前轮 XML 锚：
-
-- 普通消息、没有 Reply/At：`<cm_speaker current="1">昵称</cm_speaker>`
-- Reply/At：使用 `<cm_reply target="..."/>` / `<cm_mention target="..."/>`，正文中的 At 保持原始位置
-- Reply/At 指向 Bot self ID：只写 `target="assistant"`；其他成员只写昵称，不向 LLM 暴露账号 ID
-- AstrBot 已生成的 `<Quoted Message>` 继续负责引用原文；CM 不重复快照全文
-- contexts 均为历史，最后一条 user 才是当前请求（由通用规则提示，无尾部标记）
-
-例如，用户 Reply Bot 的一段话，并在正文中间再次 At Bot 时，最终请求的关键部分会类似：
-
-```json
-{
-  "prompt": "你看，这句话说得对吗？",
-  "contexts": [
-    {
-      "role": "user",
-      "content": "<cm_time>07/29 20:00:00</cm_time> <cm_speaker current=\"1\"/> <cm_nickname>Alice</cm_nickname> 上一句较长的历史发言",
-      "_no_save": true
-    }
-  ],
-  "extra_user_content_parts": [
-    {
-      "type": "text",
-      "text": "<Quoted Message>\nAssistantDemo: 被引用的原文\n</Quoted Message>"
-    },
-    {
-      "type": "text",
-      "text": "<cm_current>\n<cm_speaker current=\"1\">当前用户</cm_speaker>\n<cm_reply target=\"assistant\"/>\n<message>你看，<cm_mention target=\"assistant\"/> 这句话说得对吗？</message>\n</cm_current>"
-    }
-  ]
-}
-```
-
-最后一个 part 在运行时已 `mark_as_temp()`；部分 dump 工具只调用 Pydantic `model_dump()`，不会显示其私有 `_no_save` 状态。旧版本曾被模型复制进 assistant 正文开头的 `[群N]` / `[私N]` / `[会N]` / `[未知]`，1.2.0 会在构建请求时仅从 assistant 历史开头做展示层清理，不改数据库，也不删除 user 原文中的同样文本。
-
-开启 `cross_session` 时，其他来源的 user 带中性 `<cm_source n="N"/>` 元数据，当前会话保持零额外来源 token。N 只用于本次请求内的来源等价判断，不携带“群/私/会”语义，也不表示优先级或回答焦点。查询范围已经保证其他来源的 user 属于当前 `user_id`，不再添加“本人”标签。成功配对模式中，assistant 的 role 已明确，直接继承紧邻 user 的来源；主动/孤立 assistant 因没有可继承的 user 而保留来源元数据。混合状态模式可能拆开配对，因此外部来源 assistant 也会显式携带元数据。单边 assistant 使用 `<cm_time>MM/DD HH:MM:SS</cm_time> <cm_solo active="1"/>` / `<cm_solo orphan="1"/>` 标记。
-
-例如，`ProviderRequest.contexts` 的成功配对模式实际是 OpenAI 兼容的 JSON：
-
-```json
-[
-  {
-    "role": "user",
-    "content": "<cm_time>07/23 19:00:00</cm_time> <cm_speaker current=\"1\"/> <cm_nickname>Alice</cm_nickname> 当前群消息",
-    "_no_save": true
-  },
-  {
-    "role": "assistant",
-    "content": "<cm_time>07/23 19:00:05</cm_time> 当前群回答",
-    "_no_save": true
-  },
-  {
-    "role": "user",
-    "content": "<cm_time>07/23 20:00:00</cm_time> <cm_source n=\"1\"/> <cm_nickname>Alice</cm_nickname> 另一个来源的历史消息",
-    "_no_save": true
-  },
-  {
-    "role": "assistant",
-    "content": "<cm_time>07/23 20:00:05</cm_time> 另一个来源中的历史回复",
-    "_no_save": true
-  },
-  {
-    "role": "user",
-    "content": "<cm_time>07/23 21:00:00</cm_time> <cm_source n=\"2\"/> <cm_nickname>Alice</cm_nickname> 第二个外部来源的历史消息",
-    "_no_save": true
-  },
-  {
-    "role": "assistant",
-    "content": "<cm_time>07/23 21:00:05</cm_time> 第二个外部来源中的历史回复",
-    "_no_save": true
-  }
-]
-```
-
-这里不是给 assistant 文本再加一层 `<cm_source n="1"/>`：`role="assistant"` 已经表示这是 Bot
-回复，且在成功配对模式中它紧跟带来源元数据的 user，来源由相邻轮次继承。只有混合
-状态导致 assistant 可能与对应 user 分离时，assistant 才会显式带来源，例如：
-
-```json
-{
-  "role": "assistant",
-  "content": "<cm_source n=\"1\"/> 外部来源中的未配对/混合状态回复",
-  "_no_save": true
-}
-```
-
-来源编号只在单次请求内分配，不持久化，也不受群昵称变化影响。没有实际其他来源时不会注入跨会话说明，避免无效 token。
-
-### 配置项
-
-| 字段 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `enable` | bool | false | 总开关 |
-| `cross_session` | bool | false | 跨 umo（群私聊互通） |
-| `cross_session_blacklist` | list | `[]` | **跨会话黑名单**：`G:<群号>` / `F:<用户号>`，名单内会话不参与跨会话记忆（双向，见下） |
-| `full_group` | bool | false | 整群消息（仅群聊） |
-| `limit_rounds` | int | 30 | 注入轮数或消息数；最小按 1 处理，不限制上限（含义随状态过滤变化，见上） |
-| `max_context_chars` | int | 0 | 规整后字符预算，超出从最旧完整 user 起点裁剪；0=关闭 |
-| `llm_status_filter` | chip | `["llm_success"]` | 状态多选 |
-| `include_content_kinds` | chip | `["text"]` | 内容白名单，取值与存储 `content_kind` 一一对应（清空=不过滤） |
-| `event_kinds` | chip | 全部 | 事件子类过滤（仅白名单含 `event` 时生效；清空=全部放行） |
-| `include_all_match` | bool | false | ALL 模式开关（默认 ANY） |
-| `recall_skip_context` | bool | false | 撤回消息跳过上下文：开启后被撤回的原消息与撤回事件都不进上下文 |
-| `clear_native_history` | bool | true | 每轮清空 native history |
-| `fallback_to_native_on_empty` | bool | false | CM 空结果时是否保留 AstrBot 原生 contexts；默认 false=严格接管 |
-| `filter_by_persona` | bool | false | 按 persona 隔离 takeover 查询 |
-| `keep_tool_turns` | int | 2 | 接管时回放最近 N 轮的工具调用记录；0 = 不回放 |
-
-### 内容白名单（include_content_kinds）
-
-**只影响 takeover**，capture 照常入库。
-
-`include_content_kinds` 是白名单：选中=需要进入上下文的 kind，取值与存储的 `content_kind` 一一对应（`text` / `image` / `video` / `voice` / `emoji` / `file` / `forward` / `event`）。空集合 = 不过滤（全部进入）。配合 `include_all_match` 切换 ANY / ALL 两种语义：
-
-| `include_all_match` | 语义 | 保留条件 | 例子（白名单 `["text"]`） |
-|---|---|---|---|
-| false（默认） | ANY | content_kind 与白名单**任一交集** | `["text"]` ✓ / `["text","image"]` ✓ / `["image"]` ✗ / `[]` ✗ |
-| true | ALL | content_kind **全部**属于白名单（且非空） | `["text"]` ✓ / `["text","image"]` ✗ / `["image"]` ✗ / `[]` ✗ |
-
-**典型场景**：
-- **默认 ANY + `["text"]`**：含文本即进（纯文 ✓ / 文+图 ✓ / 纯图 ✗ / poke 通知 ✗）
-- **ALL + `["text","image"]`**：精确限定为这两种 kind
-- **清空**：不过滤，全量进入
-
-**事件子类（event_kinds）**：`event` 的细分类别（`relation_data.event.type`）不在 `content_kind` 里，用独立键控制：`ban` / `member` / `title` / `recall` / `resource` / `poke` / `reaction` / `system`，默认全选；清空 = 不按子类过滤。白名单放行 `event` 时生效（白名单为空=不过滤时同样生效）。
-
-**媒体展示**：白名单放行后，纯媒体消息在上下文中以 cm 媒体标签出现（`<cm_image/>` / `<cm_video/>` / `<cm_voice/>` / `<cm_file/>` / `<cm_forward/>`，标签名即媒体类型，`<cm_file>` 附带文件名（如 `<cm_file name="报告.pdf"/>`），无法识别时用 `<cm_unknown/>`；QQ 表情带中文名渲染为 `<cm_emoji>名称</cm_emoji>`，如「问号脸」；戳一戳并入事件协议为 `<cm_event type="poke">戳一戳</cm_event>`，表情回应为 `<cm_event type="reaction">阿明 用 问号脸 回应了 小虎 的消息</cm_event>`），混合消息在文本末尾补缺失的标签（如 `指挥官，你看这张图 <cm_image/>`）；上下文是纯文本，媒体组件本身不进上下文。媒体标签归入 cm_ 注入协议：通用规则禁止输出任何 cm_ 标签，LLM 若模仿输出会在发送/落库前被整元素清洗掉。
-
-### persona 隔离（filter_by_persona）
-
-**只影响 takeover 查询**，capture 照常全量入库（每条记录带 `persona_id` 列）。
-
-`filter_by_persona` 开启后，takeover 查询严格按当前 persona 过滤——切换 persona 时旧 persona 时期的对话自动隔离，切回后自然回归。`persona_id` 为空时过滤 `IS NULL OR ''`（匹配老库旧行），并打 warn 日志提醒。
-
-**与 cross_session 的协同**：
-
-| `filter_by_persona` | `cross_session` | 切 persona + /new + 切回旧行为 |
-|---|---|---|
-| F | F | 现行行为，看到所有数据 |
-| T | F | persona 隔离，但 /new 后切不回旧 persona 数据（cid 卡死） |
-| F | T | 跨 cid 聚合，persona 不卡 |
-| **T** | **T** | **persona 严格过滤 + 跨 cid 聚合**——完整隔离体验 |
-
-**设计说明**：
-- cid **不会自动**随 persona 切换——同一 cid 下可能累积多个 persona 的数据，按 `persona_id` 列区分
-- 1.4.0 之前的旧库不再自动补列（启动直接报错）；`persona_id` 为空时按 `IS NULL OR ''` 处理旧行
-- 入库时 `persona_id` 取自 `_get_effective_persona`（走 `persona_manager.resolve_selected_persona`，与 LLM 实际生效 persona 同源）
-
-## 存档语义
-
-CM 存档的是 **LLM 实际产出的内容**：`capture_bot` 在 `on_decorating_result` 装饰链**最先**执行（priority=10000），捕获最接近 LLM 原始输出的回复。用户最终看到的展示形式（分段、引用组件、At、表情装饰等由后续装饰链追加）允许与存档存在差异——存档的服务对象是 LLM 上下文与查询，不是发送快照。装饰链若改写回复的**语义内容**（而非包装形式），属于装饰插件的越界行为，CM 不负责修正。
-
-## 已知限制
-
-- **首条消息是非 LLM 命令时漏存**：cid 尚未创建，且无 LLM 钩子兜底
-- **信任核心 `/reset` / `/new` 标志**：仅在 AstrBot 核心设置 `_clean_group_context_session` 后，CM 才从当前事件文本中查找 `reset` 或 `new` 以区分操作；不兼容 `/reset@bot`、全角斜杠等花式写法，也不再根据 Bot 回复文本猜测。若可信标志存在却无法识别命令，CM 打出带原文的 WARNING 并放弃本次会话操作（宁可不动，避免把 `/new` 误判成 `/reset`）。
-- **日志分层与内容边界**：INFO 只记事件与统计（可带完整 id，**不带聊天正文/原始事件负载/命令原文**）；正文类诊断放 DEBUG，异常形态放 WARNING。DEBUG 与 WARNING 按排障需要**不做截断**：所有 id（umo / conversation_id / message_id / turn_id / media_id / at_id / reply_id / forward_id）在日志里一律输出**完整值**；DEBUG 与 WARNING 行的正文、原始 JSON、命令原文同样不再截断（例如未知 notice 的 `raw=…` 是完整原始事件 JSON，可能含账号，仅本地诊断用）。
-- **`/reset` 之后仍有少量记录**：`/reset` 只删「删除那一刻已经落库」的记录。平台重连后补发的旧系统通知、或删除瞬间正在写入的事件会在删除之后才落库，因此看起来像"没删掉"。插件在删除后立刻回查同一 (umo, cid)：日志里出现 `残留自检：… 已无可见记录`（DEBUG）说明删除本身是完整的；出现 `残留自检：… 仍残留 N 条（按内容类型：…）`（WARNING）才是真的交错残留。需要清理时用查询台的删除模式按条软删除。
-- **`/reset` 只清当前 CID**：与 AstrBot 语义一致（`/reset` 清空当前会话历史，`/new` 才换会话）。开着 `cross_session` 时检索会跨 CID（同 umo 全部历史会话）并带上同 `platform_id` + 同 `user_id` 的其他 UMO（群私聊互通），因此 `/reset` 之后**旧 CID 的记录仍会进入上下文**——需要清干净时用查询台的删除模式逐条软删除，或改用 `/new` 后重新评估检索范围。
-- **Dashboard 清空/删除会话不同步**：该入口走核心 `delete_conversations_by_user_id`，不设 `_clean_group_context_session`，CM 不做清理（需要时可在查询台按 CID 逐条软删除）。
-
-## 依赖
-
-由 AstrBot 宿主环境提供：`sqlalchemy[asyncio]>=2.0.41`、`aiosqlite>=0.21.0`
-
-版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+结构线变迁（6）：工具表幂等键从 `(umo, cid, turn_id, call_index)` 收窄到 `(turn_id, call_index)`；计划表主键从 `(umo, turn_id)` 收窄到 `turn_id`；删掉只写不读的 `messages.reply_group` 与 `reply_messages.instance_ts`；删掉三条不会被命中的索引；计划表/工具表/元信息表补 `CHECK`。升级走 `SHADOW_MIGRATIONS`（累积应用），数据一行不丢，`messages` 的 `rowid` 保持不变（查询台的 `record_id` 契约）。

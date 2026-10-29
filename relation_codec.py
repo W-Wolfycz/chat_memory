@@ -39,6 +39,21 @@ MEDIA_KIND_LABELS = {
 MAX_REPLY_SNAPSHOT_CHARS = 300
 
 
+def strip_relation_tokens(text: str) -> str:
+    """把残留的 ``⟦CM_AT:n⟧`` / ``⟦CM_*:n⟧`` token 换成占位标签。
+
+    计划行（``chat_memory_reply_messages``）没有 ``relation_data``，渲染时无法按
+    media/mentions 下标还原位置 token；不清理的话裸 token 会直接进 LLM 上下文
+    （模型会照着⟦CM_AT:0⟧格式模仿输出）。有 relation 的行走这里也是安全的：
+    位置 token 早已被 ``render_content_template`` 替换掉，只剩用户正文。
+    """
+    value = str(text or "")
+    if not value:
+        return value
+    value = AT_TOKEN_RE.sub('<cm_mention target="未知成员"/>', value)
+    return MEDIA_TOKEN_RE.sub("<cm_unknown/>", value)
+
+
 def escape_plain_text(text: str) -> str:
     """把用户文本里的每个 ``⟦``/``⟧`` 换成哨兵字符，杜绝伪造内部 At / 媒体 token。
 
@@ -224,7 +239,8 @@ def _media_label_of(item: Any) -> str:
             )
         return '<cm_event type="poke">戳一戳</cm_event>'
     if kind == "emoji":
-        name = face_name(str(item.get("id") or ""))
+        face_id = item.get("id")
+        name = face_name("" if face_id is None else str(face_id).strip())
         if name:
             return f'<cm_emoji>{xml_escape(name, quote=True)}</cm_emoji>'
     if kind == "file":
@@ -241,7 +257,9 @@ def render_content_template(template: str, relation_data: Any) -> str:
     """
     data = parse_relation_data(relation_data)
     if not data:
-        return template or ""
+        # 无关系数据时正文里没有真 token（有的话也在 strip_relation_tokens 里处理），
+        # 但写入时做过的 ⟦⟧→哨兵 转义必须在这里还原，否则 `⟦` 会以 `⦑` 形态落进上下文。
+        return unescape_plain_text(template or "")
     mentions = data.get("mentions", [])
     media = data.get("media", [])
     value = template or ""
