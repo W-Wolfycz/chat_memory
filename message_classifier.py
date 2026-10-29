@@ -132,7 +132,7 @@ def _media_source_ref(comp, kind: str) -> Optional[dict]:
 
 def extract_user_template(
     event: AstrMessageEvent,
-) -> tuple[str, list[dict], list, Optional[dict]]:
+) -> tuple[str, list[dict], list, Optional[dict], list]:
     """按 MessageChain 顺序构建正文模板、media 条目（含元信息/归档 id）、
     媒体来源引用和 Reply 快照种子。"""
     try:
@@ -481,6 +481,15 @@ def _system_event_parts(
             # 戳一戳走消息路径（适配器把带 target_id 的 poke 转成 Poke 组件），
             # 不作为系统事件归档；无 target_id 的实现差异也一律不归档。
             return None
+        if sub == "input_status":
+            # "对方正在输入…"（NapCat 的 notify/input_status）：**瞬时状态**，不是对话
+            # 内容，而且对方每敲一次就发一条。以前落到兜底分支记成「[系统通知]」，
+            # 私聊里会把这个会话刷满（用户实测"私聊全是系统通知"就是它）。
+            return None
+        if sub == "gray_tip":
+            # 群灰条（NapCat 上报的未分类灰条，内容是 JSON）：语义接近群名/头衔/撤回
+            # 那些专门 notice，所以只记一行"灰色提示"，正文不进库也不进上下文。
+            return ("[灰色提示]", "灰色提示", "", uid, "", "system")
         label = _NOTIFY_SUB_LABELS.get(sub)
         if label:
             return (f"[{label}]", label, "", uid, "", "title")

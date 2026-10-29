@@ -110,6 +110,7 @@ class WebApiTestCase(unittest.TestCase):
             {route[0] for route in context.routes},
             {
                 "/chat_memory/about",
+                "/chat_memory/snapshot",
                 "/chat_memory/settings",
                 "/chat_memory/health",
                 "/chat_memory/overview",
@@ -119,6 +120,8 @@ class WebApiTestCase(unittest.TestCase):
                 "/chat_memory/soft-delete",
                 "/chat_memory/restore",
                 "/chat_memory/tools",
+                "/chat_memory/group-names",
+                "/chat_memory/personas",
                 "/chat_memory/media/<media_id>",
                 "/chat_memory/export",
                 "/chat_memory/export/<file_name>",
@@ -137,6 +140,7 @@ class WebApiTestCase(unittest.TestCase):
                 "/chat_memory/query",
                 "/chat_memory/restore",
                 "/chat_memory/settings",
+                "/chat_memory/snapshot",
                 "/chat_memory/soft-delete",
                 "/chat_memory/tools",
             ],
@@ -162,22 +166,21 @@ class WebApiTestCase(unittest.TestCase):
         self.assertEqual(response["data"]["tool_payload"]["tool_name"], "draw")
         self.assertEqual(response["data"]["tool_payload"]["page"], 2)
 
-        # 小节：facets 与 record 转发 query 参数
+        # 小节：facets 与 record 转发 query 参数（键名与 POST /query 一致）
         module = load_module(
             args={
-                "umo": "bot:FriendMessage:u1",
-                "conversation_id": "cid-a",
-                "role": "assistant",
-                "llm_status": "llm_success",
+                "chat_type": "group",
+                "session_id": "g1",
+                "sender": "10001",
                 "content_kind": "text",
+                "deleted_state": "visible",
                 "id": "9",
             },
         )
         controller = module.ChatMemoryUiWebApi(Context(), Repository())
         facets = asyncio.run(controller.facets())
-        self.assertEqual(facets["data"]["filters"]["conversation_id"], "cid-a")
-        self.assertEqual(facets["data"]["filters"]["role"], "assistant")
-        self.assertEqual(facets["data"]["filters"]["llm_status"], "llm_success")
+        self.assertEqual(facets["data"]["filters"]["session_id"], "g1")
+        self.assertEqual(facets["data"]["filters"]["sender"], "10001")
         self.assertEqual(facets["data"]["filters"]["content_kind"], "text")
         record = asyncio.run(controller.record_detail())
         self.assertEqual(record["data"]["record"]["record_id"], 9)

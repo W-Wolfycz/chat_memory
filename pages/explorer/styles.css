@@ -198,9 +198,13 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .record-card { position: relative; overflow: hidden; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 13px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow-soft); transition: border-color .15s ease, transform .15s ease; }
 .record-card:hover { border-color: color-mix(in srgb, var(--accent) 32%, var(--line)); transform: translateY(-1px); }
 .record-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); }
-.record-card.assistant::before { background: var(--teal); }
-.role-avatar { width: 39px; height: 39px; display: grid; place-items: center; border-radius: 11px; color: var(--accent); background: var(--accent-soft); font-weight: 760; font-size: 12px; }
-.assistant .role-avatar { color: var(--teal); background: var(--teal-soft); }
+.speaker-avatar { width: 39px; height: 39px; display: grid; place-items: center; border-radius: 11px; overflow: hidden; background: var(--accent-soft); color: var(--accent); font-weight: 760; font-size: 15px; }
+.speaker-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 工具卡里的调用者头像：比消息卡小一号，跟 chip 同高 */
+.speaker-avatar.small { width: 20px; height: 20px; border-radius: 6px; }
+.speaker-avatar.small .avatar-initial { font-size: 10px; }
+
+.avatar-initial { display: grid; place-items: center; width: 100%; height: 100%; }
 .record-main { min-width: 0; }
 .record-header { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 .record-sender { max-width: 100%; font-weight: 710; overflow-wrap: anywhere; }
@@ -213,6 +217,19 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .badge.kind { color: var(--teal); background: var(--teal-soft); }
 .badge.sub { color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line-strong); }
 .badge.recalled { color: #fff; background: var(--amber); font-weight: 720; }
+/* 高级只读模式：轮次/状态 chip 需要区分"已配对"与"单边" */
+.badge.ok { color: var(--teal); background: var(--teal-soft); font-weight: 700; }
+.badge.warn { color: #b4472f; background: rgba(180, 71, 47, .12); font-weight: 700; }
+/* 高级模式区分 user / assistant：assistant 走 .kind 的青色，user 走强调色 */
+/* 高级只读模式：按 llm_status 取值区分颜色 */
+.badge.status-success { color: var(--teal); background: var(--teal-soft); font-weight: 700; }
+.badge.status-proactive { color: var(--amber); background: var(--amber-soft); font-weight: 700; }
+.badge.status-pending { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
+.badge.status-orphan { color: var(--danger); background: var(--danger-soft); font-weight: 700; }
+.badge.status-none { color: var(--text-3); background: var(--surface-3); }
+.badge.send-attempted { color: var(--text-2); background: var(--surface-2); border: 1px dashed var(--line-strong); }
+.badge.send-prepared { color: var(--text-3); background: var(--surface-2); border: 1px dashed var(--line); }
+.badge.role-user { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
 /* 软删除（schema v8）：删除模式下每条记录带 times（软删除）/ backup（恢复）图标 */
 .record-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
 .record-detail-button { align-self: start; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--accent); background: var(--surface-2); font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: border-color .15s ease, background .15s ease; }
@@ -320,6 +337,11 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 /* 工具调用卡片 */
 .tool-card { padding: 16px 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-soft); }
 .tool-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+/* 工具卡：这一轮里的第几步（同一轮的多次调用共用同一轮次） */
+.badge.step { color: var(--accent); background: var(--accent-soft); font-weight: 720; }
+.badge.tool-bot { color: var(--text-2); background: var(--surface-2); border: 1px solid var(--line-strong); }
+.badge.tool-persona { color: var(--amber); background: var(--amber-soft); }
+
 .badge.tool-name { color: var(--amber); background: var(--amber-soft); font-weight: 720; }
 .tool-card-time { color: var(--text-3); font-size: 11px; font-family: var(--mono); }
 /* 工具卡片：turn_id / umo / cid 与记录列表一样用 chip（badge）展示，完整不截断 */
