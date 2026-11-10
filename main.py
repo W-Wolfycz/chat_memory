@@ -117,6 +117,11 @@ class ChatMemoryPlugin(Star):
         ct_conf = config.get("context_takeover", {}) or {}
         self.ct_enable = bool(ct_conf.get("enable", False))
         self.ct_cross_session = bool(ct_conf.get("cross_session", False))
+        # 仅私聊跨会话：群聊里不做任何跨会话拉取（把用户在其他群说过的话带进群里，
+        # 常被嫌"串味"）。与跨会话黑名单叠加，黑名单仍然优先。
+        self.ct_cross_session_private_only = bool(
+            ct_conf.get("cross_session_private_only", False)
+        )
         self.ct_full_group = bool(ct_conf.get("full_group", False))
         # 跨会话黑名单（双向生效）：名单内的会话不参与跨会话记忆——既不作为来源出现在
         # 别人的记忆里，自己也读不到任何其他会话；它们自己的同会话记忆不受影响。
@@ -218,7 +223,11 @@ class ChatMemoryPlugin(Star):
         if self.ct_enable:
             modes = []
             if self.ct_cross_session:
-                modes.append("cross_session")
+                modes.append(
+                    "cross_session(仅私聊)"
+                    if self.ct_cross_session_private_only
+                    else "cross_session"
+                )
             if self.ct_full_group:
                 modes.append("full_group")
             mode_repr = "+".join(modes) if modes else "standard"
@@ -1383,8 +1392,9 @@ class ChatMemoryPlugin(Star):
 
         logger.debug(
             f"{self._log_prefix(event)} 接管 contexts={len(contexts)} "
-            f"(cross_session={self.ct_cross_session}, full_group={self.ct_full_group}, "
-            f"cid={cid})"
+            f"(cross_session={self.ct_cross_session}, "
+            f"private_only={self.ct_cross_session_private_only}, "
+            f"full_group={self.ct_full_group}, cid={cid})"
         )
 
     @filter.on_llm_request(priority=-1000)
@@ -1537,6 +1547,7 @@ class ChatMemoryPlugin(Star):
             umo,
             self._blacklist_entries(),
             force_current_session=force_current_session,
+            private_only=self.ct_cross_session_private_only,
         )
         if session_blacklisted(umo, self._blacklist_entries()):
             self._note_blacklisted_session(umo)
@@ -2176,6 +2187,7 @@ class ChatMemoryPlugin(Star):
                 umo,
                 self._blacklist_entries(),
                 force_current_session=not bool(user_id),
+                private_only=self.ct_cross_session_private_only,
             ),
             paired_rounds=not mixed_mode,
             target_map=target_map,

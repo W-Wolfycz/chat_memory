@@ -139,43 +139,43 @@ sys.modules["chat_memory"] = pkg
 
 models_mod = types.ModuleType("chat_memory.models")
 sys.modules["chat_memory.models"] = models_mod
-exec(compile((PLUGIN_DIR / "models.py").read_text(), "models.py", "exec"),
+exec(compile((PLUGIN_DIR / "models.py").read_text(encoding="utf-8"), "models.py", "exec"),
      models_mod.__dict__)
 setattr(pkg, "models", models_mod)
 
 qq_face_mod = types.ModuleType("chat_memory.qq_face")
 sys.modules["chat_memory.qq_face"] = qq_face_mod
-exec(compile((PLUGIN_DIR / "qq_face.py").read_text(), "qq_face.py", "exec"),
+exec(compile((PLUGIN_DIR / "qq_face.py").read_text(encoding="utf-8"), "qq_face.py", "exec"),
      qq_face_mod.__dict__)
 setattr(pkg, "qq_face", qq_face_mod)
 
 relation_codec_mod = types.ModuleType("chat_memory.relation_codec")
 sys.modules["chat_memory.relation_codec"] = relation_codec_mod
-exec(compile((PLUGIN_DIR / "relation_codec.py").read_text(), "relation_codec.py", "exec"),
+exec(compile((PLUGIN_DIR / "relation_codec.py").read_text(encoding="utf-8"), "relation_codec.py", "exec"),
      relation_codec_mod.__dict__)
 setattr(pkg, "relation_codec", relation_codec_mod)
 
 media_archive_mod = types.ModuleType("chat_memory.media_archive")
 sys.modules["chat_memory.media_archive"] = media_archive_mod
-exec(compile((PLUGIN_DIR / "media_archive.py").read_text(), "media_archive.py", "exec"),
+exec(compile((PLUGIN_DIR / "media_archive.py").read_text(encoding="utf-8"), "media_archive.py", "exec"),
      media_archive_mod.__dict__)
 setattr(pkg, "media_archive", media_archive_mod)
 
 classifier_mod = types.ModuleType("chat_memory.message_classifier")
 sys.modules["chat_memory.message_classifier"] = classifier_mod
-exec(compile((PLUGIN_DIR / "message_classifier.py").read_text(),
+exec(compile((PLUGIN_DIR / "message_classifier.py").read_text(encoding="utf-8"),
              "message_classifier.py", "exec"), classifier_mod.__dict__)
 setattr(pkg, "message_classifier", classifier_mod)
 
 context_builder_mod = types.ModuleType("chat_memory.context_builder")
 sys.modules["chat_memory.context_builder"] = context_builder_mod
-exec(compile((PLUGIN_DIR / "context_builder.py").read_text(),
+exec(compile((PLUGIN_DIR / "context_builder.py").read_text(encoding="utf-8"),
              "context_builder.py", "exec"), context_builder_mod.__dict__)
 setattr(pkg, "context_builder", context_builder_mod)
 
 storage_mod = types.ModuleType("chat_memory.storage")
 sys.modules["chat_memory.storage"] = storage_mod
-exec(compile((PLUGIN_DIR / "storage.py").read_text(), "storage.py", "exec"),
+exec(compile((PLUGIN_DIR / "storage.py").read_text(encoding="utf-8"), "storage.py", "exec"),
      storage_mod.__dict__)
 setattr(pkg, "storage", storage_mod)
 
@@ -190,16 +190,16 @@ sys.modules["chat_memory.ui"] = ui_pkg
 setattr(pkg, "ui", ui_pkg)
 ui_repository_mod = types.ModuleType("chat_memory.ui.repository")
 sys.modules["chat_memory.ui.repository"] = ui_repository_mod
-exec(compile((PLUGIN_DIR / "ui" / "repository.py").read_text(), "ui/repository.py", "exec"),
+exec(compile((PLUGIN_DIR / "ui" / "repository.py").read_text(encoding="utf-8"), "ui/repository.py", "exec"),
      ui_repository_mod.__dict__)
 setattr(ui_pkg, "repository", ui_repository_mod)
 ui_web_api_mod = types.ModuleType("chat_memory.ui.web_api")
 sys.modules["chat_memory.ui.web_api"] = ui_web_api_mod
-exec(compile((PLUGIN_DIR / "ui" / "web_api.py").read_text(), "ui/web_api.py", "exec"),
+exec(compile((PLUGIN_DIR / "ui" / "web_api.py").read_text(encoding="utf-8"), "ui/web_api.py", "exec"),
      ui_web_api_mod.__dict__)
 setattr(ui_pkg, "web_api", ui_web_api_mod)
 
-_main_src = (PLUGIN_DIR / "main.py").read_text()
+_main_src = (PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
 _mod_ns = {"__name__": "chat_memory.main"}
 exec(compile(ast.parse(_main_src), "main.py", "exec"), _mod_ns)
 _ChatMemoryPlugin = _mod_ns["ChatMemoryPlugin"]
@@ -216,6 +216,7 @@ def _make_plugin():
     p = _PluginStub()
     p.ct_enable = True
     p.ct_cross_session = False
+    p.ct_cross_session_private_only = False
     p.ct_full_group = False
     p.ct_limit_rounds = 5
     p.ct_max_context_chars = 0

@@ -1649,14 +1649,21 @@ def effective_cross_session(
     entries,
     *,
     force_current_session: bool = False,
+    private_only: bool = False,
 ) -> bool:
     """当前会话**实际**是否跨会话读取：黑名单内的会话强制只读本会话。
 
     ``force_current_session``（公开 API 在缺少 user_id 时的降级）优先于配置；
+    ``private_only``：只在私聊里跨会话——群聊即便开了跨会话也只读当前群，
+    不把该用户在其他群/私聊说过的话带进群聊上下文。
     黑名单只做减法——它永远不会把没开跨会话的会话变成跨会话。
     """
     if not cross_session or force_current_session:
         return False
+    if private_only:
+        kind = session_key(umo)
+        if kind is None or kind[0] != "friend":
+            return False
     return not session_blacklisted(umo, entries)
 
 

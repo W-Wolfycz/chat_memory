@@ -34,6 +34,15 @@
         "default": false,
         "hint": "同一用户在其他群聊和私聊中的记录也进入当前上下文。与整群消息同时开启时，其他会话仍只取当前用户。"
       },
+      "cross_session_private_only": {
+        "description": "仅私聊跨会话",
+        "type": "bool",
+        "default": false,
+        "condition": {
+          "cross_session": true
+        },
+        "hint": "只在私聊里拉取该用户在其他群/私聊的记录；群聊中完全不跨会话（等价于只读当前群，不把别处说过的话带进群里）。与跨会话黑名单叠加，黑名单仍然优先。"
+      },
       "cross_session_blacklist": {
         "description": "跨会话黑名单",
         "type": "list",
