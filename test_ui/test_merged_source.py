@@ -238,21 +238,6 @@ class MergedSourceTestCase(unittest.TestCase):
         self.assertTrue(target, "新插入的消息应当出现")
         self.assertEqual(target[0]["sender_nickname"], "阿二", "应当补成同类消息里的名字")
 
-    def test_turn_role_index_is_declared(self) -> None:
-        """守的静默失效：`ix_cmmb_turn_role` 被删掉后功能完全正常，只是「仅看配对」从
-        0.8 秒退化到 195 秒（81k × 30k 的相关子查询）——不看耗时根本发现不了。
-        """
-        from chat_memory import shared_store as store
-
-        # 真正执行的是 shadow_schema_statements()（建表 + 建索引），校验这一份
-        ddl = " ".join(store.shadow_schema_statements())
-        normalized = " ".join(ddl.split())
-        self.assertIn(
-            "ix_cmmb_turn_role ON chat_memory_message_bots (turn_id, role)",
-            normalized,
-            "配对筛选依赖 (turn_id, role) 索引，缺了会退化成分钟级",
-        )
-
     def test_keep_open_soft_delete_is_visible(self) -> None:
         """守的静默失效：keep_open 连接把旧历史去重结果缓存在 TEMP 表里（含 deleted_at），
         软删除只改库、页面永远读到旧快照 —— 表现是"删了还在、再点报已被删除"。

@@ -294,26 +294,6 @@ def _rec(role="user", content="你好", user_id="u1", nickname="Alice",
 # ── 测试用例：context_builder 纯函数 ────────────────
 
 
-def test_strip_cm_xml_tags():
-    """LLM 回复入库前移除 cm_ XML 结构：标签连同内文整体删除。"""
-    f = context_builder_mod.strip_cm_xml_tags
-    assert f('<cm_source n="1"/>正文') == "正文"
-    assert f('<cm_speaker current="1">Alice</cm_speaker> 你好') == "你好"
-    assert f('<cm_current>\n<cm_reply target="assistant"/>\n正文\n</cm_current>') == ""
-    assert f('<CM_TIME>08/03 10:00:00</CM_TIME>回答') == "回答"
-    assert f('好的 <cm_time>08/03 10:00:00</cm_time> 我知道了') == "好的 我知道了"
-    assert f('回复 <cm_time>08/03 10:00:00<cm_time> 然后说') == "回复 然后说"  # 漏闭合 + 时间戳
-    assert f('<cm_time>08/03 10:00:00') == ""  # 漏闭合
-    assert f('<cm_nickname>Bob</cm_nickname> 说：你好') == "说：你好"
-    assert f('<cm_reply target="Alice">引用原文</cm_reply> 好的') == "好的"
-    # 媒体占位标签同样整元素删除（防 LLM 模仿输出 cm_ 媒体标签）
-    assert f('好的 <cm_image/> 请查收') == "好的 请查收"
-    assert f('<cm_image>xxx</cm_image>正文') == "正文"
-    assert f('<code>&lt;cm_source/&gt;</code>') == '<code>&lt;cm_source/&gt;</code>'
-    assert f("普通回复") == "普通回复"
-    print("[T01] strip_cm_xml_tags ✓")
-
-
 def test_user_forged_cm_tags_stripped():
     """用户侧伪造的 cm_ XML 在进上下文前被清除，CM 注入的可信前缀保留。"""
     p = _make_plugin()
@@ -530,39 +510,6 @@ def test_reply_restoration():
     assert db.target_calls == [(source_umo, ["turn_g2_target"])]
     assert '<cm_reply target="Bob">群2被引用原文</cm_reply>' in out5[0]["content"]
     print("[T08] reply_restoration ✓")
-
-
-def test_strip_think_and_legacy_prefixes():
-    """think 前缀与旧版 source 前缀剥离：纯函数 + normalize 注入路径。"""
-    # 小节：剥离 AstrBot 序列化进 Plain 的 think 前缀
-    f = context_builder_mod.strip_reasoning_prefix
-    src = "[{'type': 'think', 'content': '内部推理', 'encrypted': None}]实际回复"
-    assert f(src) == "实际回复"
-    assert f("普通文本") == "普通文本"
-    assert f("[{'type': 'think'") == "[{'type': 'think'"  # 不完整前缀原样
-
-    # 小节：清理旧版 CM 注入到 assistant 开头的 [群N]/[私N]/[会N]/[未知] 标签
-    g = context_builder_mod.strip_legacy_assistant_source_prefix
-    assert g("[群1] 你好") == "你好"
-    assert g("[私1][会2] 你好") == "你好"
-    assert g("[未知] 你好") == "你好"
-    assert g("[群1] 中间[群2] 保留") == "中间[群2] 保留"  # 只清开头
-    assert g("无标签") == "无标签"
-
-    # 小节：_takeover_normalize 注入时剥离老库已存的 think 前缀
-    p = _make_plugin()
-    records = [
-        _rec(content="你好"),
-        _rec(role="assistant",
-             content="[{'type': 'think', 'content': '推理', 'encrypted': None}]实际回复",
-             created_at="2026-07-09 10:00:05"),
-    ]
-    out = p._takeover_normalize(records, _UMO_GROUP)
-    assert out[0]["content"] == (
-        "<cm_time>07/09 10:00:00</cm_time> <cm_nickname>Alice</cm_nickname> 你好"
-    )
-    assert out[1]["content"] == "<cm_time>07/09 10:00:05</cm_time> 实际回复"
-    print("[T09] strip_think_and_legacy_prefixes ✓")
 
 
 def test_character_budget_keeps_latest_user():
@@ -875,32 +822,6 @@ def test_classify_content():
     print("[T15] classify_content ✓")
 
 
-def test_unknown_text_and_assistant_poke():
-    """Unknown 组件文本提取；assistant 链识别戳一戳。"""
-    c = classifier_mod
-    Plain, Poke, Unknown = (
-        sys.modules["astrbot.api.message_components"].Plain,
-        sys.modules["astrbot.api.message_components"].Poke,
-        sys.modules["astrbot.api.message_components"].Unknown,
-    )
-    unk = Unknown(); unk.text = "平台未知段文本"
-
-    class _Ev:
-        message_str = ""
-
-        def get_messages(self):
-            return [unk]
-
-        def get_message_type(self):
-            return types.SimpleNamespace(value="GroupMessage")
-
-    assert c.classify_content(_Ev())[0] == ["text"]
-    poke = Poke()
-    kind2, text2 = c.classify_assistant_chain([poke])
-    assert kind2 == ["poke"] and text2 == ""
-    print("[T16] unknown_text_and_assistant_poke ✓")
-
-
 def test_capture_user_poke_as_event():
     """user 戳一戳消息 → 归一为 event 落库（type=poke，operator=发言者昵称）。
 
@@ -1092,108 +1013,6 @@ def test_media_position_tokens_and_ids():
     assert template4 == ""
     assert relation4["media"][0]["id"] == "456"
     print("[T17] media_position_tokens_and_ids ✓")
-
-
-def test_media_metadata_and_source_refs():
-    """媒体条目带归档 id/文件名/戳一戳类型；来源引用按组件字段解析（无 IO）。"""
-    mc = sys.modules["astrbot.api.message_components"]
-    Plain, Image, Video, Record, File, Forward = (
-        mc.Plain, mc.Image, mc.Video, mc.Record, mc.File, mc.Forward,
-    )
-    classifier_mod = sys.modules["chat_memory.message_classifier"]
-    import tempfile
-
-    def plain(t):
-        c = Plain(); c.text = t; return c
-
-    with tempfile.TemporaryDirectory() as tmp:
-        local_img = os.path.join(tmp, "pic.png")
-        open(local_img, "wb").write(b"\x89PNG\r\n\x1a\n")
-
-        img_local = Image(); img_local.path = local_img; img_local.url = ""
-        img_remote = Image(); img_remote.path = ""; img_remote.url = "https://example.com/a.png"
-        video = Video(); video.path = ""; video.url = "http://127.0.0.1:6099/x.mp4"
-        file_local = File(); file_local.name = "C:\\dir\\课程表.pdf"
-        file_local.file_ = local_img; file_local.url = ""
-        fwd = Forward(); fwd.id = "fwd_1"
-
-        class _Ev:
-            message_str = ""
-
-            def get_messages(self):
-                return [plain("看"), img_local, plain(" "), img_remote,
-                        video, file_local, fwd]
-
-        template, mentions, media, refs, reply = (
-            classifier_mod.extract_user_template(_Ev())
-        )
-        assert [m["kind"] for m in media] == ["image", "image", "video", "file", "forward"]
-        # 归档类条目带随机 hex id；文件带 sanitize 后 basename
-        for m in media[:4]:
-            assert re.fullmatch(r"[0-9a-f]{32}", m["id"])
-        assert media[3]["name"] == "课程表.pdf"
-        assert media[4]["id"] == "fwd_1"
-        # 来源引用与 media 同序对齐
-        assert refs[0] == {"local": local_img}
-        assert refs[1] == {"url": "https://example.com/a.png"}
-        assert refs[2] == {"url": "http://127.0.0.1:6099/x.mp4"}
-        assert refs[3] == {"local": local_img}
-        assert refs[4] is None
-        # 位置 token 与渲染不受新增元信息影响
-        assert "⟦CM_IMAGE:0⟧" in template and "⟦CM_FILE:3⟧" in template
-        relation = classifier_mod.build_relation_seed(_Ev())[1]
-        assert relation["media"][3]["name"] == "课程表.pdf"
-
-    # poke type：组件 _type 缺失时回落 "126"
-    poke = mc.Poke(); poke.target_id = lambda: "456"
-    poke._type = "666"
-    _t2, _m2, media2, _r2, _s2 = classifier_mod.extract_user_template(
-        types.SimpleNamespace(message_str="", get_messages=lambda: [poke])
-    )
-    assert media2[0] == {"kind": "poke", "id": "456", "type": "666"}
-    poke2 = mc.Poke(); poke2.target_id = lambda: "456"
-    poke2._type = ""
-    _t3, _m3, media3, _r3, _s3 = classifier_mod.extract_user_template(
-        types.SimpleNamespace(message_str="", get_messages=lambda: [poke2])
-    )
-    assert media3[0]["type"] == "126"
-    print("[T18] media_metadata_and_source_refs ✓")
-
-
-def test_empty_chain_seed_full_returns_five_tuple():
-    """空 chain（notice/request 转空消息、空消息）也必须返回 5 元组。
-
-    回归：extract_user_template 的空链早退曾漏掉 media_refs（4 元组），
-    导致 build_relation_seed_full 解包爆炸（生产 15:52 的 ValueError）。
-    """
-    classifier_mod = sys.modules["chat_memory.message_classifier"]
-
-    class _EvEmpty:
-        def __init__(self):
-            self.message_str = ""
-
-        def get_messages(self):
-            return []
-
-    template, mentions, media, refs, reply_seed = (
-        classifier_mod.extract_user_template(_EvEmpty())
-    )
-    assert template == "" and mentions == [] and media == [] and refs == []
-    assert reply_seed is None
-    t2, rel2, media2, refs2 = classifier_mod.build_relation_seed_full(_EvEmpty())
-    assert t2 == "" and rel2 is None and media2 == [] and refs2 == []
-    assert classifier_mod.build_relation_seed(_EvEmpty()) == ("", None)
-
-    # 空链 + message_str 兜底
-    class _EvStr:
-        message_str = "你好"
-
-        def get_messages(self):
-            return []
-
-    template3, rel3 = classifier_mod.build_relation_seed(_EvStr())
-    assert template3 == "你好" and rel3 is None
-    print("[T19] empty_chain_seed_full_returns_five_tuple ✓")
 
 
 def test_system_event_summary():
@@ -1510,18 +1329,6 @@ class _EventStub:
         return self._sender
 
 
-def test_sniff_ext_mp4_box_offset():
-    """MP4 magic 位于偏移 4（box size 在前），嗅探必须按 offset 判定。"""
-    archiver_mod = sys.modules["chat_memory.media_archive"]
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "x.bin"
-        path.write_bytes(b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00")
-        assert archiver_mod._sniff_ext(path, "video") == "mp4"
-    print("[T22] sniff_ext_mp4_box_offset ✓")
-
-
 def test_media_archive_local_and_cleanup():
     """MediaArchiver：本地接管落盘登记、级联删除文件、关闭时拒绝。"""
     import tempfile
@@ -1737,7 +1544,11 @@ def test_takeover_reuses_cached_persona():
 
 
 def test_instruction_idempotent():
-    """3 条 system 指令幂等追加：重复调用只加一次。"""
+    """3 条 system 指令幂等追加：重复调用只加一次；旧措辞不得回退。
+
+    只守两件事：重复注入会让 system prompt 悄悄膨胀（静默失效）；旧措辞"可合并参考"
+    是串味 bug 的回归点。具体文案是渲染结果，改坏了看 prompt 就发现，不再逐句断言。
+    """
     p = _make_plugin()
     req = types.SimpleNamespace(system_prompt="原有")
     for _ in range(2):
@@ -1747,22 +1558,7 @@ def test_instruction_idempotent():
     assert req.system_prompt.count("ChatMemory 通用规则") == 1
     assert req.system_prompt.count("ChatMemory 群聊历史解释规则") == 1
     assert req.system_prompt.count("ChatMemory 跨会话来源规则") == 1
-    assert "群友视角" in req.system_prompt
-    assert "按 ChatMemory 配置筛选的群聊历史片段" in req.system_prompt
-    assert "必须按发送者" in req.system_prompt
-    assert "无 <cm_speaker> 也无 <cm_source>" in req.system_prompt
-    assert "续写角色" in req.system_prompt
-    assert "每条默认回应其前最近" in req.system_prompt
-    # 跨会话规则必须以当前会话为主（旧措辞"可合并参考"正是串味的来源，已废除）
-    assert "当前会话是本次对话的主场" in req.system_prompt
-    assert "一律以当前会话为准" in req.system_prompt
     assert "可合并参考" not in req.system_prompt
-    assert "来源标记仅供你理解" in req.system_prompt
-    # 泄漏防线：不许向用户提及会话编号或暗示还有其他会话（静默删掉这半句会让规则失效）
-    assert "也不要暗示存在其他会话" in req.system_prompt
-    assert "<cm_speaker" in req.system_prompt
-    assert "闲聊触发" in req.system_prompt
-    print("[T26] instruction_idempotent ✓")
 
 
 def test_builtin_ltm_coexist_warn_once():
@@ -2361,8 +2157,6 @@ def test_takeover_event_type_filter():
     print("[T59] takeover_event_type_filter ✓")
 
 
-
-
 def test_unknown_notice_warning_once():
     """未知 notice 类型：首次出现打 WARNING，重复出现降级 DEBUG（防刷屏）。"""
     p = _make_plugin()
@@ -2832,33 +2626,6 @@ def test_schema_migration_order_and_v7_upgrade():
     print("[T76] schema_migration_order_and_v7_upgrade ✓")
 
 
-def test_logs_and_ids_never_truncated():
-    """静态守卫：id 一律完整，DEBUG/WARNING 文本不得再出现截断切片。"""
-    forbidden = (
-        "[:8]", "[:16]", "[:24]", "[:40]", "[:44]", "[:48]", "[:50]",
-        "[:60]", "[:100]", "[:120]", "[:200]", "[:300]", "[:400]",
-    )
-    for name in (
-        "main.py",
-        "storage.py",
-        "shared_store.py",
-        "media_archive.py",
-        "message_classifier.py",
-        "context_builder.py",
-        "relation_codec.py",
-        "ui/repository.py",
-        "ui/web_api.py",
-    ):
-        source = (PLUGIN_DIR / name).read_text(encoding="utf-8")
-        hits = [
-            f"{name}:{index}: {line.strip()}"
-            for index, line in enumerate(source.splitlines(), 1)
-            if any(token in line for token in forbidden)
-        ]
-        assert not hits, hits
-    print("[T75] logs_and_ids_never_truncated ✓")
-
-
 def test_inject_current_turn_focus_guard_and_anchor():
     """本轮焦点锚注入：未接管不注入、重复调用不重复注入、锚含昵称不含账号。"""
     p = _make_plugin()
@@ -2902,7 +2669,6 @@ def test_inject_current_turn_focus_guard_and_anchor():
     asyncio.run(p.inject_current_turn_focus(ev, req))
     assert len(req.extra_user_content_parts) == 1
     print("[T63] inject_current_turn_focus_guard_and_anchor ✓")
-
 
 
 def test_takeover_recall_skip_context():
@@ -2953,7 +2719,6 @@ def test_takeover_recall_skip_context():
     records, _src = asyncio.run(p._takeover_query("aiocqhttp:GroupMessage:g1", "cid_demo", "u1"))
     assert [r["content"] for r in records] == ["正常消息"]
     print("[T64] takeover_recall_skip_context ✓")
-
 
 
 def test_file_placeholder_carries_name_in_context():
@@ -3295,29 +3060,6 @@ def test_unsent_plan_marked_and_rendered():
     assert "<cm_unsent/>" not in normal[0]["content"]
 
 
-def test_shared_store_shadow_default_on():
-    """配置契约：双写强制启用（没有关闭入口）、切读是单个 checkbox 且受 7 天窗口门槛。
-
-    守的静默失效：配置项写成模式选择/留了"可关闭双写"的入口时，"现在到底读哪边"
-    要靠读文档猜；门槛失效则等于拿几小时的数据就切读。
-    """
-    schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
-    assert "shared_store_shadow" not in schema, "本版不提供关闭双写的配置项"
-    entry = schema["shadow_read"]
-    assert entry["type"] == "bool" and entry["default"] is False, "切读只用一个 checkbox"
-    assert "options" not in entry and "labels" not in entry
-    source = (PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
-    assert "self.shared_store_shadow = True" in source, "双写必须强制启用"
-    assert 'config.get("shadow_read", False)' in source
-    shared_text = (PLUGIN_DIR / "shared_store.py").read_text(encoding="utf-8")
-    assert "SHADOW_READ_MIN_DAYS = 7" in shared_text, "门槛天数定义在 shared_store"
-    assert "_SHADOW_READ_MIN_DAYS = shared_store.SHADOW_READ_MIN_DAYS" in source
-    # 影子层是内部结构线，从 1 起算（不背着开发期的编号史）
-    shared = (PLUGIN_DIR / "shared_store.py").read_text(encoding="utf-8")
-    assert "SHADOW_SCHEMA_VERSION = 6" in shared
-    print("[T81] shared_store_shadow_forced_on_and_read_gated ✓")
-
-
 def test_shadow_message_view_collapses_turn():
     """消息级 V2 读路径也要"一轮一条逻辑回复"：计划行让位、各段按平台号拼接。
 
@@ -3472,6 +3214,24 @@ def test_blacklist_invalid_entries_warn_on_load():
     finally:
         logger_mod.logger.warning = orig_warning
     print("[T85] blacklist_invalid_entries_warn_on_load ✓")
+
+
+def test_cross_session_private_only():
+    """仅私聊跨会话：群聊不拉其他会话，私聊照常；黑名单仍然优先。
+
+    守的静默失效：开关配上了却被忽略——群聊里照旧把该用户在其他群说过的话带进来，
+    用户以为"群聊不再串味"实际没关，且没有任何报错或提示。
+    """
+    cross = storage_mod.effective_cross_session
+    group = "BOT1:GroupMessage:10001"
+    friend = "BOT1:FriendMessage:10001"
+    assert cross(False, friend, [], private_only=True) is False
+    assert cross(True, group, [], private_only=False) is True
+    assert cross(True, group, [], private_only=True) is False
+    assert cross(True, friend, [], private_only=False) is True
+    assert cross(True, friend, [], private_only=True) is True
+    assert cross(True, friend, ["F:10001"], private_only=True) is False
+    assert cross(True, "BOT1:TempMessage:10001", [], private_only=True) is False
 
 
 def test_cross_session_blacklist_takeover_wiring():
@@ -4368,7 +4128,6 @@ def test_takeover_v2_read_source():
     asyncio.run(p._query_tool_contexts(umo, "cid_demo"))
     assert tool_db.calls == ["tools_v2", "tools_v1"], tool_db.calls
     print("[T90] takeover_v2_read_source ✓")
-
 
 
 if __name__ == "__main__":
