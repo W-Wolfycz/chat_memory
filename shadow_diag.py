@@ -70,6 +70,41 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# 本轮草稿行的 upsert：content 逐段**追加**（tool loop 一轮多段时拼起来），
+# 其余字段只补空。抽成模块常量是为了让单测能用原生 sqlite3 直接跑这同一段 SQL
+# （测试里没有 sqlalchemy 引擎），避免测试另抄一份 SQL 与实现脱钩。
+# 判重按**段落边界**做：两边都补换行后 `instr`，避免"新段是现有正文的子串"被误判成
+# 重复（现有「好的呀」+ 新段「好」→ 直接 instr 会命中，白丢一段）。
+PLAN_UPSERT_SQL = (
+    "INSERT INTO chat_memory_reply_messages "
+    "(turn_id, umo, conversation_id, persona_id, created_at, "
+    " content, content_kind, llm_status, send_status) "
+    "VALUES (:turn_id, :umo, :cid, :persona_id, :now, "
+    " :content, :content_kind, :llm_status, :send_status) "
+    "ON CONFLICT (turn_id) DO UPDATE SET "
+    "  content = CASE "
+    "    WHEN chat_memory_reply_messages.content = '' THEN excluded.content "
+    "    WHEN COALESCE(excluded.content, '') = '' "
+    "      THEN chat_memory_reply_messages.content "
+    "    WHEN instr(char(10) || chat_memory_reply_messages.content || char(10), "
+    "               char(10) || excluded.content || char(10)) > 0 "
+    "      THEN chat_memory_reply_messages.content "
+    "    ELSE chat_memory_reply_messages.content || char(10) || excluded.content END, "
+    "  content_kind = CASE WHEN chat_memory_reply_messages.content_kind IN ('', '[]') "
+    "                 THEN excluded.content_kind "
+    "                 ELSE chat_memory_reply_messages.content_kind END, "
+    "  persona_id = CASE WHEN chat_memory_reply_messages.persona_id = '' "
+    "                 THEN excluded.persona_id "
+    "                 ELSE chat_memory_reply_messages.persona_id END, "
+    "  llm_status = CASE WHEN chat_memory_reply_messages.llm_status = '' "
+    "                 THEN excluded.llm_status "
+    "                 ELSE chat_memory_reply_messages.llm_status END, "
+    "  send_status = CASE WHEN excluded.send_status = '' "
+    "                 THEN chat_memory_reply_messages.send_status "
+    "                 ELSE excluded.send_status END"
+)
+
+
 async def note_reply_plan(
     session: AsyncSession,
     *,
@@ -80,11 +115,19 @@ async def note_reply_plan(
     send_status: str = "",
     persona_id: str = "",
 ) -> None:
-    """写"这一轮的计划内容"（发送前抓到的正文 + 轮次状态），一轮一行。
+    """写"这一轮草稿"（装饰阶段抓到的正文 + 轮次状态），一轮一行。
 
-    只补空字段：同一轮先到的计划正文赢，后到的只填空白项。
+    **不是"计划"而是"草稿"**：`on_decorating_result` 在 tool loop 里会触发多次
+    （工具调用前一段、调用后一段），每次都是这一轮真实产出的一部分。所以同轮再来一段时
+    **追加**到既有正文后面（换行分隔），而不是像以前那样"先到者赢"——否则没有回显时，
+    用来兜底的那份正文只有首段，上下文里看着像"只说了半句"。
+
+    幂等：重复写入同一段（补捕获重试会这样）按**段落边界**判重后跳过，
+    不会重复拼接；也不会因为"新段是旧正文的子串"而白丢一段。
+
+    其余字段仍是"只补空"（首段可信度最高：persona/状态在第一段就定了）。
     主键是 ``turn_id``（全局唯一），不再带 ``umo``——所以不同会话不会混淆 id，
-    按会话取计划走 ``ix_cmrm_cid (umo, conversation_id)``。
+    按会话取草稿走 ``ix_cmrm_cid (umo, conversation_id)``。
     """
     turn_id = str(participation.get("turn_id") or "")
     umo = str(participation.get("umo") or "")
@@ -92,28 +135,7 @@ async def note_reply_plan(
     if not (turn_id and umo):
         return
     await session.execute(
-        text(
-            "INSERT INTO chat_memory_reply_messages "
-            "(turn_id, umo, conversation_id, persona_id, created_at, "
-            " content, content_kind, llm_status, send_status) "
-            "VALUES (:turn_id, :umo, :cid, :persona_id, :now, "
-            " :content, :content_kind, :llm_status, :send_status) "
-            "ON CONFLICT (turn_id) DO UPDATE SET "
-            "  content = CASE WHEN chat_memory_reply_messages.content = '' "
-            "                 THEN excluded.content ELSE chat_memory_reply_messages.content END, "
-            "  content_kind = CASE WHEN chat_memory_reply_messages.content_kind IN ('', '[]') "
-            "                 THEN excluded.content_kind "
-            "                 ELSE chat_memory_reply_messages.content_kind END, "
-            "  persona_id = CASE WHEN chat_memory_reply_messages.persona_id = '' "
-            "                 THEN excluded.persona_id "
-            "                 ELSE chat_memory_reply_messages.persona_id END, "
-            "  llm_status = CASE WHEN chat_memory_reply_messages.llm_status = '' "
-            "                 THEN excluded.llm_status "
-            "                 ELSE chat_memory_reply_messages.llm_status END, "
-            "  send_status = CASE WHEN excluded.send_status = '' "
-            "                 THEN chat_memory_reply_messages.send_status "
-            "                 ELSE excluded.send_status END"
-        ),
+        text(PLAN_UPSERT_SQL),
         {
             "turn_id": turn_id,
             "umo": umo,

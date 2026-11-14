@@ -3234,6 +3234,253 @@ def test_cross_session_private_only():
     assert cross(True, "BOT1:TempMessage:10001", [], private_only=True) is False
 
 
+def test_public_query_skip_recalled_forwarded():
+    """守的静默失效：公开查询加了 `skip_recalled` 却没透传到 SQL 层。
+
+    后果很隐蔽——被撤回的消息照常返回，进程内消费者（长期记忆等）会把它们当正常
+    发言抽进自己的库，事后无法与真实发言区分，且全程没有报错或日志。
+    四个入口（v1/v2 × 消息级/轮级）都要把参数传到 db。
+    """
+    calls = []
+
+    class _DB:
+        async def query_latest(self, *a, **k):
+            calls.append(("latest", k.get("skip_recalled")))
+            return []
+
+        async def query_rounds(self, *a, **k):
+            calls.append(("rounds", k.get("skip_recalled")))
+            return []
+
+        async def query_latest_v2(self, *a, **k):
+            calls.append(("latest_v2", k.get("skip_recalled")))
+            return []
+
+        async def query_rounds_v2(self, *a, **k):
+            calls.append(("rounds_v2", k.get("skip_recalled")))
+            return []
+
+    p = _make_plugin()
+    p.db = _DB()
+
+    # 切读未生效 → query_history / query_rounds 走旧表
+    p.shadow_read = False
+    p._shadow_read_ready = False
+    asyncio.run(p.query_history(_UMO_GROUP, "cid_demo", skip_recalled=True))
+    asyncio.run(p.query_rounds(_UMO_GROUP, "cid_demo", skip_recalled=True))
+
+    # 切读生效 → 两个跟随入口走合并存储；_v2 两个强制入口始终走合并存储
+    p.shadow_read = True
+    p._shadow_read_ready = True
+    asyncio.run(p.query_history(_UMO_GROUP, "cid_demo", skip_recalled=True))
+    asyncio.run(p.query_rounds(_UMO_GROUP, "cid_demo", skip_recalled=True))
+    asyncio.run(p.query_history_v2(_UMO_GROUP, "cid_demo", skip_recalled=True))
+    asyncio.run(p.query_rounds_v2(_UMO_GROUP, "cid_demo", skip_recalled=True))
+
+    assert {name for name, _ in calls} == {
+        "latest", "rounds", "latest_v2", "rounds_v2"
+    }, calls
+    assert all(flag is True for _, flag in calls), calls
+
+    # 第二段：db → shadow_read 这一跳没有可跑的桩（单测不带 sqlalchemy 引擎），
+    # 用 AST 断言透传还在——漏传同样是静默返回撤回内容，且只发生在两个包装函数里。
+    tree = ast.parse((PLUGIN_DIR / "storage.py").read_text(encoding="utf-8"))
+    forwarded = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if node.name not in ("query_latest_v2", "query_rounds_v2"):
+            continue
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in ("fetch_messages", "fetch_rounds")):
+                forwarded[node.name] = "skip_recalled" in {
+                    kw.arg for kw in call.keywords
+                }
+    assert forwarded == {"query_latest_v2": True, "query_rounds_v2": True}, forwarded
+
+    # 第三段：旧表两个入口也必须有这个参数——线上就是这么漏的：main 传了、db 没接，
+    # 直接 TypeError（有回退兜底时表现为"整条读路径失败"）。
+    missing = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "DBManager":
+            for fn in node.body:
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name not in (
+                    "query_latest", "query_rounds", "query_latest_v2", "query_rounds_v2"
+                ):
+                    continue
+                args = [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+                if "skip_recalled" not in args:
+                    missing.append(fn.name)
+    assert not missing, f"这些入口缺 skip_recalled 参数: {missing}"
+
+
+def test_known_content_tokens_match_regex():
+    """守的静默失效：新增媒体 token 时只改正则、没更新 `KNOWN_CONTENT_TOKENS`。
+
+    外部消费者用这个清单区分"CM 升级了格式"与"渲染有 bug"；漏一项会让它把正常残留
+    误报成未知格式（或反之）。三处（正则 / 元组 / 渲染分支）必须同源。
+    """
+    codec = sys.modules["chat_memory.relation_codec"]
+    tokens = tuple(codec.KNOWN_CONTENT_TOKENS)
+    assert tokens[0] == "⟦CM_AT:"
+    # 每个前缀都能被对应正则识别成渲染目标，反之正则覆盖的每种类型都在清单里
+    for prefix in tokens:
+        assert codec.count_unrendered_tokens(f"{prefix}0⟧") == {
+            prefix.rstrip(":"): 1
+        }, prefix
+    for kind in ("IMAGE", "VIDEO", "VOICE", "FILE", "EMOJI", "FORWARD", "POKE"):
+        assert f"⟦CM_{kind}:" in tokens, kind
+        assert codec.MEDIA_TOKEN_RE.search(f"⟦CM_{kind}:3⟧"), kind
+    assert codec.AT_TOKEN_RE.search("⟦CM_AT:2⟧")
+    # 不认识的 ⟦…⟧ 不算已知 token（留给调用方按差集判断"格式升级"）
+    assert codec.count_unrendered_tokens("⟦CM_NEWKIND:0⟧") == {}
+
+    # 消费方只能按实例访问（跨插件 import 子模块会 ModuleNotFoundError）：
+    # 插件类上的同名方法必须转发到同一实现，且是同步调用。
+    p = _make_plugin()
+    assert p.count_unrendered_tokens("⟦CM_IMAGE:0⟧和⟦CM_POKE:1⟧") == {
+        "⟦CM_IMAGE": 1, "⟦CM_POKE": 1
+    }
+    assert p.count_unrendered_tokens("干净正文") == {}
+
+
+def test_plan_row_appends_segments():
+    """守的静默失效：一轮多段（tool loop 工具调用前后各一段）时，草稿行"先到者赢"
+    只剩首段——回显缺失时上下文里那一轮看着像"只说了半句"，而且不报错。
+
+    草稿行是本轮各段按序拼接（换行分隔），重复投递同一段要跳过（补捕获重试会这样）。
+    直接用生产 SQL 常量跑原生 sqlite（单测没有 sqlalchemy 引擎）。
+    """
+    sd = sys.modules["chat_memory.shadow_diag"]
+    ss = sys.modules["chat_memory.shared_store"]
+    con = sqlite3.connect(":memory:")
+    try:
+        for statement in ss.shadow_schema_statements():
+            con.execute(statement)
+
+        def put(content, *, kind="[]", llm="", send="", persona=""):
+            con.execute(sd.PLAN_UPSERT_SQL, {
+                "turn_id": "turn_seg", "umo": "BOT1:GroupMessage:group_demo",
+                "cid": "cid_demo", "persona_id": persona,
+                "now": "2026-11-14 00:00:00", "content": content,
+                "content_kind": kind, "llm_status": llm, "send_status": send,
+            })
+            con.commit()
+            return con.execute(
+                "SELECT content, llm_status, persona_id "
+                "FROM chat_memory_reply_messages WHERE turn_id = 'turn_seg'"
+            ).fetchone()
+
+        assert put("第一段", kind='["text"]', llm="llm_success", persona="p1") == (
+            "第一段", "llm_success", "p1"
+        )
+        # 第二段追加，不是覆盖；首段的 llm_status/persona 不被后到者清空
+        assert put("第二段") == ("第一段\n第二段", "llm_success", "p1")
+        # 同一段重复投递（补捕获重试）不得重复拼接
+        assert put("第一段")[0] == "第一段\n第二段"
+        # 空内容不影响已拼好的正文
+        assert put("")[0] == "第一段\n第二段"
+        assert put("第三段")[0] == "第一段\n第二段\n第三段"
+        # 新段是旧正文的**子串**时必须照样追加（按段落边界判重，不是裸 instr）
+        assert put("第一段\n第二段\n第三段")[0] == "第一段\n第二段\n第三段"
+        assert put("第二段")[0] == "第一段\n第二段\n第三段"   # 整段重复→跳过
+    finally:
+        con.close()
+
+
+def test_plan_row_substring_is_not_deduped():
+    """守的静默失效：判重若用裸 `instr(现有, 新段)`，新段是旧正文子串时会被当成
+    "已经拼过"而丢弃——例如旧正文「好的呀」+ 新段「好」，第二段就静默消失。
+    必须按**段落边界**判重。
+    """
+    sd = sys.modules["chat_memory.shadow_diag"]
+    ss = sys.modules["chat_memory.shared_store"]
+    con = sqlite3.connect(":memory:")
+    try:
+        for statement in ss.shadow_schema_statements():
+            con.execute(statement)
+
+        def put(content):
+            con.execute(sd.PLAN_UPSERT_SQL, {
+                "turn_id": "turn_sub", "umo": "BOT1:GroupMessage:group_demo",
+                "cid": "cid_demo", "persona_id": "", "now": "2026-11-14 00:00:00",
+                "content": content, "content_kind": "[]", "llm_status": "",
+                "send_status": "",
+            })
+            con.commit()
+            return con.execute(
+                "SELECT content FROM chat_memory_reply_messages "
+                "WHERE turn_id = 'turn_sub'"
+            ).fetchone()[0]
+
+        assert put("好的呀") == "好的呀"
+        assert put("好") == "好的呀\n好", "子串不得被判成重复"
+    finally:
+        con.close()
+
+
+def test_insert_mirrors_when_legacy_conflicts():
+    """守的静默失效：旧表 `ux_cm_turn_role` 只允许一轮一条，同轮第二段（tool loop 里
+    工具调用前后的多段回复）落库时被 `INSERT OR IGNORE` 吞掉——旧行为连带跳过合并存储
+    镜像，于是主模型也丢段、user 行的 `llm_status` 提升一并丢失，只留一句 WARNING。
+    合并存储才是 2.0 的主模型，不能被旧表的限制连坐。
+    """
+    mirrored = []
+
+    class _Res:
+        rowcount = 0          # 模拟唯一键冲突：旧表一行没插进去
+
+    class _Sess:
+        async def execute(self, *a, **k):
+            return _Res()
+
+        async def commit(self):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    db = object.__new__(storage_mod.DBManager)
+    db.shadow_enabled = True
+    db._tz = None
+    db.shadow_stats = {"writes": 0, "skipped": 0, "failures": 0, "last_error": ""}
+    db.async_session = lambda: _Sess()
+
+    async def _noop_init():
+        return None
+
+    async def _record_mirror(operation):
+        mirrored.append(operation)
+        return True
+
+    db.init_db = _noop_init
+    db._shadow_write = _record_mirror
+
+    # 测试环境的 sqlalchemy 桩里 `text()` 不可用：这里只关心"是否调用镜像"，
+    # 让 SQL 构造退化成恒等函数即可（本用例不验证 SQL 内容）。
+    orig_text = storage_mod.text
+    storage_mod.text = lambda statement=None, *a, **k: statement
+    try:
+        ok = asyncio.run(db.insert(
+            "BOT1:GroupMessage:group_demo", "cid_demo", "10001", "assistant", "第二段",
+            llm_status="llm_success", content_kind=["text"], platform_id="BOT1",
+            platform_name="aiocqhttp", message_type="GroupMessage",
+            session_id="group_demo", self_id="20001", turn_id="turn_x",
+            send_status="prepared", update_user_llm_status="llm_success",
+        ))
+    finally:
+        storage_mod.text = orig_text
+    assert len(mirrored) == 1, "旧表冲突时仍必须镜像到合并存储（否则主模型丢段）"
+    assert ok is True, "合并存储写成功就该算这条已记录"
+
+
 def test_cross_session_blacklist_takeover_wiring():
     """黑名单接到 takeover 查询链上：当前会话在名单里 → 强制只读本会话。
 

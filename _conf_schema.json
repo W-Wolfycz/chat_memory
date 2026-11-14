@@ -166,7 +166,7 @@
         "description": "按 persona 隔离",
         "type": "bool",
         "default": false,
-        "hint": "只用当前 persona 的记录；空 persona 匹配未标记的旧记录。跨 /new 查询需同时开启「跨会话目标」。"
+        "hint": "只用当前 persona 的记录；空 persona 匹配未标记的旧记录。同一会话内切人格即自动隔离，不需要 /new 换会话；只有想让 /new 之后仍找回旧会话的记录时，才需要同时开启「跨会话目标」。"
       },
       "keep_tool_turns": {
         "description": "工具上下文保留轮数",

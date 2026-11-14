@@ -633,6 +633,25 @@ class DBManager:
             logger.debug(f"[ChatMemory] 群名读取失败: {type(exc).__name__}")
             return {}
 
+    async def shadow_meta(self) -> dict[str, str]:
+        """读合并存储的结构元信息（``chat_memory_shadow_meta`` 整表键值）。
+
+        供 ``get_shared_store_status`` 这类只读状态接口用：键只有几个、值都是短字符串，
+        一次查完比按需逐键查询省事。影子层关闭或读失败返回空字典（调用方给默认值）。
+        """
+        if not self.shadow_enabled:
+            return {}
+        try:
+            await self.init_db()
+            async with self.async_session() as session:
+                result = await session.execute(
+                    text("SELECT key, value FROM chat_memory_shadow_meta")
+                )
+                return {str(key): str(value) for key, value in result.all()}
+        except Exception as exc:  # noqa: BLE001 - 读不到就当没有
+            logger.debug(f"[ChatMemory] 结构元信息读取失败: {type(exc).__name__}")
+            return {}
+
     async def backfill_turn_persona(self) -> int:
         """补齐"同轮有 persona 但本行空着"的影子行（影子专用，尽力而为）。"""
         if not self.shadow_enabled:
@@ -718,10 +737,10 @@ class DBManager:
         （push＝NapCat 回显，主通道；pull＝发送后拉群历史，兜底），旧表已有发送路径写的
         assistant 行，重复写会让现有读路径看到两份。
 
-        返回值：普通路径返回**旧表是否真的插入了行**（``INSERT OR IGNORE`` 遇到唯一键
-        冲突时 rowcount=0，绝不能再当成成功——那会让上层把"这轮没写进去"记成写成功、
-        assistant 照旧升级 llm_status）；``shadow_only=True`` 时返回影子行是否真的落库
-        （``False`` = 数据不足被归一拒绝/影子层关闭/写异常）。
+        返回值：普通路径返回**这条记录是否进入了任一层存储**——旧表插入成功、或旧表
+        因唯一键冲突跳过但合并存储镜像成功，都算成功（``shadow_only=True`` 时只看影子层）。
+        只有"旧表冲突**且**合并存储没写进去"才返回 ``False``：那才是真的什么都没记下来，
+        上层必须当失败处理（别把"这轮没写进去"记成写成功、assistant 照旧升级 llm_status）。
 
         ``claim_turn=True`` 表示"这是本实例自己发出的一条"（push/pull 供货路径）：
         调拨层会把它记进逻辑表并并回本轮计划行的组；否则只写物理行与参与行。
@@ -834,18 +853,40 @@ class DBManager:
                 )
             return mirrored
 
-        # 只有真的插进旧表的行才镜像：没落库（唯一键冲突）的行进合并存储就是凭空造事实。
-        if inserted_rows:
-            await self._shadow_write(_mirror_record_and_status)
-        else:
-            # INSERT OR IGNORE 把唯一键冲突静默吞掉了（典型：同 (turn_id, role) 重复写入）。
-            # 必须让调用方看见：否则这轮 user 根本没落库，assistant 却会被标 llm_success。
-            # 只记 id/状态，不带正文。
-            logger.warning(
-                "[ChatMemory] 记录未落库（唯一键冲突被忽略）: role=%s turn=%s send_status=%s",
-                role, turn_id or "-", send_status or "-",
-            )
-        return bool(inserted_rows)
+        # 镜像**不以"旧表插入成功"为前提**：旧表的 ``ux_cm_turn_role`` 只允许一轮一条，
+        # 所以"同一轮的第二段"（tool loop 里工具调用前后的多段回复）、以及 LLM 触发时的
+        # 补捕获重试，都会落到 ``INSERT OR IGNORE`` 的冲突分支——这是**设计内**行为
+        # （2.0 的一轮多段模型由平台回显补齐分段），不该让旧表的限制连坐主模型：
+        # 连坐会同时丢掉合并存储的计划行与 user 行 ``llm_status`` 提升。
+        # 镜像本身按 ``msg_uid`` / 计划行主键 upsert（计划行"只补空"），重复写是幂等的。
+        mirrored = await self._shadow_write(_mirror_record_and_status)
+        if not inserted_rows:
+            if mirrored:
+                # 旧表跳过但合并存储已记录：一轮多段 / 补捕获重试的正常路径，只留 DEBUG。
+                logger.debug(
+                    "[ChatMemory] 旧表跳过（同轮已有 %s 行，旧表一轮一条），"
+                    "合并存储已镜像: turn=%s send_status=%s",
+                    role, turn_id or "-", send_status or "-",
+                )
+            else:
+                # 区分两种"没镜像"：影子层根本没启用 ≠ 启用但这次没写成功。
+                if not self.shadow_enabled:
+                    logger.debug(
+                        "[ChatMemory] 记录跳过（同轮已有 %s 行，旧表一轮一条；"
+                        "合并存储未启用）: turn=%s send_status=%s",
+                        role, turn_id or "-", send_status or "-",
+                    )
+                else:
+                    # 影子层开着却没写进去才是真失败：让调用方看见（否则这轮 user 没落库、
+                    # assistant 却会被标 llm_success）。只记 id/状态，不带正文。
+                    logger.warning(
+                        "[ChatMemory] 记录未落库（旧表唯一键冲突且合并存储未镜像）: "
+                        "role=%s turn=%s send_status=%s",
+                        role, turn_id or "-", send_status or "-",
+                    )
+        # 返回值＝"这条记录是否进入了任一层存储"。旧表冲突但合并存储写成功时算成功：
+        # 上层用它决定要不要继续（补捕获重试、状态升级），按旧表判会把已记录的当成没写。
+        return bool(inserted_rows or mirrored)
 
     async def mark_plan_send_attempted(
         self, umo: str, conversation_id: str, turn_id: str
@@ -971,6 +1012,7 @@ class DBManager:
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[dict]:
         """查询最近 N 条记录（按时间升序返回）。
 
@@ -986,6 +1028,7 @@ class DBManager:
         ``(created_at, id) > (since, after_id)`` keyset 游标。
         ``datetime`` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 ``CURRENT_TIMESTAMP`` 对齐）。
         ``limit`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）导致全库返回。
+        ``skip_recalled``：跳过被撤回的消息（``recalled_at`` 非空）。
         """
         await self.init_db()
         limit = max(1, min(1000, int(limit)))
@@ -1032,6 +1075,10 @@ class DBManager:
                         )
                     params["kinds"] = kind_list
                     expanding_binds.append("kinds")
+
+            if skip_recalled:
+                # 撤回标记在消息级（旧表同样有 recalled_at 列）：消费者落库前要能排除。
+                conditions.append("recalled_at IS NULL")
 
             since_norm = _normalize_dt(since)
             until_norm = _normalize_dt(until)
@@ -1086,6 +1133,7 @@ class DBManager:
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[list[dict]]:
         """按配对返回对话轮次。每轮保证 ``[user_dict, assistant_dict]`` 两条。
 
@@ -1103,6 +1151,7 @@ class DBManager:
         结果严格为完整 ``[user_dict, assistant_dict]``，不会返回孤立 user；历史重复 assistant
         时按 ``created_at ASC, id ASC`` 取最早的一条。
         ``limit_rounds`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）。
+        ``skip_recalled``：user 侧被撤回的轮次整轮不返回（``recalled_at`` 非空）。
         """
         await self.init_db()
         limit_rounds = max(1, min(1000, int(limit_rounds)))
@@ -1170,6 +1219,9 @@ class DBManager:
                     user_params["persona_id"] = persona_id
                 else:
                     conditions.append("(persona_id IS NULL OR persona_id = '')")
+            if skip_recalled:
+                # 撤回标记打在消息行上：user 侧被撤回则整轮不返回（assistant 侧随之消失）。
+                conditions.append("recalled_at IS NULL")
 
             pair_exists = [
                 "EXISTS (SELECT 1 FROM chat_memory_records a",
@@ -2216,10 +2268,12 @@ class DBManager:
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[dict]:
         """V2 版 ``query_latest``：同样的参数与语义，数据来自影子层。
 
         ``record_id`` / ``after_id`` 用影子层的**会话内序号**（``seq``），不是旧表行号。
+        ``skip_recalled``：跳过被撤回的消息（消费者不希望撤回内容进入下游）。
         """
         self._check_after_id(after_id, since)
         scope_cond, scope_params = self._session_scope_v2(umo, user_id)
@@ -2241,6 +2295,7 @@ class DBManager:
                 until=_normalize_dt(until),
                 from_oldest=from_oldest,
                 after_id=after_id,
+                skip_recalled=skip_recalled,
             )
 
     async def query_rounds_v2(
@@ -2257,8 +2312,12 @@ class DBManager:
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[list[dict]]:
-        """V2 版 ``query_rounds``：每轮 ``[user, assistant]``；assistant 侧是合并后的完整回复。"""
+        """V2 版 ``query_rounds``：每轮 ``[user, assistant]``；assistant 侧是合并后的完整回复。
+
+        ``skip_recalled``：跳过被撤回的 user（其 assistant 侧随之整轮不返回）。
+        """
         self._check_after_id(after_id, since)
         scope_cond, scope_params = self._session_scope_v2(umo, user_id)
         async with self._v2_session() as session:
@@ -2278,6 +2337,7 @@ class DBManager:
                 until=_normalize_dt(until),
                 from_oldest=from_oldest,
                 after_id=after_id,
+                skip_recalled=skip_recalled,
             )
 
     async def query_tool_records_v2(

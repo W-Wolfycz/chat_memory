@@ -2,6 +2,20 @@
 
 数据库 schema 版本独立于插件版本：合并存储 `schema_version = 6`（2.0 起的主模型），旧表 `user_version = 8`（退役中）。
 
+## 2.0.1 — 2026-11-14
+
+- 公开查询（`query_history` / `query_rounds` / 两个 `_v2`）新增 `skip_recalled=True`：跳过被撤回的消息，V1/V2 两条读路径都透传到 SQL。不传仍是旧行为；**长期记忆这类落库型消费者应当开启**——否则撤回内容会被当正常发言永久存进下游，事后无法与真实发言区分。
+- 新增 `get_shared_store_status()`：只读返回读源、实际结构版本、双写起点、切读门槛结论与窗口天数，供消费者给游标分区（README §9.3）。
+- `relation_codec` 新增机器可读 token 清单与自检工具：`KNOWN_CONTENT_TOKENS` / `count_unrendered_tokens()`；与渲染正则同源，新增 token 时测试会拦住漏更新。同一方法也挂在插件实例上（`cm.count_unrendered_tokens(text)`，**同步**）——跨插件不能 import 子模块，消费者只能按实例访问。
+- 修掉了**同轮多段回复只记首段**：旧表 `ux_cm_turn_role` 一轮只允许一条 assistant，第二段起被 `INSERT OR IGNORE` 吞掉；而旧实现"只在旧表插入成功时才镜像"，于是合并存储也跟着丢段（连 user 行的 `llm_status` 提升一起丢）。现在旧表冲突仍照常镜像——主模型不该被旧表的限制连坐；返回值改为"任一层写入成功即算成功"，相应日志从 WARNING 降为 DEBUG，只有两层都没写进去才是真失败。
+- 计划行改为**本轮草稿**：`on_decorating_result` 在 tool loop 里会对同一轮触发多次（工具调用前后各一段），现在按序**追加**拼接而不是"先到者赢"——回显缺失时兜底正文不再只剩首段；重复投递同一段（补捕获重试）按**段落边界**判重跳过，不会重复拼接，也不会因为新段是旧正文的子串而白丢一段。表名与字段不变，其余字段仍"只补空"。
+- 新增对外文档 `docs/V2_READER_CONTRACT.md`：给只读 SQL 消费者（独立进程、不 import 插件）的完整契约——稳定面/内部面、`seq` 游标分区、多 persona 可见性、`content_kind` 空值语义、撤回与草稿行语义、上线自检清单。`docs/` 其余文件仍是本地内部文档（`.gitignore` 已按文件逐个忽略）。
+- 文档补齐读者契约：同一 `msg_uid` 在多个 persona 分区各可见一次属**预期**（同 persona 不会重复）；`content_kind` 为空的记录在白名单模式下**不可见**属预期契约（`docs/multi_bot_shared_store.md`「读者契约补充」）。
+- 明确 `seq` 代际（epoch/ingest_id）**暂不提供**：改用 `get_shared_store_status()` 让消费者自保，理由与替代方案见 `docs/EXTERNAL_READER_API.md` P1 决定。
+- 修正 `filter_by_persona` 的说明：同一会话内切人格即自动隔离，**不需要 `/new` 换会话**；`cross_session` 只用于"跨 cid 也看得见"。
+
+测试：64 + 17 = **81 passed**。
+
 ## 2.0.0 — 2026-11-12
 
 合并存储成为主模型，旧表进入退役期。

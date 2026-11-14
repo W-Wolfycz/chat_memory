@@ -4,7 +4,7 @@
 
 从 1.x 的"每条消息按实例各存一份"，到 2.0 的"一条消息只存一份、三个 BOT 共享同一份事实"——这条合并存储的路拆过好几版设计、也踩过双写丢正文的坑，现在总算落地了。V2 上线。
 
-- 版本 `2.0.0` ｜ 平台：NapCat（`aiocqhttp`）、`qq_official` ｜ AstrBot `>=4.16,<5`
+- 版本 `2.0.1` ｜ 平台：NapCat（`aiocqhttp`）、`qq_official` ｜ AstrBot `>=4.16,<5`
 - 仓库：<https://github.com/W-Wolfycz/chat_memory>
 
 ---
@@ -20,7 +20,7 @@ CM 要记录**你自己说了什么**——分段回复的每一段、平台改�
 
 **怎么确认生效**：启动日志里会有 `已订阅平台自身消息回显（platform=BOT1…）`，每个实例一条；查询台里能看到自己的回复分段和送达状态。一直订不上时插件会提醒你一次。
 
-**不开会怎样**：存档照常（别人说的、事件、工具调用都不受影响），但 BOT 说过的话只剩"发送前的全文"——看不到分段，也判断不了那一句到底发没发出去。
+**不开会怎样**：存档照常（别人说的、事件、工具调用都不受影响），但 BOT 说过的话只剩"发送前的全文"（一轮多段时按顺序拼成一段）——看不到真实分段，也判断不了那一句到底发没发出去。
 
 ---
 
@@ -47,18 +47,18 @@ CM 要记录**你自己说了什么**——分段回复的每一段、平台改�
 
 ## 3. 从 1.x 升级
 
-**`2.0.0` 是目前唯一「双写」的版本**（旧表和新表同时写）。它是个桥接版：
+**2.0.x 都处于「双写」阶段**（旧表和新表同时写）。它是从 1.x 过来的桥接版：
 
 ```
-1.x  ──升级──▶  2.0.0（双写开始计时）  ──等 7 天──▶  勾选切读  ──确认没问题──▶  后续版本（单写）
+1.x  ──升级──▶  2.0.x（双写开始计时）  ──等 7 天──▶  勾选切读  ──确认没问题──▶  后续版本（单写）
 ```
 
-- **不要跳过 2.0.0 直接升后续版本**：后续版本会停写旧表，而"双写满 7 天"这个窗口只有 2.0.0 能积累。跳过就永远凑不满条件，新表里也只是一段不完整的历史。
+- **不要跳过 2.0.x 直接升后续版本**：后续版本会停写旧表，而"双写满 7 天"这个窗口只在 2.0.x 里积累。跳过就永远凑不满条件，新表里也只是一段不完整的历史。
 - **推荐等切读生效（≥7 天）再往后升级**：先用旧表兜着跑几天，确认新表数据完整、查询台显示正常，再勾 `shadow_read`；切读稳定后再升后续版本。
 - 升级是自动的：加载时检测结构版本并迁移，**数据一行不丢**，消息行号与工具调用 id 都保持不变。
 - 双写期间磁盘占用会翻倍（两份数据），7 天后切读、后续版本停写旧表就会回落。
 
-详细信息见 [CHANGELOG](CHANGELOG.md) 的 2.0.0 段。
+详细信息见 [CHANGELOG](CHANGELOG.md) 的 2.0.x 段。
 
 ---
 
@@ -150,7 +150,7 @@ AstrBot → 插件 → ChatMemory，三个页面：
 ## 8. 已知限制
 
 1. **切读只覆盖双写之后**：切读后看不到 2.0.0 装上之前的历史（查询台仍能看到旧表段，两侧口径不同）。
-2. **自己发言的形态依赖回显**：宽限内没认领到轮次的段只写物理行，这一轮会退回"计划全文"。
+2. **自己发言的形态依赖回显**：宽限内没认领到轮次的段只写物理行，这一轮会退回"草稿正文"（同一轮多段时按序拼接）。
 3. **上下文窗口是"最近 N 轮"**：超限后窗口左移，对模型侧的前缀缓存不是最优（改成块对齐窗口是下一步）。
 4. **旧表还没删**：2.0.0 双写，后续版本才停写并移除。
 
@@ -194,7 +194,7 @@ AstrBot → 插件 → ChatMemory，三个页面：
 |---|---|---|
 | `chat_memory_messages` | 一条物理消息一行 | `msg_uid`(PK)、`seq`、`platform_seq`、`content`(模板)、`content_kind`、`relation_data`、`recalled_at`、`deleted_at` |
 | `chat_memory_message_bots` | 每实例参与行 | 唯一键 `(msg_uid, platform_id, self_id, conversation_id)`；`role`、`llm_status`、`send_status`、`persona_id`、`target_id`、`turn_id`、`platform_message_id` |
-| `chat_memory_reply_messages` | 一轮一条计划 | `turn_id`(PK)、`umo`、`conversation_id`、`content`、`content_kind`、`llm_status`、`send_status` |
+| `chat_memory_reply_messages` | 一轮一条草稿 | `turn_id`(PK)、`umo`、`conversation_id`、`content`、`content_kind`、`llm_status`、`send_status` |
 | `chat_memory_tool_calls` | 每次工具调用 | 唯一键 `(turn_id, call_index)` |
 | `chat_memory_session_seq` | 会话序号计数器 | `(platform_name, message_type, session_id) → last_seq`，只增不减 |
 | `chat_memory_group_names` | 群名快照 | `(platform_name, session_id) → group_name` |
@@ -217,6 +217,12 @@ rounds = await cm.query_rounds(umo, cid, user_id="10001", limit_rounds=10)
 | `query_history` / `query_rounds` | 跟随 `shadow_read`（含 7 天门槛） |
 | `query_history_v2` / `query_rounds_v2` | 强制合并存储（对拍/灰度用） |
 | `build_takeover_contexts` | 复用接管配置拼上下文（不写库、不清原生历史） |
+| `get_shared_store_status` | 只读状态：`source` / `schema_version` / `dual_write_started_at` / `shadow_read_ready` |
+| `count_unrendered_tokens(text)` | **同步**：统计正文里残留的已知内部 token（`{"⟦CM_IMAGE": 2}`），空字典＝渲染干净 |
+
+四个查询方法都支持 `skip_recalled=True`：跳过被撤回的消息（默认 `False`，与旧版行为一致）。
+**长期记忆、画像这类"落库"型消费者应当开启**——否则撤回内容会被当成正常发言永久存进下游，
+事后无法与真实发言区分。
 
 注意：`since`/`until` 按 UTC naive 解释；返回的 `created_at` 是配置时区的 naive 字符串，做游标请用 `created_at_utc`。2.0 起返回 dict 不再有 `reply_group`（按 `turn_id` / `segments` 归组）。
 
@@ -232,7 +238,7 @@ rounds = await cm.query_rounds(umo, cid, user_id="10001", limit_rounds=10)
 | `event_message_type(ALL)` | 1000 | 入站消息 / 事件通知捕获 |
 | `on_llm_request` | 默认 / `-100` / `-1000` | 补捕获、升 `llm_pending`、接管上下文、当前轮焦点 |
 | `on_llm_tool_respond` | — | 工具调用落库 |
-| `on_decorating_result` | 10000 | 写计划行、记发送侧账本 |
+| `on_decorating_result` | 10000 | 写本轮草稿行、记发送侧账本 |
 | `after_message_sent` | — | 标记 `send_attempted` |
 
 自己的消息靠 **push 回显**（主）与 **pull 拉群历史**（兜底）进入合并存储；撤回通知先于消息落库时按 0.5/1.5/3/8 秒退避重试。
@@ -252,14 +258,16 @@ SELECT msg_uid, platform_id, self_id, conversation_id, umo, role, platform_messa
   FROM chat_memory_message_bots WHERE COALESCE(turn_id, '') <> '';
 ```
 
-- `content` 是**模板**：`⟦CM_AT:n⟧` 等占位符要按 `relation_data` 渲染（`relation_codec.render_content_template()` 是纯函数，可照抄）；不认识的 token 建议计数告警。
+- `content` 是**模板**：`⟦CM_AT:n⟧` 等占位符要按 `relation_data` 渲染后再用（渲染逻辑在 `relation_codec.render_content_template()`，纯函数，可照抄）。已知 token 清单见 `relation_codec.KNOWN_CONTENT_TOKENS`，渲染后自检用 `count_unrendered_tokens()`（返回空字典＝干净）；**跨插件不要直接 import 子模块**（会 ModuleNotFoundError），走插件实例的同名方法：`cm.count_unrendered_tokens(text)`（同步）。遇到不认识的 token 建议计数告警，不要静默吞掉。
 - 消息表没有"收/发"之分：谁发的看 `sender_id`，是不是本实例发的看参与行 `role`。
 - `seq` 只增不减、**允许空洞**（删除与并发观察会留空号）；不要用 `rowid` 代替。
 - 幂等键用 `msg_uid`，不要用 `(content, 时间)`。
 - `schema_version` 变化就当结构变了，重新校验列清单。
 
+完整契约（稳定面/内部面、游标分区、多 persona 可见性、撤回与草稿行语义、上线自检清单）见 [docs/V2_READER_CONTRACT.md](docs/V2_READER_CONTRACT.md)。
+
 ### 9.7 版本与结构
 
-- 插件版本 `2.0.0`；合并存储结构线 `6`；旧表 `user_version = 8`（退役中）。
+- 插件版本 `2.0.1`；合并存储结构线 `6`；旧表 `user_version = 8`（退役中）。
 - 结构变更走 `SHADOW_MIGRATIONS` 累积迁移，不丢弃重建；切读窗口 `dual_write_started_at` 随迁移保留。
 - 后续路线：停写旧表 → 删旧表与旧索引 → 去掉 `shadow_read` 开关与 7 天门槛 → 去掉查询台的双 id 偏移（`record_id = rowid + 1e9`）。

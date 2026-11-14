@@ -85,6 +85,7 @@ from .relation_codec import (
     AT_TOKEN_RE as _AT_TOKEN_RE,
     MEDIA_TOKEN_RE as _MEDIA_TOKEN_RE,
     build_current_turn_xml,
+    count_unrendered_tokens as _count_unrendered_tokens,
     dump_relation_data,
     escape_plain_text as _escape_plain_text,
     truncate_content_template,
@@ -337,8 +338,9 @@ class ChatMemoryPlugin(Star):
         self.ct_include_all_match = bool(ct_conf.get("include_all_match", False))
         # 撤回消息跳过上下文：开启后被撤回的原消息与撤回事件都不进 LLM 上下文
         self.ct_recall_skip_context = bool(ct_conf.get("recall_skip_context", False))
-        # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时跳过（兜底）
-        # 与 cross_session=T 协同可获完整 persona 隔离体验（切 persona + /new + 切回仍可见旧数据）
+        # persona 过滤：开启后查询严格按当前 persona_id 过滤；persona_id 为空时只匹配未标记的行。
+        # **同一 cid 内切人格就能隔离**——persona 写在行上，过滤是行级条件，不需要 /new 换 cid。
+        # cross_session=T 只用于"跨 cid 也看得见"（/new 之后想找回旧对话时才需要）。
         self.ct_filter_by_persona = bool(ct_conf.get("filter_by_persona", False))
         # 工具调用上下文：接管时回放 CM 库中最近 N 个轮次的工具调用记录
         # （assistant tool_calls + role=tool），保证 LLM 跨轮看到工具返回，
@@ -1799,7 +1801,10 @@ class ChatMemoryPlugin(Star):
             **audit,
         )
         if not ok:
-            logger.warning(f"{self._log_prefix(event)} user 写入失败，extras 未标记，assistant 将标 orphan")
+            logger.warning(
+                f"{self._log_prefix(event)} user 写入失败（旧表与合并存储都没写进去），"
+                f"extras 未标记，assistant 将标 orphan"
+            )
             return False
 
         # 媒体归档：本地源同步接管（毫秒级）+ 远程源后台下载，失败不影响存档。
@@ -2845,7 +2850,8 @@ class ChatMemoryPlugin(Star):
         )
         if not ok:
             logger.warning(
-                f"{self._log_prefix(event)} assistant prepared 写入失败，turn={turn_id}"
+                f"{self._log_prefix(event)} assistant prepared 写入失败"
+                f"（旧表与合并存储都没写进去），turn={turn_id}"
             )
         self._note_active_turn(
             turn_id=str(turn_id), cid=str(cid), persona_id=persona_id or "",
@@ -3789,6 +3795,7 @@ class ChatMemoryPlugin(Star):
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[dict]:
         """查询会话历史。``user_id`` 为空时返回该会话所有用户的混合记录（群聊场景）。
 
@@ -3800,6 +3807,7 @@ class ChatMemoryPlugin(Star):
         ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点，tz-aware 自动转 UTC）。
         ``after_id`` 与 ``since`` 同时提供时使用严格 ``(created_at, id)`` 下界。
         ``from_oldest=True`` 时从最旧记录开始截取；返回顺序始终为时间正序。
+        ``skip_recalled=True``：跳过被撤回的消息（默认 False，行为与旧版一致）。
         """
         return await self._read_with_switch(
             lambda: self.db.query_latest_v2(
@@ -3807,12 +3815,14 @@ class ChatMemoryPlugin(Star):
                 role_filter, persona_id=persona_id, since=since, until=until,
                 from_oldest=from_oldest, after_id=after_id,
                 content_kind_all_match=content_kind_all_match,
+                skip_recalled=skip_recalled,
             ),
             lambda: self.db.query_latest(
                 umo, conversation_id, user_id, limit, llm_status, content_kind,
                 role_filter, persona_id=persona_id, since=since, until=until,
                 from_oldest=from_oldest, after_id=after_id,
                 content_kind_all_match=content_kind_all_match,
+                skip_recalled=skip_recalled,
             ),
         )
 
@@ -3830,6 +3840,7 @@ class ChatMemoryPlugin(Star):
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[list[dict]]:
         """按轮次返回 user-assistant 配对。每轮 ``[user_dict, assistant_dict]`` 两条。
 
@@ -3839,6 +3850,7 @@ class ChatMemoryPlugin(Star):
         ``after_id`` 与 ``since`` 同时提供时使用严格 ``(created_at, id)`` 下界；
         ``content_kind_all_match=True`` 时使用严格内容白名单语义。
         ``from_oldest=True`` 时从最旧完整轮次开始截取；返回顺序始终为时间正序。
+        ``skip_recalled=True``：跳过被撤回的 user（该轮不再返回）。
         """
         return await self._read_with_switch(
             lambda: self.db.query_rounds_v2(
@@ -3846,12 +3858,14 @@ class ChatMemoryPlugin(Star):
                 persona_id=persona_id, since=since, until=until,
                 from_oldest=from_oldest, after_id=after_id,
                 content_kind_all_match=content_kind_all_match,
+                skip_recalled=skip_recalled,
             ),
             lambda: self.db.query_rounds(
                 umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
                 persona_id=persona_id, since=since, until=until,
                 from_oldest=from_oldest, after_id=after_id,
                 content_kind_all_match=content_kind_all_match,
+                skip_recalled=skip_recalled,
             ),
         )
 
@@ -4008,6 +4022,7 @@ class ChatMemoryPlugin(Star):
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[dict]:
         """``query_history`` 的 V2：同样参数与语义，数据来自合并存储（影子层）。
 
@@ -4022,6 +4037,7 @@ class ChatMemoryPlugin(Star):
             persona_id=persona_id, since=since, until=until,
             from_oldest=from_oldest, after_id=after_id,
             content_kind_all_match=content_kind_all_match,
+            skip_recalled=skip_recalled,
         )
 
     async def query_rounds_v2(
@@ -4038,6 +4054,7 @@ class ChatMemoryPlugin(Star):
         from_oldest: bool = False,
         after_id: Optional[int] = None,
         content_kind_all_match: bool = False,
+        skip_recalled: bool = False,
     ) -> list[list[dict]]:
         """``query_rounds`` 的 V2：每轮 ``[user, assistant]``。
 
@@ -4050,6 +4067,7 @@ class ChatMemoryPlugin(Star):
             persona_id=persona_id, since=since, until=until,
             from_oldest=from_oldest, after_id=after_id,
             content_kind_all_match=content_kind_all_match,
+            skip_recalled=skip_recalled,
         )
 
     async def build_takeover_contexts_v2(
@@ -4065,8 +4083,49 @@ class ChatMemoryPlugin(Star):
             umo, user_id, conversation_id, persona_id, exclude_turn_id, source="v2"
         )
 
-    # ── 内部工具 ──────────────────────────────────────
+    async def get_shared_store_status(self) -> dict:
+        """合并存储的只读状态：读源、结构版本、双写起点、切读门槛结论。
 
+        给外部消费者（长期记忆、画像等）做游标分区用：读源切换或影子层按版本重建时，
+        它们应当形成新分区（既不重复消费同一段历史，也不静默跳过）。此前只能靠
+        ``getattr`` 探测私有属性，拿不到结构版本。
+
+        读不到的部分给默认值，**不外抛**——这是状态查询，不该让调用方因缺元信息而失败。
+        """
+        meta = await self.db.shadow_meta()
+        try:
+            schema_version = int(meta.get("schema_version") or 0)
+        except (TypeError, ValueError):
+            schema_version = 0
+        return {
+            "source": self._shadow_read_source(),
+            "schema_version": schema_version,
+            "expected_schema_version": int(shared_store.SHADOW_SCHEMA_VERSION),
+            "dual_write_started_at": (meta.get("dual_write_started_at") or None),
+            "shadow_read_ready": bool(getattr(self, "_shadow_read_ready", False)),
+            "shadow_read_enabled": bool(getattr(self, "shadow_read", False)),
+            "shadow_enabled": bool(getattr(self, "shared_store_shadow", False)),
+            "window_days": float(getattr(self, "_shadow_read_window_days", -1.0)),
+        }
+
+    def count_unrendered_tokens(self, text: str) -> dict[str, int]:
+        """正文里残留的**已知**内部 token 计数（**同步**纯函数，不需要 await）。
+
+        外部消费者拿不到本插件的子模块（跨插件 `import` 子模块会 ModuleNotFoundError），
+        所以按实例访问走这里：
+
+        ```python
+        cm = context.get_registered_star("chat_memory")
+        left = cm.count_unrendered_tokens(record["content"])
+        ```
+
+        返回空字典＝渲染干净；非空（如 ``{"⟦CM_IMAGE": 2}``）说明拿到的是未渲染模板。
+        不认识的 ``⟦…⟧`` 不计入——那属于格式升级，可用 ``⟦`` 总出现次数与该返回值之和
+        做差单独告警。
+        """
+        return _count_unrendered_tokens(text)
+
+    # ── 内部工具 ──────────────────────────────────────
     async def _safe_insert(
         self, umo: str, cid: str, user_id: str, role: str, content: str,
         message_id: Optional[str] = None, pair_id: Optional[str] = None,

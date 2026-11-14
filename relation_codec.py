@@ -26,6 +26,30 @@ _MEDIA_PREFIXES = ("IMAGE", "VIDEO", "VOICE", "FILE", "EMOJI", "FORWARD", "POKE"
 MEDIA_TOKEN_RE = re.compile(
     r"⟦CM_(?:IMAGE|VIDEO|VOICE|FILE|EMOJI|FORWARD|POKE):(\d+)⟧"
 )
+# 已知 token 前缀（机器可读）：消费者用它区分"CM 升级新增了 token"与"渲染实现有 bug"。
+# 与上面两个正则**必须同源**：新增 token 时三处一起改（正则、本元组、渲染分支）。
+KNOWN_CONTENT_TOKENS = (
+    AT_TOKEN_LITERAL,
+    *(f"⟦CM_{prefix}:" for prefix in _MEDIA_PREFIXES),
+)
+
+
+def count_unrendered_tokens(text: str) -> dict[str, int]:
+    """统计正文里残留的**已知**内部 token，按前缀分组返回（``{"⟦CM_IMAGE": 2}``）。
+
+    用途：外部消费者在落库/展示前自检——返回空字典说明渲染干净；非空说明拿到了
+    未渲染的模板（消费方用错字段，或渲染被跳过）。**不认识的** ``⟦…⟧`` 不计入，
+    那属于"格式升级"，调用方可以另按 ``⟦`` 出现次数与这里的总和做差来判断。
+    """
+    value = str(text or "")
+    if not value:
+        return {}
+    counts: dict[str, int] = {}
+    for prefix in KNOWN_CONTENT_TOKENS:
+        hits = value.count(prefix)
+        if hits:
+            counts[prefix.rstrip(":")] = hits
+    return counts
 # kind → 上下文占位标签（poke/emoji/file 由 _media_label_of 特判，
 # 其余与 context_builder.MEDIA_PLACEHOLDER_LABELS 同名）
 MEDIA_KIND_LABELS = {
