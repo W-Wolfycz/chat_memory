@@ -73,6 +73,17 @@
         "default": 30,
         "hint": "仅选 llm_success 时按轮数计算，否则按消息数；最小 1。"
       },
+      "retain_ratio": {
+        "description": "窗口保留比例（%）",
+        "type": "int",
+        "default": 80,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        },
+        "hint": "窗口超上限时回退到此比例，再让新消息慢慢补满——起点在块内不动，前缀缓存命中率≈该值。调低＝回退更多、跳块更少（裁剪更狠）；调高＝跳块更勤。100＝关闭块对齐。"
+      },
       "max_context_chars": {
         "description": "上下文字符预算",
         "type": "int",

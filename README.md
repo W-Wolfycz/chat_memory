@@ -4,7 +4,7 @@
 
 从 1.x 的"每条消息按实例各存一份"，到 2.0 的"一条消息只存一份、三个 BOT 共享同一份事实"——这条合并存储的路拆过好几版设计、也踩过双写丢正文的坑，现在总算落地了。V2 上线。
 
-- 版本 `2.0.1` ｜ 平台：NapCat（`aiocqhttp`）、`qq_official` ｜ AstrBot `>=4.16,<5`
+- 版本 `2.0.2` ｜ 平台：NapCat（`aiocqhttp`）、`qq_official` ｜ AstrBot `>=4.16,<5`
 - 仓库：<https://github.com/W-Wolfycz/chat_memory>
 
 ---
@@ -50,7 +50,7 @@ CM 要记录**你自己说了什么**——分段回复的每一段、平台改�
 **2.0.x 都处于「双写」阶段**（旧表和新表同时写）。它是从 1.x 过来的桥接版：
 
 ```
-1.x  ──升级──▶  2.0.x（双写开始计时）  ──等 7 天──▶  勾选切读  ──确认没问题──▶  后续版本（单写）
+1.x  ──升级──▶  2.0.x（双写开始计时）  ──等 7 天──▶  勾选切读  ──确认没问题──▶  2.1（停写旧表）
 ```
 
 - **不要跳过 2.0.x 直接升后续版本**：后续版本会停写旧表，而"双写满 7 天"这个窗口只在 2.0.x 里积累。跳过就永远凑不满条件，新表里也只是一段不完整的历史。
@@ -172,7 +172,8 @@ AstrBot → 插件 → ChatMemory，三个页面：
 | `context_takeover.cross_session_private_only` | bool | `false` | 只在私聊里跨会话（群聊只读当前群）；勾了 `cross_session` 才显示 |
 | `context_takeover.cross_session_blacklist` | list | `[]` | 黑名单 `G:<群号>` / `F:<用户号>` |
 | `context_takeover.full_group` | bool | `false` | 整群取数（不限当前用户） |
-| `context_takeover.limit_rounds` | int | `30` | 取多少轮（只选 `llm_success` 时按轮，否则按消息条数） |
+| `context_takeover.limit_rounds` | int | `30` | 窗口上限（只选 `llm_success` 时按轮，否则按消息条数） |
+| `context_takeover.retain_ratio` | int（滑块 1~100） | `80` | 超限时回退到这个比例再让新消息补满；起点在块内不动，前缀缓存命中率 ≈ 该比例。`100` = 关闭块对齐 |
 | `context_takeover.max_context_chars` | int | `0` | 上下文字符上限（0＝不限） |
 | `context_takeover.llm_status_filter` | list | `["llm_success"]` | 取哪些 LLM 状态（`["no_llm"]`＝空值） |
 | `context_takeover.include_content_kinds` | list | `["text"]` | 内容白名单 |
@@ -268,6 +269,6 @@ SELECT msg_uid, platform_id, self_id, conversation_id, umo, role, platform_messa
 
 ### 9.7 版本与结构
 
-- 插件版本 `2.0.1`；合并存储结构线 `6`；旧表 `user_version = 8`（退役中）。
+- 插件版本 `2.0.2`；合并存储结构线 `6`；旧表 `user_version = 8`（退役中）。
 - 结构变更走 `SHADOW_MIGRATIONS` 累积迁移，不丢弃重建；切读窗口 `dual_write_started_at` 随迁移保留。
 - 后续路线：停写旧表 → 删旧表与旧索引 → 去掉 `shadow_read` 开关与 7 天门槛 → 去掉查询台的双 id 偏移（`record_id = rowid + 1e9`）。

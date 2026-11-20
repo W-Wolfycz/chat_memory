@@ -1944,6 +1944,7 @@ class DBManager:
         filter_by_persona: bool = False,
         skip_recalled: bool = False,
         blacklist: Optional[list[str]] = None,
+        after: Optional[int] = None,
     ) -> list[list[dict]]:
         """内部方法：配对模式查询（takeover 专用）。
 
@@ -2007,6 +2008,11 @@ class DBManager:
             if skip_recalled:
                 conditions.append("recalled_at IS NULL")
             params: dict = {**scope_param, "lim": limit_rounds}
+            if after is not None:
+                # cache 友好窗口锚点：旧表用自增主键 id（AUTOINCREMENT，不复用），
+                # 与 V2 的会话内 seq 对应；条件必须放在 params 建好之后。
+                conditions.append("id >= :after")
+                params["after"] = int(after)
             expanding_binds: list[str] = []
 
             if conversation_id:
@@ -2123,6 +2129,7 @@ class DBManager:
         exclude_turn_id: Optional[str] = None,
         skip_recalled: bool = False,
         blacklist: Optional[list[str]] = None,
+        after: Optional[int] = None,
     ) -> list[dict]:
         """内部方法：混合模式查询（takeover 专用）。
 
@@ -2161,6 +2168,10 @@ class DBManager:
             if skip_recalled:
                 conditions.append("recalled_at IS NULL")
             params: dict = {**scope_param, "lim": limit_messages}
+            if after is not None:
+                # cache 友好窗口锚点（旧表自增主键），与 V2 的 seq 对应
+                conditions.append("id >= :after")
+                params["after"] = int(after)
             expanding_binds: list[str] = []
 
             if conversation_id:
@@ -2409,6 +2420,7 @@ class DBManager:
         exclude_turn_id: Optional[str] = None,
         skip_recalled: bool = False,
         blacklist: Optional[list[str]] = None,
+        after: Optional[int] = None,
     ) -> list[dict]:
         """V2 版 ``query_messages_raw``（takeover 混合模式）：scope 语义与 V1 完全一致。"""
         scope_cond, scope_param = _scope_filter(
@@ -2429,6 +2441,7 @@ class DBManager:
                 filter_by_persona=filter_by_persona,
                 exclude_turn_id=exclude_turn_id or None,
                 skip_recalled=skip_recalled,
+                after_seq=after,
             )
 
     async def query_rounds_raw_v2(
@@ -2445,6 +2458,7 @@ class DBManager:
         filter_by_persona: bool = False,
         skip_recalled: bool = False,
         blacklist: Optional[list[str]] = None,
+        after: Optional[int] = None,
     ) -> list[list[dict]]:
         """V2 版 ``query_rounds_raw``（takeover 配对模式）。
 
@@ -2470,6 +2484,7 @@ class DBManager:
                 persona_id=persona_id,
                 filter_by_persona=filter_by_persona,
                 skip_recalled=skip_recalled,
+                after_seq=after,
             )
 
 

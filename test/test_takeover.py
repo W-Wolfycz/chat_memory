@@ -193,6 +193,13 @@ exec(compile((PLUGIN_DIR / "group_names.py").read_text(encoding="utf-8"),
              "group_names.py", "exec"), group_names_mod.__dict__)
 setattr(pkg, "group_names", group_names_mod)
 
+# cache 友好窗口（纯逻辑，无第三方依赖）
+context_window_mod = types.ModuleType("chat_memory.context_window")
+sys.modules["chat_memory.context_window"] = context_window_mod
+exec(compile((PLUGIN_DIR / "context_window.py").read_text(encoding="utf-8"),
+             "context_window.py", "exec"), context_window_mod.__dict__)
+setattr(pkg, "context_window", context_window_mod)
+
 shadow_read_mod = types.ModuleType("chat_memory.shadow_read")
 sys.modules["chat_memory.shadow_read"] = shadow_read_mod
 exec(compile((PLUGIN_DIR / "shadow_read.py").read_text(encoding="utf-8"), "shadow_read.py", "exec"),
@@ -244,6 +251,8 @@ class _PluginStub(_ChatMemoryPlugin):
 def _make_plugin():
     p = _PluginStub()
     p.shared_store_shadow = False          # 单测不碰影子层（需要时各自设桩）
+    p.ct_retain_ratio = 80                 # cache 友好窗口：默认 80%
+    p._window_anchors = sys.modules["chat_memory.context_window"].AnchorStore()
     p.sent_capture_history = False
     p._shadow_tasks = set()
     p._sent_history_unsupported = set()
@@ -2135,7 +2144,8 @@ def test_takeover_event_type_filter():
         async def query_rounds_raw(self, umo, cid, user_id, limit, kinds,
                                    all_match, cross_umo=False, full_group=False,
                                    blacklist=None, persona_id="",
-                                   filter_by_persona=False, skip_recalled=False):
+                                   filter_by_persona=False, skip_recalled=False,
+                                   **_kw):
             return [[
                 {"role": "user", "content_kind": ["event"], "content": "x",
                  "relation_data": {"event": {"type": "ban"}}},
@@ -3421,6 +3431,226 @@ def test_plan_row_substring_is_not_deduped():
         assert put("好") == "好的呀\n好", "子串不得被判成重复"
     finally:
         con.close()
+
+
+def test_window_block_alignment_wiring():
+    """守的静默失效：块对齐在**接线层**失效——桩数据没坐标、或裁切后没写锚点，
+    行为看起来完全正常，只是每轮都移动窗口起点、缓存收益归零。
+
+    同时守"锚点失效自愈"：锚点指向未来坐标（库重建/会话删空）时若一直查空，
+    上下文会永久为空。
+    """
+    def rows(n, start=1):
+        return [
+            {"record_id": i, "role": "user" if i % 2 else "assistant",
+             "turn_id": f"t{i // 2}", "content": f"m{i}",
+             "content_kind": ["text"], "llm_status": "llm_success"}
+            for i in range(start, start + n)
+        ]
+
+    class _Db:
+        def __init__(self, total=31):
+            self.total = total
+            self.afters = []
+
+        async def query_messages_raw(self, umo, cid, uid, limit, statuses, kinds,
+                                     all_match, **kw):
+            after = kw.get("after")
+            self.afters.append(after)
+            if after is not None and after > 1000:
+                return []      # 锚点指向未来坐标（库重建/清空）→ 查空
+            return rows(self.total)
+
+        async def query_messages_raw_v2(self, *a, **kw):
+            raise RuntimeError("v2 挂了")
+
+    p = _make_plugin()
+    p.ct_llm_status_filter = ["llm_success", ""]      # 混合模式（按条）
+    p.ct_limit_rounds = 30
+    p.ct_retain_ratio = 80                            # low = 24
+    db = _Db()
+    p.db = db
+
+    out, _src = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    assert 24 <= len(out) <= 30, len(out)
+    assert len(out) < 31, "超过上限却没裁"
+    anchors = p._window_anchors
+    assert anchors.size() == 1, anchors.snapshot()
+    first_anchor = next(iter(anchors.snapshot().values()))["anchor"]
+    assert first_anchor, "裁切后没有写入锚点"
+
+    # 第二轮：数据涨到 35 条 → 仍在块内（≤30？超了）→ 这里只验证锚点可复用不崩
+    db.total = 30
+    out2, _src = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    assert len(out2) <= 30
+
+    # 锚点失效自愈：把锚点改成未来坐标 → 查询为空 → 应忘记并重试（afters 里出现 None）
+    anchors.set(next(iter(anchors.snapshot())), 10 ** 9)
+    db.afters.clear()
+    out3, _src = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    assert out3, "锚点失效后没有自愈，上下文变空"
+    assert None in db.afters, f"没有用空下界重试过: {db.afters}"
+
+
+def test_window_block_alignment_pair_mode():
+    """守的静默失效：配对模式（只选 llm_success）走的是 query_rounds_raw 分支，
+    若这条分支没做块对齐，窗口每轮都会整体前移一轮——功能正常、缓存全灭。
+    """
+    def rounds(n, start=1):
+        out = []
+        for i in range(start, start + n):
+            out.append([
+                {"record_id": i * 2, "role": "user", "turn_id": f"t{i}",
+                 "content": f"u{i}", "content_kind": ["text"],
+                 "llm_status": "llm_success"},
+                {"record_id": i * 2 + 1, "role": "assistant", "turn_id": f"t{i}",
+                 "content": f"a{i}", "content_kind": ["text"],
+                 "llm_status": "llm_success"},
+            ])
+        return out
+
+    class _Db:
+        def __init__(self):
+            self.afters = []
+
+        async def query_rounds_raw(self, umo, cid, uid, limit, kinds, all_match,
+                                   **kw):
+            self.afters.append(kw.get("after"))
+            return rounds(31)          # 31 轮 > 上限 30
+
+    p = _make_plugin()
+    p.ct_llm_status_filter = ["llm_success"]     # 配对模式（按轮）
+    p.ct_limit_rounds = 30
+    p.ct_retain_ratio = 80                       # low = 24 轮
+    p.db = _Db()
+
+    out, _src = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    assert len(out) == 24 * 2, f"应裁到 24 轮（48 条），实际 {len(out)} 条"
+    anchor = next(iter(p._window_anchors.snapshot().values()))["anchor"]
+    assert anchor == out[0]["record_id"], "锚点应指向第一轮 user 行的坐标"
+
+
+def test_window_anchor_not_shared_across_sources():
+    """守的静默失效：V1 的自增 id 与 V2 的会话内 seq 是两套值域，共用一个锚点会让
+    窗口错位（甚至直接查空）。做法：先让 V2 正常跑一轮建立锚点（大值），再让它抛异常
+    整段回退 V1 —— V1 那次绝不能带着 V2 的锚点去查。
+    """
+    seen = {"v2_calls": 0, "v1_afters": []}
+
+    def rows(n, start):
+        return [
+            {"record_id": i, "role": "user" if i % 2 else "assistant",
+             "turn_id": f"t{i // 2}", "content": f"m{i}",
+             "content_kind": ["text"], "llm_status": "llm_success"}
+            for i in range(start, start + n)
+        ]
+
+    class _Db:
+        async def query_messages_raw_v2(self, umo, cid, uid, limit, statuses, kinds,
+                                        all_match, **kw):
+            seen["v2_calls"] += 1
+            if seen["v2_calls"] > 1:
+                raise RuntimeError("v2 挂了")
+            return rows(31, 100001)          # V2 坐标：大值 seq
+
+        async def query_messages_raw(self, umo, cid, uid, limit, statuses, kinds,
+                                     all_match, **kw):
+            seen["v1_afters"].append(kw.get("after"))
+            return rows(5, 1)                # V1 坐标：小值 id
+
+    p = _make_plugin()
+    p.ct_llm_status_filter = ["llm_success", ""]
+    p.ct_limit_rounds = 30
+    p.ct_retain_ratio = 80
+    p.shadow_read = True
+    p._shadow_read_ready = True
+    p.db = _Db()
+
+    # 第一轮：V2 成功，超限裁切 → 写下 V2 侧锚点
+    _out1, src1 = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    assert src1 == "v2"
+    assert p._window_anchors.size() == 1
+
+    # 第二轮：V2 抛异常 → 整段回退 V1；V1 不能复用它那份大值锚点
+    _out2, src2 = asyncio.run(p._takeover_query(_UMO_GROUP, "cid_demo", "u1"))
+    assert src2 == "v1"
+    assert seen["v1_afters"], "回退后没有走 V1"
+    assert seen["v1_afters"][0] is None, (
+        f"V1 复用了 V2 的锚点: {seen['v1_afters']}"
+    )
+
+
+def test_echo_row_inherits_turn_persona():
+    """守的静默失效：回显行（``message_sent``）不带 persona，空着落库本身没事，
+    但 ``filter_by_persona=True`` 的读路径会把这一整段过滤掉——上下文少一截，
+    而回填要等下次加载/日清（线上实测 111 行 / 47 轮整段消失，用户侧表现是
+    "刚说的话模型没看见"）。必须在写入当刻用同轮的已有 persona 补齐。
+    """
+    ss = sys.modules["chat_memory.shared_store"]
+
+    class _Res:
+        def __init__(self, row):
+            self._row = row
+
+        def first(self):
+            return self._row
+
+    class _Sess:
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.queries = []
+
+        async def execute(self, sql, params=None):
+            self.queries.append((str(sql), params))
+            return _Res(self.rows.pop(0) if self.rows else None)
+
+    base = {"turn_id": "turn_1", "umo": "BOT1:FriendMessage:10001",
+            "conversation_id": "cid"}
+
+    # 测试环境的 sqlalchemy 桩里 `text()` 不可用；这里只关心"查了哪张表/返回什么"，
+    # 让 SQL 构造退化成恒等函数即可。
+    orig_text = ss.text
+    ss.text = lambda statement=None, *a, **k: statement
+
+    # 1) 参与行里同轮已有 persona → 直接取
+    s1 = _Sess([("persona_demo",)])
+    assert asyncio.run(ss.inherit_turn_persona(s1, dict(base))) == "persona_demo"
+    assert len(s1.queries) == 1
+
+    # 2) 参与行还没有 → 退到计划成员（发送侧记账一定带 persona）
+    s2 = _Sess([None, ("persona_demo",)])
+    assert asyncio.run(ss.inherit_turn_persona(s2, dict(base))) == "persona_demo"
+    assert len(s2.queries) == 2
+
+    # 3) 两处都空 → 返回空串，不编造
+    s3 = _Sess([None, None])
+    assert asyncio.run(ss.inherit_turn_persona(s3, dict(base))) == ""
+
+    # 4) 缺 turn_id 的普通平台行 → 一次都不查
+    s4 = _Sess([])
+    assert asyncio.run(ss.inherit_turn_persona(s4, {"umo": "u"})) == ""
+    assert s4.queries == []
+
+    # 5) cid 为空时要按「空 cid」去匹配（`conversation_id = ''` 匹配不到真实 cid 行，
+    #    会静默漏继承）；有值时保持直等号，否则索引只命中 umo 一列。
+    s5 = _Sess([("persona_demo",)])
+    asyncio.run(ss.inherit_turn_persona(s5, {"turn_id": "t", "umo": "u"}))
+    assert "COALESCE(conversation_id, '')" in str(s5.queries[0][0])
+    s6 = _Sess([("persona_demo",)])
+    asyncio.run(ss.inherit_turn_persona(
+        s6, {"turn_id": "t", "umo": "u", "conversation_id": "c1"}))
+    sql6 = str(s6.queries[0][0])
+    assert "conversation_id = :cid" in sql6 and "COALESCE(conversation_id" not in sql6
+
+    ss.text = orig_text
+
+    # 5) 接线：mirror_record 必须在 upsert_participation **之前**补
+    src = (PLUGIN_DIR / "shared_store.py").read_text(encoding="utf-8")
+    body = src[src.index("async def mirror_record"):]
+    body = body[: body.index("async def ", 10)]      # 只取该函数体
+    assert "inherit_turn_persona" in body, "mirror_record 没有调用 persona 继承"
+    assert body.index("inherit_turn_persona") < body.index("await upsert_participation"), \
+        "继承必须发生在参与行 upsert 之前"
 
 
 def test_insert_mirrors_when_legacy_conflicts():

@@ -204,12 +204,19 @@ def _filter_conditions(
     since: Optional[datetime],
     until: Optional[datetime],
     after_id: Optional[int],
+    after_seq: Optional[int] = None,
 ) -> tuple[list[str], dict, tuple[str, ...]]:
     """公共 WHERE 片段（消息级 + 参与行级），与 V1 同名参数一一对应。"""
     conditions = ["deleted_at IS NULL"]
     params: dict[str, Any] = {}
     expanding: list[str] = []
 
+    if after_seq is not None:
+        # cache 友好窗口的锚点：``seq`` 是会话内只增序号，窗口起点固定在这里，
+        # 块内不移动 → 前缀稳定。与 ``after_id``（keyset 增量游标）语义不同，
+        # 两者互斥使用。
+        conditions.append("seq >= :after_seq")
+        params["after_seq"] = int(after_seq)
     if skip_recalled:
         conditions.append("recalled_at IS NULL")
     if role_filter:
@@ -276,6 +283,7 @@ async def fetch_messages(
     until: Optional[datetime] = None,
     from_oldest: bool = False,
     after_id: Optional[int] = None,
+    after_seq: Optional[int] = None,
     collapse_turns: bool = True,
 ) -> list[dict]:
     """按 V1 ``query_latest`` / ``query_messages_raw`` 的语义从影子层取消息。
@@ -290,6 +298,7 @@ async def fetch_messages(
         role_filter=role_filter, persona_id=persona_id,
         filter_by_persona=filter_by_persona, exclude_turn_id=exclude_turn_id,
         skip_recalled=skip_recalled, since=since, until=until, after_id=after_id,
+        after_seq=after_seq,
     )
     conditions.append(f"({scope_cond})")
     if cid:
@@ -526,6 +535,7 @@ async def fetch_rounds(
     until: Optional[datetime] = None,
     from_oldest: bool = False,
     after_id: Optional[int] = None,
+    after_seq: Optional[int] = None,
 ) -> list[list[dict]]:
     """配对查询：每轮 ``[user_dict, assistant_dict]``（assistant 侧是合并后的完整回复）。"""
     wanted = max(1, min(1000, int(limit_rounds)))
@@ -537,7 +547,7 @@ async def fetch_rounds(
         include_kinds=include_kinds, all_match=all_match, role_filter="user",
         persona_id=persona_id, filter_by_persona=filter_by_persona,
         skip_recalled=skip_recalled, since=since, until=until,
-        from_oldest=from_oldest, after_id=after_id,
+        from_oldest=from_oldest, after_id=after_id, after_seq=after_seq,
     )
     turn_ids = [str(row.get("turn_id") or "") for row in user_rows]
     if not any(turn_ids):

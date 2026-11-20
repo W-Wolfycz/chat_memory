@@ -81,6 +81,16 @@ from .models import (
     SEND_ATTEMPTED as _SEND_ATTEMPTED,
     SEND_PREPARED as _SEND_PREPARED,
 )
+from .context_window import (
+    AnchorStore,
+    WindowPlan,
+    advance_anchor,
+    plan_window,
+    row_coord as _row_coord,
+    scope_key as _window_scope_key,
+    UNIT_MESSAGE as _UNIT_MESSAGE,
+    UNIT_ROUND as _UNIT_ROUND,
+)
 from .relation_codec import (
     AT_TOKEN_RE as _AT_TOKEN_RE,
     MEDIA_TOKEN_RE as _MEDIA_TOKEN_RE,
@@ -346,6 +356,12 @@ class ChatMemoryPlugin(Star):
         # （assistant tool_calls + role=tool），保证 LLM 跨轮看到工具返回，
         # 不重复调用工具（重复建任务、重复扣费）。0 = 不回放；负值按 0。
         self.ct_keep_tool_turns = max(0, int(ct_conf.get("keep_tool_turns", 2)))
+        # cache 友好窗口：触发裁剪时保留窗口的比例（1~100，百分比）。
+        # 100 = 关闭块对齐（逐条裁剪，等于旧行为）。块对齐失效时会记一条 WARNING，
+        # 不静默按"周期 1"跑。
+        self.ct_retain_ratio = max(1, min(100, int(ct_conf.get("retain_ratio", 80))))
+        # 窗口锚点（进程内）：scope_key -> 起点 id/seq。丢了重建，不持久化。
+        self._window_anchors = AnchorStore()
 
         # 读取 AstrBot 全局时区配置（IANA 名称如 "Asia/Shanghai"），传给 DBManager
         # 做查询输出转换：存储统一 UTC naive，返回时转此 tz naive
@@ -2512,32 +2528,107 @@ class ChatMemoryPlugin(Star):
 
         reader_v2 = self._resolve_read_source(source) == "v2"
 
+        # ── cache 友好窗口：锚点在块内固定，只有超限才前移 ──
+        # 单位随模式变：配对模式按轮、混合模式按条。锚点不存在时先取 total+1 个
+        # 单位，用它同时完成"判断是否超限"和"定位裁剪点"，不需要额外 COUNT。
+        #
+        # key 与 plan **必须按读源分别算**：V1 的坐标是旧表自增 id、V2 是会话内
+        # seq，两者值域无关。切读（v1↔v2）或 V2 读失败整段回退 V1 时，如果沿用
+        # 另一侧的锚点，窗口会错位甚至直接查空。
+        window_unit = _UNIT_ROUND if is_pair_only else _UNIT_MESSAGE
+
+        def _window_slot(use_v2: bool) -> tuple[str, WindowPlan]:
+            """按读源取（或初始化）窗口计划。"""
+            key = _window_scope_key(
+                umo=umo,
+                cid=target_cid,
+                user_id=user_id,
+                # 未启用 persona 过滤时 persona_id 不参与可见集合 → 不进 key
+                persona_id=persona_id if filter_by_persona else None,
+                cross_umo=cross_umo,
+                full_group=effective_full_group,
+                include_kinds=include_kinds if include_kinds else None,
+                statuses=status_set if status_set else None,
+                all_match=all_match,
+                unit=window_unit,
+                total=limit,
+                retain_pct=self.ct_retain_ratio,
+                source="v2" if use_v2 else "v1",
+            )
+            plan = plan_window(
+                total=limit,
+                retain_pct=self.ct_retain_ratio,
+                store=self._window_anchors,
+                key=key,
+            )
+            if not plan.enabled:
+                self._note_window_disabled(plan.reason)
+            return key, plan
+
         async def _fetch(use_v2: bool) -> list[dict]:
             """按当前模式取数；读源只影响这一层，scope/状态/白名单一字不改。"""
-            if is_pair_only:
-                # 配对模式：按 user 时间排序整轮，并保持 user/assistant 相邻。
-                # query_rounds_raw 已按 created_at ASC, id ASC 返回，无需再次排序。
-                rounds = await (self.db.query_rounds_raw_v2 if use_v2
-                                else self.db.query_rounds_raw)(
-                    umo, target_cid, user_id, limit, include_kinds, all_match,
+            window_key, window_plan = _window_slot(use_v2)
+            window_after = window_plan.anchor if window_plan.enabled else None
+            fetch_total = window_plan.fetch_limit if window_plan.enabled else limit
+
+            async def _query(after):
+                """真正的取数；``after`` 为窗口下界（None = 不限）。"""
+                if is_pair_only:
+                    # 配对模式：按 user 时间排序整轮，并保持 user/assistant 相邻。
+                    # query_rounds_raw 已按 created_at ASC, id ASC 返回，无需再排序。
+                    return await (self.db.query_rounds_raw_v2 if use_v2
+                                  else self.db.query_rounds_raw)(
+                        umo, target_cid, user_id, fetch_total, include_kinds, all_match,
+                        cross_umo=cross_umo, full_group=effective_full_group,
+                        blacklist=self._blacklist_entries(),
+                        persona_id=persona_id, filter_by_persona=filter_by_persona,
+                        skip_recalled=self.ct_recall_skip_context,
+                        after=after,
+                    )
+                # 混合模式：按消息数取，块对齐在 advance_anchor 里做（含轮首对齐）。
+                # query_messages_raw 已按全局时间线升序返回，无需再次排序。
+                return await (self.db.query_messages_raw_v2 if use_v2
+                              else self.db.query_messages_raw)(
+                    umo, target_cid, user_id, fetch_total, status_set,
+                    include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
                     blacklist=self._blacklist_entries(),
                     persona_id=persona_id, filter_by_persona=filter_by_persona,
+                    exclude_turn_id=exclude_turn_id or None,
                     skip_recalled=self.ct_recall_skip_context,
+                    after=after,
                 )
+
+            raw = await _query(window_after)
+            if window_plan.enabled and window_after is not None and not raw:
+                # 锚点失效（库按结构版本重建把 seq/id 归零、会话被删空、库被替换）：
+                # 拿它当查询下界只会一直查空。丢掉锚点重算一次，避免上下文永久为空。
+                self._window_anchors.forget(window_key)
+                window_plan.anchor = None
+                raw = await _query(None)
+
+            if is_pair_only:
+                rounds = raw
+                if window_plan.enabled and rounds:
+                    # 超限 → 裁到 low 轮；锚点天然是轮首（每轮的首条就是 user）
+                    head = _row_coord(rounds[0][0]) if rounds else 0
+                    if len(rounds) > window_plan.total:
+                        rounds = rounds[-window_plan.low:]
+                        head = _row_coord(rounds[0][0]) if rounds else 0
+                        if head:
+                            window_plan.anchor = head
+                            window_plan.advanced = True
+                            self._window_anchors.set(window_key, head)
+                    elif window_plan.anchor is None and head:
+                        window_plan.anchor = head
+                        self._window_anchors.set(window_key, head)
                 return [msg for rnd in rounds for msg in rnd]
-            # 混合模式：按消息数；overfetch 2x 给规整留余地（防先 LIMIT 后过滤导致空上下文）
-            # 规整阶段会丢头部 assistant / 尾部 solo；overfetch 后再在 normalize 截到目标条数
-            # query_messages_raw 已按全局时间线升序返回，无需再次排序。
-            return await (self.db.query_messages_raw_v2 if use_v2
-                          else self.db.query_messages_raw)(
-                umo, target_cid, user_id, limit * 2, status_set, include_kinds, all_match,
-                cross_umo=cross_umo, full_group=effective_full_group,
-                blacklist=self._blacklist_entries(),
-                persona_id=persona_id, filter_by_persona=filter_by_persona,
-                exclude_turn_id=exclude_turn_id or None,
-                skip_recalled=self.ct_recall_skip_context,
-            )
+            if window_plan.enabled:
+                raw = advance_anchor(
+                    plan=window_plan, store=self._window_anchors,
+                    key=window_key, rows=raw,
+                )
+            return raw
 
         try:
             records = await _fetch(reader_v2)
@@ -2575,6 +2666,20 @@ class ChatMemoryPlugin(Star):
                 )
             ]
         return records, ("v2" if reader_v2 else "v1")
+
+    def _note_window_disabled(self, reason: str) -> None:
+        """块对齐失效只提示一次。
+
+        失效时窗口会退化成"每条消息都移动锚点"，缓存收益归零——这和用户以为
+        "开着优化"完全相反，所以必须让人看得见，不能静默按周期 1 跑。
+        """
+        if getattr(self, "_window_disabled_noted", False):
+            return
+        self._window_disabled_noted = True
+        logger.warning(
+            f"{self._log_prefix()} 上下文块对齐已停用：{reason}；"
+            f"本次将按逐条裁剪（缓存收益归零）"
+        )
 
     @staticmethod
     def _is_event_record(record: dict) -> bool:

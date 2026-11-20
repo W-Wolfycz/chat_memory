@@ -710,6 +710,11 @@ async def mirror_record(session: AsyncSession, params: dict[str, Any]) -> bool:
             # 这条消息已经属于另一轮（push 先认领、pull 回看窗口后到）：先认领者赢，
             # 不抢归属；参与行 turn_id 等落库后改回去（见 stale_owner）。
             stale_owner = owner
+    if not str(participation.get("persona_id") or "").strip():
+        # 回显行不带 persona：不补就会在 filter_by_persona 读路径里整段消失。
+        inherited = await inherit_turn_persona(session, participation)
+        if inherited:
+            participation["persona_id"] = inherited
     await upsert_participation(session, msg_uid, participation)
     if stale_owner:
         # 一条物理消息属于先认领的那一轮：参与行的 turn_id 刚被后一次认领覆写成后一轮，
@@ -728,6 +733,45 @@ async def mirror_record(session: AsyncSession, params: dict[str, Any]) -> bool:
             },
         )
     return True
+
+
+async def inherit_turn_persona(session: AsyncSession, participation: dict) -> str:
+    """回显行没有 persona：用**同一轮**已有行补上，别等下次回填。
+
+    回显（``message_sent``）事件里不带 persona，只有发送侧记账（计划成员）和
+    user 捕获带。空着落库不会立刻出问题——直到 ``filter_by_persona=True`` 的读路径
+    把这一整段过滤掉，上下文就少了一截，而那时 ``backfill_turn_persona`` 要等
+    下次加载/日清才跑（线上实测 111 行 / 47 轮整段消失）。
+
+    查找顺序：同轮参与行 → 同轮计划成员（发送侧一定会写 persona）。
+    查不到返回空串，调用方保持原值；历史空缺仍由 ``backfill_turn_persona`` 兜。
+    """
+    turn_id = str(participation.get("turn_id") or "")
+    umo = str(participation.get("umo") or "")
+    cid = str(participation.get("conversation_id") or "")
+    if not (turn_id and umo):
+        return ""
+    params = {"turn_id": turn_id, "umo": umo, "cid": cid}
+    # cid 可能拿不到（pull 兜底路径）：那时库里存的是真实 cid，`conversation_id = ''`
+    # 匹配不上任何行 → 静默漏继承。只有这种情形才用 COALESCE 兜；cid 有值时保持
+    # 直等号，否则索引会退化成只命中 umo 一列（实测 ix_cmmb_umo_turn 用不满）。
+    cid_cond = (
+        "conversation_id = :cid" if cid else "COALESCE(conversation_id, '') = ''"
+    )
+    for table in ("chat_memory_message_bots", "chat_memory_reply_messages"):
+        result = await session.execute(
+            text(
+                f"SELECT persona_id FROM {table} "
+                "WHERE turn_id = :turn_id AND umo = :umo "
+                f"AND {cid_cond} AND COALESCE(persona_id, '') <> '' "
+                "LIMIT 1"
+            ),
+            params,
+        )
+        row = result.first()
+        if row and str(row[0] or "").strip():
+            return str(row[0]).strip()
+    return ""
 
 
 async def lookup_sender_nickname(session: AsyncSession, message: dict[str, Any]) -> str:
@@ -1076,7 +1120,7 @@ async def backfill_turn_persona(session: AsyncSession) -> int:
     回显事件（``message_sent``）里没有 persona，只能靠发送侧记账带；历史空缺按
     ``(turn_id, umo, conversation_id)`` 就地回填——同一轮的计划行一定有 persona，
     不按 persona 过滤的读路径看不出差别，过滤时会整段消失（线上 111 行 / 47 轮）。
-    加载时与每日清理各跑一次。
+    加载时与每日清理各跑一次；新写入的行已由 `inherit_turn_persona` 实时补齐。
     """
     filled = 0
     for table in ("chat_memory_message_bots", "chat_memory_reply_messages"):
