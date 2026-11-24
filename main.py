@@ -11,7 +11,7 @@
 
 - ``content_kind``：消息内容形态（JSON 数组，可多值）
   - ``'text'`` / ``'image'`` / ``'video'`` / ``'voice'`` / ``'file'``
-    / ``'emoji'`` / ``'forward'`` / ``'system_event'`` / ``'poke'``
+    / ``'emoji'`` / ``'forward'`` / ``'event'`` / ``'poke'``
   - ``[]`` 空数组 = empty（如纯 @ 无文字、纯 Reply 无文字）
   - ``'at'`` / ``'reply'`` 不入 content_kind，用独立字段 ``at_id`` / ``reply_id`` 表达
 
@@ -133,12 +133,6 @@ _PUSH_DECLARE_ROUNDS = 3
 # 回显订阅巡检：启动时立刻订一次，之后按这个间隔补齐（平台重载会重建 bot 与总线）。
 # **不依赖任何消息**——测试端没有真实消息输入时，重载插件就应当看到结果。
 _ECHO_WATCH_INTERVAL_SEC = 60
-# 切读门槛：双写必须跑满这么多天，配置的切读才生效（"配了但没到日子"＝先只写不读）。
-# 显式 source="v2" 的调用不受它限制——那是给对拍/灰度用的程序化开关，不是用户开关。
-# 同一个数也被查询台用（ui/repository.py），所以常量定义在 shared_store 里。
-_SHADOW_READ_MIN_DAYS = shared_store.SHADOW_READ_MIN_DAYS
-# 本地开关：置 True 时上面的天数不再作为条件（仅供本机验证，不进配置、不写日志）
-_DEBUG_IGNORE_CUTOVER_WINDOW = False
 # 主动查"自己在这个群里的显示名"的缓存时长：群名片改了最多 6 小时后自动跟上
 _MEMBER_NAME_TTL_SEC = 6 * 3600
 # 成员名缓存条数上限（大约 = 2000 个 (群, 人) 组合）
@@ -323,8 +317,8 @@ class ChatMemoryPlugin(Star):
         ct_status_list = list(ct_status) if ct_status else ["llm_success"]
         self.ct_llm_status_filter = ["" if s == "no_llm" else s for s in ct_status_list]
         # Kind 白名单：选中=需要；默认 ["text"]；空集合 = 不过滤（全部进入）。
-        # 配置值直接对应存储的 content_kind 细粒度取值；未知/旧值（如 1.5.x 的 media）
-        # 一律忽略——不做兼容映射，用户需重新勾选具体类型。
+        # 配置值直接对应存储的 content_kind 细粒度取值；未知取值一律忽略——
+        # 不做兼容映射，用户需重新勾选具体类型。
         # 类型守卫：配置被手改成非列表时回落到默认 ["text"]（否则会退化成"不过滤"）。
         include_raw = ct_conf.get("include_content_kinds", ["text"])
         if not isinstance(include_raw, list):
@@ -334,10 +328,6 @@ class ChatMemoryPlugin(Star):
             for value in include_raw
             if isinstance(value, str) and value in _CONTENT_KIND_OPTIONS
         }
-        # 1.5.0 前落库的事件行 kind 是旧值 `system_event`：勾了 `event` 就把旧值一起放行，
-        # 否则历史事件在上下文里被静默排除（查询台早就兼容了这个旧值）。
-        if "event" in self.ct_include_kinds:
-            self.ct_include_kinds.add("system_event")
         # 事件子类（relation_data.event.type）：空 = 不按子类过滤（全部放行）
         self.ct_event_kinds: set[str] = {
             value
@@ -372,17 +362,10 @@ class ChatMemoryPlugin(Star):
             self._tz = ZoneInfo("Asia/Shanghai")
 
         data_dir = StarTools.get_data_dir("chat_memory")
-        # 多 BOT 合并存储：**本版强制双写**（旧表照旧写 + 镜像到合并存储），没有配置开关
-        # ——切读门槛（双写满 7 天）与下一版的"单写"都依赖这段窗口连续。合并存储随本版
-        # 首次发布，不存在"关掉双写"的线上配置，所以这里没有兼容分支。
+        # 合并存储是唯一存储：写入只走 chat_memory_messages 一套表，读路径也没有
+        # 可切换的第二个读源。
         self.shared_store_shadow = True
-        # 切读（单开关）：勾上后接管上下文与公开查询 API 都读合并存储。双写没满 7 天不生效
-        # （见 _refresh_shadow_read_gate），读失败自动回退旧表（见 _read_failed）。
-        self.shadow_read = bool(config.get("shadow_read", False))
-        self._shadow_read_failures = 0
-        # 门槛状态（initialize 里按双写窗口算）：默认未就绪 = 只写不读
-        self._shadow_read_ready = False
-        self._shadow_read_window_days = -1.0
+        self._read_failures = 0
         # 自己发言的平台化：发送后拉群历史（需要 OneBot 客户端支持 get_group_msg_history）
         self.sent_capture_history = bool(config.get("sent_capture_history", False))
         # (platform_id, message_type, session_id) → conversation_id：push 回显没有
@@ -393,6 +376,8 @@ class ChatMemoryPlugin(Star):
         self._group_names = GroupNameCache()
         self._sent_history_unsupported: set[str] = set()
         self._echo_subscribe_failed: set[str] = set()
+        # 回显处理失败的异常类型（同一类型只告警一次，避免每条消息刷一行）
+        self._echo_failures_reported: set[str] = set()
         self._echo_watch_task: Optional[asyncio.Task] = None
         self._push_missing_declared = False
         self._push_subscribed_platforms: set[str] = set()
@@ -489,17 +474,13 @@ class ChatMemoryPlugin(Star):
                     self._refresh_bot_nicknames(force=True)
                 )
                 logger.info(
-                    f"{self._log_prefix()} 合并存储影子双写已启用："
-                    f"旧表照旧写入，同时镜像到 chat_memory_messages / "
-                    f"chat_memory_message_bots（本版强制双写；切读需双写满 "
-                    f"{_SHADOW_READ_MIN_DAYS} 天）"
+                    f"{self._log_prefix()} 合并存储已启用："
+                    f"chat_memory_messages / chat_memory_message_bots"
                 )
-                # 切读门槛：按双写窗口判定，并把结论写进日志（勾了但没到日子要看得出）
-                await self._refresh_shadow_read_gate()
                 # 启动期维护（撤回补标 / persona 回填 / 回显 target 纠正 / 孤儿回收）**放后台**：
                 # 它们在大库上要几十秒到几分钟（线上 415 个撤回事件实测 4 分钟），同步 await
                 # 会让插件重载一直不返回（Dashboard 升级卡在"更新中"），期间读路径还会被长事务
-                # 挡住（`database is locked` → OperationalError 回退旧表）。
+                # 挡住（`database is locked` → OperationalError）。
                 self._spawn_shadow_task(self._run_startup_maintenance())
                 stats = getattr(self.db, "shadow_stats", None) or {}
                 if stats.get("failures") or stats.get("skipped"):
@@ -665,11 +646,8 @@ class ChatMemoryPlugin(Star):
                 allow_immutable_fallback=immutable_fallback,
                 # 只有指向插件实时库时才允许恢复软删除记录（写入口）
                 writable_path=self.db.db_path,
-                # 查询台是长期存活的读者：复用只读连接，把"旧历史去重"缓存在 TEMP 表里
+                # 查询台是长期存活的读者：复用只读连接，把合并源缓存在 TEMP 表里
                 keep_open=True,
-                # 读源必须与插件一致：只看"三表齐 + 版本对 + 满 7 天"会让默认配置下
-                # 上下文读旧表、查询台已读合并存储（用户看到的两套数据不同源）。
-                shadow_read_enabled=self._ui_shadow_read_allowed(),
             )
             self.ui_web_api = ChatMemoryUiWebApi(
                 self.context,
@@ -690,14 +668,6 @@ class ChatMemoryPlugin(Star):
             logger.warning(
                 f"{self._log_prefix()} 查询台启用失败（存档功能不受影响）：{exc}"
             )
-
-    def _ui_shadow_read_allowed(self) -> bool:
-        """查询台是否允许读合并存储：**与插件上下文用同一个读源判定**。
-
-        只判"三表齐 / 版本对 / 双写满 7 天"是不够的：默认配置 ``shadow_read=false`` 时
-        上下文读旧表，而查询台会自己切到合并存储——用户看到的数据与模型记住的不是一套。
-        """
-        return self._shadow_read_source() == "v2"
 
     @staticmethod
     def _read_plugin_version() -> str:
@@ -738,7 +708,6 @@ class ChatMemoryPlugin(Star):
             # 切到别的库后 writable=False → 查询台的恢复按钮会被拒绝
             writable_path=self.db.db_path,
             keep_open=True,
-            shadow_read_enabled=self._ui_shadow_read_allowed(),
         )
         health = await candidate.health()
         stored = "" if normalized == self.db.db_path else str(normalized)
@@ -874,8 +843,6 @@ class ChatMemoryPlugin(Star):
                         media_id, ref["local"], umo, cid, turn_id, kind, name=name
                     )
                 elif ref.get("base64") is not None:
-                    import base64
-
                     data = base64.b64decode(ref["base64"])
                     await self.media_archiver.archive_bytes(
                         media_id, data, umo, cid, turn_id, kind, name=name
@@ -911,7 +878,6 @@ class ChatMemoryPlugin(Star):
             header, _, payload = uri.partition(",")
             if not payload or not header.startswith("data:"):
                 return None
-            import base64
 
             if header.endswith(";base64"):
                 return base64.b64decode(payload)
@@ -1023,8 +989,13 @@ class ChatMemoryPlugin(Star):
         if not message_id:
             return ""
         try:
-            row = await self.db.find_by_message_id(umo, message_id)
-        except Exception:
+            row = await self.db.find_by_message_id_v2(umo, message_id)
+        except Exception as exc:  # noqa: BLE001 - 查不到原文只降级摘要文案
+            # 静默返回空串会让摘要退化成纯 "[撤回消息]"：模型看不到"撤回的是谁说了什么"，
+            # 而现场一切正常。留一条 DEBUG（不带正文）供排障。
+            logger.debug(
+                f"{self._log_prefix()} 撤回原文查询失败: {type(exc).__name__}"
+            )
             return ""
         if not row:
             return ""
@@ -1049,8 +1020,13 @@ class ChatMemoryPlugin(Star):
         if bot_name:
             return bot_name
         try:
-            nickname = await self.db.latest_sender_nickname(umo, user_id)
-        except Exception:
+            nickname = await self.db.latest_sender_nickname_v2(umo, user_id)
+        except Exception as exc:  # noqa: BLE001 - 昵称查不到只退化文案
+            # 静默返回空串会让 <cm_event> 丢掉 target：「谁对谁做了什么」变成「做了什么」，
+            # 模型少一层归属信息而不报错。
+            logger.debug(
+                f"{self._log_prefix()} 事件目标昵称查询失败: {type(exc).__name__}"
+            )
             return ""
         nickname = str(nickname or "").strip()
         if not nickname or nickname.isdigit():
@@ -1065,8 +1041,11 @@ class ChatMemoryPlugin(Star):
         if not umo or not message_id:
             return ""
         try:
-            row = await self.db.find_by_message_id(umo, message_id)
-        except Exception:
+            row = await self.db.find_by_message_id_v2(umo, message_id)
+        except Exception as exc:  # noqa: BLE001 - 查不到只退化文案
+            logger.debug(
+                f"{self._log_prefix()} 表情回应目标查询失败: {type(exc).__name__}"
+            )
             return ""
         if not row:
             return ""
@@ -1594,7 +1573,7 @@ class ChatMemoryPlugin(Star):
                 if self._is_self_echo_event(event):
                     # 平台回显（post_type=message_sent）：这是"我发出的那条平台消息"的
                     # 权威事实，与其它 BOT 的观察用同一个 real_seq → 影子层自动并成同一行。
-                    # 只镜像影子表（旧表已有发送路径的 assistant 行），随后停止事件，
+                    # 只镜像这一条（发送路径已经写过计划行），随后停止事件，
                     # 避免自己的消息继续走进 LLM 阶段形成自回复循环。
                     await self._capture_self_echo(event)
                     try:
@@ -1818,7 +1797,7 @@ class ChatMemoryPlugin(Star):
         )
         if not ok:
             logger.warning(
-                f"{self._log_prefix(event)} user 写入失败（旧表与合并存储都没写进去），"
+                f"{self._log_prefix(event)} user 写入失败（合并存储没写进去），"
                 f"extras 未标记，assistant 将标 orphan"
             )
             return False
@@ -1859,7 +1838,7 @@ class ChatMemoryPlugin(Star):
         source_id = str(reply_seed.get("source_id") or "").strip()
         is_bot_reply = bool(target_user_id and self_id and target_user_id == self_id)
         if not is_bot_reply and source_id:
-            target = await self.db.resolve_user_reply_target(umo, platform_id, source_id)
+            target = await self.db.resolve_user_reply_target_v2(umo, platform_id, source_id)
             if target:
                 return {
                     "resolution": "turn",
@@ -2122,16 +2101,13 @@ class ChatMemoryPlugin(Star):
     async def _query_tool_contexts(self, umo: str, cid: str, source: str = "") -> list[dict]:
         """按当前接管配置回放 CM 库中最近 N 轮工具调用为 OpenAI 格式 contexts。
 
-        ``keep_tool_turns=0`` 时直接关闭回放（用户可显式填 0）。``source="v2"`` 时读
-        合并存储的工具表；读失败回退旧表（工具段与历史段必须同源，读源要一起切）。
+        ``keep_tool_turns=0`` 时直接关闭回放（用户可显式填 0）。
         """
         if self.ct_keep_tool_turns <= 0:
             return []
         try:
-            records = await self._read_with_switch(
-                lambda: self.db.query_tool_records_v2(umo, cid, self.ct_keep_tool_turns),
-                lambda: self.db.query_tool_records(umo, cid, self.ct_keep_tool_turns),
-                source=source,
+            records = await self.db.query_tool_records_v2(
+                umo, cid, self.ct_keep_tool_turns
             )
         except Exception as e:  # noqa: BLE001 - 工具段取不到不影响历史段
             logger.warning(
@@ -2382,86 +2358,24 @@ class ChatMemoryPlugin(Star):
             f"（名单 {len(self._blacklist_entries())} 项）"
         )
 
-    def _shadow_read_source(self) -> str:
-        """配置决定的读源：``"v2"``=合并存储，``"v1"``=旧表（默认）。
-
-        切读没勾、或双写没跑满门槛时一律 v1（启动日志会说还差几天）。
-        显式 ``source="v2"`` 不受此限制——那是程序化的对拍/灰度开关，见
-        ``_resolve_read_source``。
-        """
-        if not getattr(self, "shadow_read", False):
-            return "v1"
-        return "v2" if getattr(self, "_shadow_read_ready", False) else "v1"
-
-    def _resolve_read_source(self, source: str = "") -> str:
-        """显式 ``source`` 优先，空串跟随配置；未知值按配置处理（不会静默当 v2）。"""
-        value = str(source or "").strip().lower()
-        if value in ("v1", "v2"):
-            return value
-        return self._shadow_read_source()
-
-    async def _refresh_shadow_read_gate(self) -> None:
-        """按双写窗口判定切读是否已解锁，并把结论写进日志。
-
-        规则：双写跑满 ``_SHADOW_READ_MIN_DAYS`` 天才允许切读；没到日子时**配置照收、
-        但不生效**（仍按只写不读跑），并且必须能看见还差几天。
-        """
-        days = await self.db.dual_write_window_days()
-        self._shadow_read_window_days = float(days)
-        self._shadow_read_ready = days >= _SHADOW_READ_MIN_DAYS
-        if _DEBUG_IGNORE_CUTOVER_WINDOW:  # 仅本机验证；发布态必须为 False
-            self._shadow_read_ready = True
-        if not getattr(self, "shadow_read", False):
-            logger.debug(
-                f"{self._log_prefix()} 切读未启用（只写不读）；双写窗口 "
-                f"{days:.1f} 天，门槛 {_SHADOW_READ_MIN_DAYS} 天"
-            )
-        elif self._shadow_read_ready:
-            logger.info(
-                f"{self._log_prefix()} 切读已生效：双写窗口 {days:.1f} 天，"
-                f"接管上下文与公开查询 API 都读合并存储"
-            )
-        else:
-            remain = max(0.0, _SHADOW_READ_MIN_DAYS - max(days, 0.0))
-            shown = "尚未开始记录（本次启动写入起点）" if days < 0 else f"{days:.1f} 天"
-            logger.info(
-                f"{self._log_prefix()} 切读已启用，但双写窗口还没满："
-                f"当前 {shown}，还需约 {remain:.1f} 天；在此之前仍按只写不读运行"
-            )
-
     async def _read_failed(self, exc: BaseException) -> None:
-        """切读失败：回退旧表 + 限流告警（不能变成空上下文，也不能静默退化）。
+        """合并存储读取失败：限流告警（不能静默退化成空上下文）。
 
-        前 3 次逐次 WARNING；之后每 100 次再响一次——长期坏掉时不能永久沉到 DEBUG，
-        否则"切读看起来生效"其实每轮都在回退，再没有任何可见信号。
+        前 3 次逐次 WARNING；之后每 100 次再响一次——长期坏掉时不能永久沉到 DEBUG。
+        带上异常消息（截断）：SQLite 的 OperationalError 文案是 "database is locked"
+        / "no such column: x" 这类，不含聊天正文，只记类型会让原因无从判断。
         """
-        count = int(getattr(self, "_shadow_read_failures", 0)) + 1
-        self._shadow_read_failures = count
-        # 带上异常消息（截断）：SQLite 的 OperationalError 文案是
-        # "database is locked" / "no such column: x" 这类，不含聊天正文，
-        # 只记类型会让"为什么回退"完全无从判断（线上踩过：只看到 OperationalError）。
+        count = int(getattr(self, "_read_failures", 0)) + 1
+        self._read_failures = count
         reason = str(exc).strip().replace("\n", " ")[:160]
         detail = (
-            f"合并存储读取失败（第 {count} 次），本次已回退旧表: "
+            f"合并存储读取失败（第 {count} 次）: "
             f"{type(exc).__name__}{': ' + reason if reason else ''}"
         )
         if count <= 3 or count % 100 == 0:
             logger.warning(f"{self._log_prefix()} {detail}")
         else:
             logger.debug(f"{self._log_prefix()} {detail}")
-
-    async def _read_with_switch(self, v2_call, v1_call, source: str = ""):
-        """配置切到 v2 就先读合并存储，失败自动回退旧表；否则直接读旧表。
-
-        ``source`` 显式给 ``"v1"`` / ``"v2"`` 时覆盖配置（对拍与灰度用）。
-        """
-        if self._resolve_read_source(source) != "v2":
-            return await v1_call()
-        try:
-            return await v2_call()
-        except Exception as exc:  # noqa: BLE001 - 回退旧表，绝不把读取失败变成空结果
-            await self._read_failed(exc)
-            return await v1_call()
 
     async def _takeover_query(
         self,
@@ -2471,8 +2385,7 @@ class ChatMemoryPlugin(Star):
         persona_id: str = "",
         exclude_turn_id: str = "",
         force_current_session: bool = False,
-        source: str = "",
-    ) -> tuple[list[dict], str]:
+    ) -> list[dict]:
         """按 cross_session / full_group / 配对模式 查询 CM 数据，返回扁平化 records 列表。
 
         两种查询模式：
@@ -2489,13 +2402,7 @@ class ChatMemoryPlugin(Star):
         ``force_current_session``：忽略 ``cross_session``，只查当前 UMO + CID；用于
         ``full_group`` 下缺少 ``user_id`` 的只读公开调用，防止跨 UMO 范围失去用户约束。
 
-        ``source``：空串（默认）跟随切读开关 ``shadow_read``；``"v1"`` 读旧表、
-        ``"v2"`` 读合并存储（影子层）可显式覆盖。只换数据来源，scope / 状态 / 白名单 /
-        persona / 撤回跳过等语义完全一致——对拍与切读就是靠这条路径。
-
-        返回 ``(records, actual_source)``：``actual_source`` 是**这次真正用上的读源**。
-        ``"v2"`` 读失败会整段回退 ``"v1"``（不是只回退失败的那一步），调用方必须拿这个
-        返回值去取 Reply 目标与工具段，否则会出现"历史来自旧表、引用目标来自合并存储"。
+        合并存储是唯一读源：没有第二个读源可退——读失败直接抛给调用方。
         """
         limit = self.ct_limit_rounds
         status_set: set[str] = set(self.ct_llm_status_filter)
@@ -2526,19 +2433,16 @@ class ChatMemoryPlugin(Star):
         target_cid: Optional[str] = None if cross_read else cid
         cross_umo = cross_read
 
-        reader_v2 = self._resolve_read_source(source) == "v2"
-
         # ── cache 友好窗口：锚点在块内固定，只有超限才前移 ──
         # 单位随模式变：配对模式按轮、混合模式按条。锚点不存在时先取 total+1 个
         # 单位，用它同时完成"判断是否超限"和"定位裁剪点"，不需要额外 COUNT。
         #
-        # key 与 plan **必须按读源分别算**：V1 的坐标是旧表自增 id、V2 是会话内
-        # seq，两者值域无关。切读（v1↔v2）或 V2 读失败整段回退 V1 时，如果沿用
-        # 另一侧的锚点，窗口会错位甚至直接查空。
+        # 坐标统一是会话内 `seq`（`context_window.row_coord` 只认这个），锚点只在进程
+        # 内存里，读失败时整段重试而不沿用旧坐标。
         window_unit = _UNIT_ROUND if is_pair_only else _UNIT_MESSAGE
 
-        def _window_slot(use_v2: bool) -> tuple[str, WindowPlan]:
-            """按读源取（或初始化）窗口计划。"""
+        def _window_slot() -> tuple[str, WindowPlan]:
+            """取（或初始化）窗口计划。"""
             key = _window_scope_key(
                 umo=umo,
                 cid=target_cid,
@@ -2553,7 +2457,6 @@ class ChatMemoryPlugin(Star):
                 unit=window_unit,
                 total=limit,
                 retain_pct=self.ct_retain_ratio,
-                source="v2" if use_v2 else "v1",
             )
             plan = plan_window(
                 total=limit,
@@ -2565,9 +2468,9 @@ class ChatMemoryPlugin(Star):
                 self._note_window_disabled(plan.reason)
             return key, plan
 
-        async def _fetch(use_v2: bool) -> list[dict]:
-            """按当前模式取数；读源只影响这一层，scope/状态/白名单一字不改。"""
-            window_key, window_plan = _window_slot(use_v2)
+        async def _fetch() -> list[dict]:
+            """按当前模式取数；scope/状态/白名单都在这一层决定。"""
+            window_key, window_plan = _window_slot()
             window_after = window_plan.anchor if window_plan.enabled else None
             fetch_total = window_plan.fetch_limit if window_plan.enabled else limit
 
@@ -2576,8 +2479,7 @@ class ChatMemoryPlugin(Star):
                 if is_pair_only:
                     # 配对模式：按 user 时间排序整轮，并保持 user/assistant 相邻。
                     # query_rounds_raw 已按 created_at ASC, id ASC 返回，无需再排序。
-                    return await (self.db.query_rounds_raw_v2 if use_v2
-                                  else self.db.query_rounds_raw)(
+                    return await self.db.query_rounds_raw_v2(
                         umo, target_cid, user_id, fetch_total, include_kinds, all_match,
                         cross_umo=cross_umo, full_group=effective_full_group,
                         blacklist=self._blacklist_entries(),
@@ -2587,8 +2489,7 @@ class ChatMemoryPlugin(Star):
                     )
                 # 混合模式：按消息数取，块对齐在 advance_anchor 里做（含轮首对齐）。
                 # query_messages_raw 已按全局时间线升序返回，无需再次排序。
-                return await (self.db.query_messages_raw_v2 if use_v2
-                              else self.db.query_messages_raw)(
+                return await self.db.query_messages_raw_v2(
                     umo, target_cid, user_id, fetch_total, status_set,
                     include_kinds, all_match,
                     cross_umo=cross_umo, full_group=effective_full_group,
@@ -2631,17 +2532,10 @@ class ChatMemoryPlugin(Star):
             return raw
 
         try:
-            records = await _fetch(reader_v2)
-        except Exception as exc:
-            if not reader_v2:
-                logger.warning(
-                    f"{self._log_prefix()} 接管查询失败: {type(exc).__name__}"
-                )
-                raise
-            # 切读失败**绝不能**变成空上下文：整段回退旧表，并把这件事留痕（告警计数）
+            records = await _fetch()
+        except Exception as exc:  # noqa: BLE001 - 记一次可见告警后向上抛
             await self._read_failed(exc)
-            records = await _fetch(False)
-            reader_v2 = False
+            raise
 
         # 事件子类过滤：kind 白名单只能到 event，子类（ban/member/…）
         # 记录在 relation_data.event.type，查询后过滤。
@@ -2665,7 +2559,7 @@ class ChatMemoryPlugin(Star):
                     and self._event_type_of(record) == "recall"
                 )
             ]
-        return records, ("v2" if reader_v2 else "v1")
+        return records
 
     def _note_window_disabled(self, reason: str) -> None:
         """块对齐失效只提示一次。
@@ -2684,7 +2578,7 @@ class ChatMemoryPlugin(Star):
     @staticmethod
     def _is_event_record(record: dict) -> bool:
         kinds = record.get("content_kind") or []
-        return "event" in kinds or "system_event" in kinds
+        return _K_SYSTEM in kinds
 
     @staticmethod
     def _event_type_of(record: dict) -> str:
@@ -2784,7 +2678,8 @@ class ChatMemoryPlugin(Star):
 
         内置功能经 extra_user_content_parts 以纯文本格式额外注入群聊历史，
         与 CM 接管注入的 <cm_*> 结构化历史重复且格式冲突。仅群聊事件检测；
-        始终启用（不可配置），配置读取失败静默，不干扰主流程。
+        始终启用（不可配置）。配置读不到时记 DEBUG 后放弃本轮——静默返回会让
+        "重复上下文"这件事既没提示也没痕迹。
         """
         if self._builtin_ltm_warned:
             return
@@ -2796,7 +2691,11 @@ class ChatMemoryPlugin(Star):
                 "provider_ltm_settings"
             ) or {}
             group_icl_enable = bool(settings.get("group_icl_enable", False))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - 读配置失败不该影响主流程
+            logger.debug(
+                f"{self._log_prefix(event)} 内置群聊上下文开关读取失败"
+                f"（{type(exc).__name__}），本轮跳过共存检测"
+            )
             return
         if not group_icl_enable:
             return
@@ -2956,7 +2855,7 @@ class ChatMemoryPlugin(Star):
         if not ok:
             logger.warning(
                 f"{self._log_prefix(event)} assistant prepared 写入失败"
-                f"（旧表与合并存储都没写进去），turn={turn_id}"
+                f"（合并存储没写进去），turn={turn_id}"
             )
         self._note_active_turn(
             turn_id=str(turn_id), cid=str(cid), persona_id=persona_id or "",
@@ -2985,10 +2884,10 @@ class ChatMemoryPlugin(Star):
         if not cid:
             return
         await self._safe_update_send_status(umo, cid, turn_id, _SEND_ATTEMPTED)
-        # 这一轮如果影子层没有任何 assistant 实发行（被禁言/平台拒收/结果被别的插件清空），
-        # 就把计划成员标成"已尝试发送"——判据必须用**影子侧参与行**，不能用上面那条旧表
-        # UPDATE 的 rowcount：有计划成员就必定有发送前的 prepared 行，rowcount 恒 ≥1，
-        # 用它会永远进不了这个分支（这样 `<cm_unsent/>` 就成了一条不可达的死逻辑）。
+        # 这一轮如果没有任何 assistant 实发行（被禁言/平台拒收/结果被别的插件清空），
+        # 就把计划成员标成"已尝试发送"——判据必须是**参与行里有没有实发行**，不能用
+        # 上面那条 UPDATE 的 rowcount：有计划成员就必定有发送前的 prepared 行，
+        # rowcount 恒 ≥1，用它会永远进不了这个分支（`<cm_unsent/>` 成不可达死逻辑）。
         try:
             await self.db.mark_plan_send_attempted(umo, cid, turn_id)
         except Exception as exc:  # noqa: BLE001 - 记账失败不影响发送流程
@@ -3025,7 +2924,7 @@ class ChatMemoryPlugin(Star):
         persona 也要记：回显事件（`message_sent`）本身没有 persona，只能在发送侧记账时
         带过来——不然回显写进去的那一段在按 persona 过滤的读路径里会整段消失（线上 111 行）。
         ``target_id`` 是**被回复的那个人**：回显事件里只有发送者（＝BOT 自己），把它当
-        target 会让这一段落不进"当前用户"的读范围（切读后只剩计划全文）。
+        target 会让这一段落不进"当前用户"的读范围（只剩计划全文）。
         """
         if not (turn_id and cid):
             return
@@ -3157,14 +3056,30 @@ class ChatMemoryPlugin(Star):
             logger.debug(f"{self._log_prefix()} 群名落库失败: {type(exc).__name__}")
 
     def _spawn_shadow_task(self, coro) -> None:
-        """后台影子写入（状态登记/拉取）：统一登记便于 terminate 取消。"""
+        """后台维护/写入任务：统一登记便于 terminate 取消。"""
         try:
             task = asyncio.create_task(coro)
         except RuntimeError:      # 没有运行中的事件循环：放弃这次登记，绝不外抛
             coro.close()
             return
         self._shadow_tasks.add(task)
-        task.add_done_callback(self._shadow_tasks.discard)
+        task.add_done_callback(self._shadow_task_done)
+
+    def _shadow_task_done(self, task: asyncio.Task) -> None:
+        """登记表清理 + 把后台任务的异常记下来。
+
+        只 discard 会让异常彻底消失（asyncio 只在垃圾回收时打一句"exception was never
+        retrieved"，连是哪个任务都看不出来）。这里统一记类型与任务名，正文不进日志。
+        """
+        self._shadow_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                f"{self._log_prefix()} 后台任务失败（{type(exc).__name__}）："
+                f"{task.get_name()}"
+            )
 
     async def _echo_subscribe_loop(self) -> None:
         """回显订阅巡检：启动立刻订一次，之后周期补齐（平台重载会换 bot 对象）。
@@ -3385,9 +3300,16 @@ class ChatMemoryPlugin(Star):
             try:
                 await self._capture_push_echo(platform_id, raw)
             except Exception as exc:  # noqa: BLE001 - 回显失败不得影响平台连接
-                logger.debug(
-                    f"{self._log_prefix()} 推送回显处理失败: {type(exc).__name__}"
-                )
+                # 不能吞得无声：这条通道断了会表现为"push 回显一直收不到"，
+                # 库里的自发言只在发送路径的计划行里、origin=echo 零行，而日志一片
+                # 安静。同一失败原因只报一次（每条消息刷一条 WARNING 会把日志淹掉）。
+                key = type(exc).__name__
+                if key not in self._echo_failures_reported:
+                    self._echo_failures_reported.add(key)
+                    logger.warning(
+                        f"{self._log_prefix()} 推送回显处理失败（此后同类不再重复"
+                        f"告警）: {key}；回显通道可能已失效，自发言的实发形态将缺失"
+                    )
 
         handler._chat_memory_echo_handler = True   # noqa: SLF001 - 总线上认领自身订阅
         # 归属标记：重载后旧实例的 bound method 仍挂在总线上（还被总线强引用着），
@@ -3602,15 +3524,24 @@ class ChatMemoryPlugin(Star):
         return ok
 
     def _platform_name_of(self, platform_id: str) -> str:
-        """平台类型名（影子表用）：从平台实例的 meta 取，取不到回落 aiocqhttp。"""
+        """平台类型名（合并存储用）：从平台实例的 meta 取，取不到回落 aiocqhttp。
+
+        兜底值本身要留痕：`platform_name` 参与物理消息指纹，取错会让同一条消息在
+        跨平台/跨实例写入时算成两行（页面偶尔重复），而这种现象只在数据里看得出来。
+        """
         try:
             inst = self.context.get_platform_inst(platform_id)
             meta = inst.meta() if inst is not None else None
             name = getattr(meta, "name", "") if meta is not None else ""
             if name:
                 return str(name)
-        except Exception:  # noqa: BLE001 - 元信息拿不到不影响落库
-            pass
+            reason = "meta 为空"
+        except Exception as exc:  # noqa: BLE001 - 元信息拿不到不影响落库
+            reason = type(exc).__name__
+        logger.debug(
+            f"{self._log_prefix()} 平台类型名取不到（{reason}），"
+            f"按 aiocqhttp 落库 platform={platform_id}"
+        )
         return "aiocqhttp"
 
     # ── 自己发言的平台化（pull：发送后拉群历史）──────
@@ -3835,7 +3766,7 @@ class ChatMemoryPlugin(Star):
           （典型：平台重连后补发的旧系统通知），不是没删掉。
         """
         try:
-            rows = await self.db.count_records_in_conversation(umo, cid)
+            rows = await self.db.count_records_in_conversation_v2(umo, cid)
         except Exception as exc:
             logger.debug(
                 f"{self._log_prefix(event)} /reset 残留自检失败: {type(exc).__name__}"
@@ -3865,7 +3796,7 @@ class ChatMemoryPlugin(Star):
         （/new 之前的会话、或 Dashboard 删会话留下的）还是真的没删掉。
         """
         try:
-            rows = await self.db.count_records_by_conversation(umo, exclude_cid=cid)
+            rows = await self.db.count_records_by_conversation_v2(umo, exclude_cid=cid)
         except Exception as exc:
             logger.debug(
                 f"{self._log_prefix(event)} 残留检查失败: {type(exc).__name__}"
@@ -3914,21 +3845,12 @@ class ChatMemoryPlugin(Star):
         ``from_oldest=True`` 时从最旧记录开始截取；返回顺序始终为时间正序。
         ``skip_recalled=True``：跳过被撤回的消息（默认 False，行为与旧版一致）。
         """
-        return await self._read_with_switch(
-            lambda: self.db.query_latest_v2(
-                umo, conversation_id, user_id, limit, llm_status, content_kind,
-                role_filter, persona_id=persona_id, since=since, until=until,
-                from_oldest=from_oldest, after_id=after_id,
-                content_kind_all_match=content_kind_all_match,
-                skip_recalled=skip_recalled,
-            ),
-            lambda: self.db.query_latest(
-                umo, conversation_id, user_id, limit, llm_status, content_kind,
-                role_filter, persona_id=persona_id, since=since, until=until,
-                from_oldest=from_oldest, after_id=after_id,
-                content_kind_all_match=content_kind_all_match,
-                skip_recalled=skip_recalled,
-            ),
+        return await self.db.query_latest_v2(
+            umo, conversation_id, user_id, limit, llm_status, content_kind,
+            role_filter, persona_id=persona_id, since=since, until=until,
+            from_oldest=from_oldest, after_id=after_id,
+            content_kind_all_match=content_kind_all_match,
+            skip_recalled=skip_recalled,
         )
 
     async def query_rounds(
@@ -3957,21 +3879,12 @@ class ChatMemoryPlugin(Star):
         ``from_oldest=True`` 时从最旧完整轮次开始截取；返回顺序始终为时间正序。
         ``skip_recalled=True``：跳过被撤回的 user（该轮不再返回）。
         """
-        return await self._read_with_switch(
-            lambda: self.db.query_rounds_v2(
-                umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
-                persona_id=persona_id, since=since, until=until,
-                from_oldest=from_oldest, after_id=after_id,
-                content_kind_all_match=content_kind_all_match,
-                skip_recalled=skip_recalled,
-            ),
-            lambda: self.db.query_rounds(
-                umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
-                persona_id=persona_id, since=since, until=until,
-                from_oldest=from_oldest, after_id=after_id,
-                content_kind_all_match=content_kind_all_match,
-                skip_recalled=skip_recalled,
-            ),
+        return await self.db.query_rounds_v2(
+            umo, conversation_id, user_id, limit_rounds, llm_status, content_kind,
+            persona_id=persona_id, since=since, until=until,
+            from_oldest=from_oldest, after_id=after_id,
+            content_kind_all_match=content_kind_all_match,
+            skip_recalled=skip_recalled,
         )
 
     async def build_takeover_contexts(
@@ -3981,7 +3894,6 @@ class ChatMemoryPlugin(Star):
         conversation_id: Optional[str] = None,
         persona_id: str = "",
         exclude_turn_id: str = "",
-        source: str = "",
     ) -> Optional[list[dict]]:
         """只读构建与当前 context takeover 完全一致的 LLM ``contexts``。
 
@@ -4000,9 +3912,6 @@ class ChatMemoryPlugin(Star):
         ``cross_session`` 也强制降级为当前 UMO + CID 的整群范围，避免空用户条件扩大到
         整个平台。
 
-        ``source``：空串（默认）跟随切读开关 ``shadow_read``；也可显式传
-        ``"v1"`` / ``"v2"`` 覆盖。``"v2"`` 从合并存储（影子层）读取，其余语义完全相同；
-        对拍与灰度就靠它（``build_takeover_contexts_v2`` 是同一个入口的等价写法）。
         """
         if not self.ct_enable:
             return None
@@ -4018,24 +3927,10 @@ class ChatMemoryPlugin(Star):
         if not cid:
             return []
 
-        requested = self._resolve_read_source(source)
-        try:
-            return await self._build_contexts_once(
-                umo=umo, user_id=user_id, cid=cid, persona_id=persona_id,
-                exclude_turn_id=exclude_turn_id, requested_source=requested,
-            )
-        except Exception as exc:  # noqa: BLE001 - 切读失败按整次请求回滚
-            if requested != "v2":
-                logger.warning(
-                    f"{self._log_prefix()} 接管读取失败（旧表）: {type(exc).__name__}"
-                )
-                raise
-            # 切读失败：**这次请求整段回滚旧表**（历史 / Reply 目标 / 工具段同一个读源）
-            await self._read_failed(exc)
-            return await self._build_contexts_once(
-                umo=umo, user_id=user_id, cid=cid, persona_id=persona_id,
-                exclude_turn_id=exclude_turn_id, requested_source="v1",
-            )
+        return await self._build_contexts_once(
+            umo=umo, user_id=user_id, cid=cid, persona_id=persona_id,
+            exclude_turn_id=exclude_turn_id,
+        )
 
     async def _build_contexts_once(
         self,
@@ -4045,18 +3940,16 @@ class ChatMemoryPlugin(Star):
         cid: str,
         persona_id: str,
         exclude_turn_id: str,
-        requested_source: str,
     ) -> list[dict]:
-        """按**单一读源**把一次请求的 contexts 拼完（历史 / 引用目标 / 工具段同源）。"""
+        """把一次请求的 contexts 拼完（历史 / 引用目标 / 工具段同源）。"""
         effective_full_group = self.ct_full_group and self._is_group_umo(umo)
-        records, read_source = await self._takeover_query(
+        records = await self._takeover_query(
             umo,
             cid,
             user_id,
             persona_id,
             exclude_turn_id=exclude_turn_id,
             force_current_session=not bool(user_id),
-            source=requested_source,
         )
         if not records:
             # 工具段必须跟随实际调用轮：CM 无历史即没有轮次可跟随，
@@ -4075,10 +3968,9 @@ class ChatMemoryPlugin(Star):
 
         target_map: dict[tuple[str, str], dict] = {}
         for source_umo, target_ids in target_ids_by_umo.items():
-            # 读源必须与历史一致；同源失败就让它抛出去由上层整段回滚，不在这里吞掉
+            # 失败就让它抛出去，由上层整段失败，不在这里吞掉
             target_map.update(
-                await (self.db.query_turn_targets_v2 if read_source == "v2"
-                       else self.db.query_turn_targets)(source_umo, target_ids)
+                await self.db.query_turn_targets_v2(source_umo, target_ids)
             )
 
         mixed_mode = set(self.ct_llm_status_filter) != {_LLM_SUCCESS}
@@ -4104,7 +3996,7 @@ class ChatMemoryPlugin(Star):
         # 原生历史顺序一致；**该轮不在当前历史里时整段丢弃**（见 _insert_tool_contexts：
         # 不存在的轮次不配拥有工具上下文，也绝不贴到别处）。工具段属于当前 umo + cid，
         # 不参与 cross_session / full_group 扩大范围，也不进入 user/assistant 配对。
-        tool_contexts = await self._query_tool_contexts(umo, cid, source=read_source)
+        tool_contexts = await self._query_tool_contexts(umo, cid)
         if tool_contexts:
             result = self._insert_tool_contexts(result, tool_contexts)
         else:
@@ -4129,13 +4021,12 @@ class ChatMemoryPlugin(Star):
         content_kind_all_match: bool = False,
         skip_recalled: bool = False,
     ) -> list[dict]:
-        """``query_history`` 的 V2：同样参数与语义，数据来自合并存储（影子层）。
+        """``query_history`` 的显式合并存储版本：参数与语义同上。
 
-        勾上切读（``shadow_read``）后，V1 入口内部也会改读这一层。
-        V1 与 V2 并存是为了切读期对拍与回退；两者返回的 dict 同形，V2 额外带
-        ``msg_uid`` / ``platform_seq`` / ``segments`` 等影子层字段。
-        ``record_id`` 与 ``after_id`` 用影子层的**会话内序号**（V1 是旧表行号）。
-        合并存储未启用时抛 ``RuntimeError``（不假装没数据）。
+        与 ``query_history`` 是同一个读源、同一份实现，保留独立名字是为了让调用方
+        在语义上明确"我要合并存储的那套字段（``msg_uid`` / ``platform_seq`` /
+        ``segments``）"。``record_id`` 与 ``after_id`` 用**会话内序号**。
+        库中读不到合并存储时抛 ``RuntimeError``（不假装没数据）。
         """
         return await self.db.query_latest_v2(
             umo, conversation_id, user_id, limit, llm_status, content_kind, role_filter,
@@ -4161,7 +4052,7 @@ class ChatMemoryPlugin(Star):
         content_kind_all_match: bool = False,
         skip_recalled: bool = False,
     ) -> list[list[dict]]:
-        """``query_rounds`` 的 V2：每轮 ``[user, assistant]``。
+        """``query_rounds`` 的显式合并存储版本：每轮 ``[user, assistant]``。
 
         assistant 侧是**合并后的一轮回复**：该轮实际发出的段按平台号（``platform_seq``）
         顺序拼接（群里看到的样子），该轮没有任何实际形态时才回落到计划全文行。
@@ -4175,27 +4066,13 @@ class ChatMemoryPlugin(Star):
             skip_recalled=skip_recalled,
         )
 
-    async def build_takeover_contexts_v2(
-        self,
-        umo: str,
-        user_id: str,
-        conversation_id: Optional[str] = None,
-        persona_id: str = "",
-        exclude_turn_id: str = "",
-    ) -> Optional[list[dict]]:
-        """``build_takeover_contexts`` 的 V2：同一套规整/预算逻辑，改从合并存储取数。"""
-        return await self.build_takeover_contexts(
-            umo, user_id, conversation_id, persona_id, exclude_turn_id, source="v2"
-        )
-
     async def get_shared_store_status(self) -> dict:
-        """合并存储的只读状态：读源、结构版本、双写起点、切读门槛结论。
+        """合并存储的只读状态：结构版本与起点时间。
 
-        给外部消费者（长期记忆、画像等）做游标分区用：读源切换或影子层按版本重建时，
-        它们应当形成新分区（既不重复消费同一段历史，也不静默跳过）。此前只能靠
-        ``getattr`` 探测私有属性，拿不到结构版本。
+        给外部消费者（长期记忆、画像等）做游标分区用：结构按新版本重建时它们应当形成
+        新分区（既不重复消费同一段历史，也不静默跳过）。
 
-        读不到的部分给默认值，**不外抛**——这是状态查询，不该让调用方因缺元信息而失败。
+        读不到的部分给默认值，**不外抛**——这是状态查询，不该让调用方因此失败。
         """
         meta = await self.db.shadow_meta()
         try:
@@ -4203,14 +4080,9 @@ class ChatMemoryPlugin(Star):
         except (TypeError, ValueError):
             schema_version = 0
         return {
-            "source": self._shadow_read_source(),
             "schema_version": schema_version,
             "expected_schema_version": int(shared_store.SHADOW_SCHEMA_VERSION),
             "dual_write_started_at": (meta.get("dual_write_started_at") or None),
-            "shadow_read_ready": bool(getattr(self, "_shadow_read_ready", False)),
-            "shadow_read_enabled": bool(getattr(self, "shadow_read", False)),
-            "shadow_enabled": bool(getattr(self, "shared_store_shadow", False)),
-            "window_days": float(getattr(self, "_shadow_read_window_days", -1.0)),
         }
 
     def count_unrendered_tokens(self, text: str) -> dict[str, int]:
@@ -4250,8 +4122,8 @@ class ChatMemoryPlugin(Star):
         shadow_only: bool = False,
     ) -> bool:
         try:
-            # 返回值＝旧表是否真的插入了行：INSERT OR IGNORE 命中唯一键时是空操作，
-            # 静默当成功会让"这一轮其实没写进去"完全看不见（assistant 还会升级状态）。
+            # 返回值＝这条记录是否真的写进了合并存储：写失败却当成功会让"这一轮其实
+            # 没写进去"完全看不见（assistant 还会升级状态）。
             inserted = await self.db.insert(
                 umo, cid, user_id, role, content, message_id, pair_id,
                 llm_status=llm_status, content_kind=content_kind,
@@ -4279,9 +4151,9 @@ class ChatMemoryPlugin(Star):
     async def _safe_insert_shadow_only(
         self, umo: str, cid: str, user_id: str, role: str, content: str, **kwargs
     ) -> bool:
-        """影子专用写入（不碰旧表）：供平台回显与实际逐条发送使用。
+        """只写这一条（不额外写计划行）：供平台回显与实际逐条发送使用。
 
-        返回影子行是否**真的**落库：归一被判数据不足（如缺接收时刻）时 insert 返回假，
+        返回这条是否**真的**落库：归一被判数据不足（如缺接收时刻）时 insert 返回假，
         这里必须原样上报，否则调用方会把"跳过"记成成功（线上回显曾如此静默丢整条通道）。
         """
         kwargs.setdefault("post_type", "message_sent")

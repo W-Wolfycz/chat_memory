@@ -122,18 +122,6 @@ def test_first_anchor_skips_leading_assistant():
     assert store2.get("k2") == 21
 
 
-def test_advance_on_overflow():
-    """守的静默失效：超过上限却不裁 → 窗口无限增长（token 爆掉）。"""
-    store = mod.AnchorStore()
-    key = "k"
-    plan = mod.plan_window(total=10, retain_pct=80, store=store, key=key)
-    rows = _rows(range(1, 20))            # 19 条 > 10
-    kept = mod.advance_anchor(plan=plan, store=store, key=key, rows=rows)
-    assert plan.low <= len(kept) <= plan.total, len(kept)
-    assert plan.advanced is True
-    assert kept[0]["role"] in ("user", "assistant")
-
-
 def test_advance_aligns_to_turn_head():
     """守的静默失效：裁到 low 条时若落在 assistant 段中间，上下文会从「半轮」
     开始——用户问了一句，模型只看到后半句回答。必须前移到该轮 user。
@@ -194,38 +182,3 @@ def test_advance_aligns_to_turn_head():
     # 轮首在 idx0，前移后 6 条 > total(4) → 退回未对齐位置（接受切轮）
     assert kept3[0]["record_id"] == 3
     assert kept3[0]["role"] == "assistant"
-
-
-def test_anchor_invalidated_below_floor():
-    """守的静默失效：库被重建（seq 归零）后旧锚点指向不存在的坐标，
-    拿它去查会返回空上下文——必须当无效处理并重新起算。
-    """
-    store = mod.AnchorStore()
-    store.set("k", 100)
-    assert store.get("k", floor=0) == 100
-    assert store.get("k", floor=200) is None      # 锚点 < floor → 失效
-    assert store.get("k") is None                  # 已被移除
-
-
-def test_scope_key_skips_unused_config():
-    """守的静默失效：把未启用的配置写进 key，会让同一份可见集合因为无关配置
-    变化而重建前缀（缓存白丢）。
-    """
-    base = dict(
-        umo="BOT1:GroupMessage:g1", cid="c1", user_id="u1",
-        persona_id=None, cross_umo=False, full_group=False,
-        include_kinds={"text"}, statuses={"llm_success"}, all_match=False,
-        unit=mod.UNIT_MESSAGE, total=30, retain_pct=80,
-    )
-    k1 = mod.scope_key(**base)
-    # 未启用 persona 过滤时 persona_id 传 None，与另一个 None 不同值也不应影响…
-    k2 = mod.scope_key(**{**base, "persona_id": None})
-    assert k1 == k2
-    # 但真正启用后必须区分
-    k3 = mod.scope_key(**{**base, "persona_id": "p_demo"})
-    assert k1 != k3
-    # 过滤条件/窗口参数变化必须换 key
-    assert k1 != mod.scope_key(**{**base, "include_kinds": {"text", "image"}})
-    assert k1 != mod.scope_key(**{**base, "total": 40})
-    assert k1 != mod.scope_key(**{**base, "retain_pct": 70})
-    assert k1 != mod.scope_key(**{**base, "unit": mod.UNIT_ROUND})

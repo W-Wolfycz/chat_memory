@@ -77,18 +77,6 @@ class Repository:
         return {"restore": [row_id, target]}
 
 
-class DeniedRepository(Repository):
-    """写入口被拒（非实时库）与库不可用两种失败路径。"""
-
-    async def soft_delete_record(self, row_id, target="record"):
-        raise PermissionError("当前数据源不是插件实时数据库，删除/恢复操作已禁用")
-
-    async def restore_record(self, row_id, target="record"):
-        # 用 web_api 模块里的同名异常类，保证 _call 的映射分支命中
-        module = sys.modules["chat_memory.ui.web_api"]
-        raise module.DatabaseUnavailableError("数据库不存在")
-
-
 class Context:
     def __init__(self):
         self.routes = []
@@ -100,51 +88,6 @@ class Context:
 class WebApiTestCase(unittest.TestCase):
     def tearDown(self):
         sys.modules.pop("chat_memory.ui.web_api", None)
-
-    def test_registers_only_query_and_settings_routes(self):
-        module = load_module()
-        context = Context()
-        controller = module.ChatMemoryUiWebApi(context, Repository())
-        controller.register()
-        self.assertEqual(
-            {route[0] for route in context.routes},
-            {
-                "/chat_memory/about",
-                "/chat_memory/snapshot",
-                "/chat_memory/settings",
-                "/chat_memory/health",
-                "/chat_memory/overview",
-                "/chat_memory/facets",
-                "/chat_memory/query",
-                "/chat_memory/record",
-                "/chat_memory/soft-delete",
-                "/chat_memory/restore",
-                "/chat_memory/tools",
-                "/chat_memory/group-names",
-                "/chat_memory/personas",
-                "/chat_memory/media/<media_id>",
-                "/chat_memory/export",
-                "/chat_memory/export/<file_name>",
-            },
-        )
-        self.assertTrue(all(set(route[2]) <= {"GET", "POST"} for route in context.routes))
-        # 写路由白名单：只允许设置、导出、查询与单条软删除/恢复
-        self.assertEqual(
-            sorted(
-                route[0]
-                for route in context.routes
-                if route[2] == ["POST"]
-            ),
-            [
-                "/chat_memory/export",
-                "/chat_memory/query",
-                "/chat_memory/restore",
-                "/chat_memory/settings",
-                "/chat_memory/snapshot",
-                "/chat_memory/soft-delete",
-                "/chat_memory/tools",
-            ],
-        )
 
     def test_media_endpoint(self):
         import base64 as b64

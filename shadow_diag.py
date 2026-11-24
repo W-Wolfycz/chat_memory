@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,7 +42,7 @@ _TABLES = (
 )
 
 _INDEXES = (
-    # 按会话查计划行的索引。**唯一性**由主键 ``(umo, turn_id)`` 保证（一轮一条计划）；
+    # 按会话查计划行的索引。**唯一性**由主键 ``turn_id`` 保证（一轮一条计划）；
     # 这张表没有 msg_uid 列，也不再有任何"一条消息只属于一轮"的约束——那条不变量由
     # ``chat_memory_message_bots`` 的 assistant 行 turn_id 表达（应用层保证，先到者赢）。
     "CREATE INDEX IF NOT EXISTS ix_cmrm_cid "

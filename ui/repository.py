@@ -1,4 +1,4 @@
-"""Read-only SQLite access for ChatMemory (legacy user_version 8 / merged store v4).
+"""Read-only SQLite access for ChatMemory (merged store, schema 6).
 
 The repository intentionally avoids AstrBot/core internals; the only cross-module
 imports are pure-stdlib siblings shipped in the same plugin — ``..relation_codec``
@@ -21,67 +21,22 @@ from typing import Any, Callable, TypeVar
 from zoneinfo import ZoneInfo
 
 from ..relation_codec import build_event_sentence
-from ..shared_store import SHADOW_READ_MIN_DAYS
 from ..qq_face import face_name
 
+try:
+    from astrbot.api import logger
+except ImportError:          # 单测环境不装 astrbot
+    import logging
 
-TABLE_NAME = "chat_memory_records"
-TOOL_TABLE_NAME = "chat_memory_tool_records"
+    logger = logging.getLogger("chat_memory.ui")
+
+
+TOOL_TABLE_NAME = "chat_memory_tool_calls"
 MEDIA_ARCHIVE_TABLE_NAME = "chat_memory_media_archive"
-# 合并存储（影子层）表：软删除要一起写过去，否则切读之后"删掉的记录"会重新出现
+# 合并存储表：唯一读源，软删除也写在这里
 SHADOW_MESSAGE_TABLE = "chat_memory_messages"
-SHADOW_TOOL_TABLE = "chat_memory_tool_calls"
 # 轮次成员表：计划成员行（没有物理消息）只能标在这里
 SHADOW_REPLY_TABLE = "chat_memory_reply_messages"
-REQUIRED_COLUMNS = {
-    "id",
-    "umo",
-    "conversation_id",
-    "user_id",
-    "role",
-    "content",
-    "llm_status",
-    "content_kind",
-    "created_at",
-}
-VALID_ROLES = {"user", "assistant"}
-# 软删除筛选三态：all=全部 / visible=未删除（默认） / deleted=仅已删除
-VALID_DELETED_STATES = {"all", "visible", "deleted"}
-VALID_STATUSES = {"", "llm_pending", "llm_success", "proactive", "orphan"}
-VALID_KINDS = {
-    "text",
-    "image",
-    "video",
-    "voice",
-    "file",
-    "emoji",
-    "forward",
-    "event",
-    # 1.5.0 前落库的旧 kind 值：仅兼容筛选，新数据不再写入
-    "system_event",
-    # poke 既是旧值，也是当前值（消息链里带 Poke 组件时 content_kind 就是 ["poke"]）
-    "poke",
-}
-
-# 事件子类（event.type）——查询台「事件子类」过滤的合法值
-VALID_EVENT_TYPES = {
-    "ban",
-    "member",
-    "title",
-    "recall",
-    "resource",
-    "poke",
-    "reaction",
-    "system",
-}
-AT_TOKEN_RE = re.compile(r"⟦CM_AT:(\d+)⟧")
-# 与 chat_memory.relation_codec 对称：用户正文 ⟦/⟧ 的哨兵字符，展示侧还原
-_SENTINEL_LEFT = "⦑"
-_SENTINEL_RIGHT = "⦒"
-# 媒体/动作位置 token(relation v1 新增 media 数组),UI 渲染为可读占位
-MEDIA_TOKEN_RE = re.compile(
-    r"⟦CM_(?:IMAGE|VIDEO|VOICE|FILE|EMOJI|FORWARD|POKE):(\d+)⟧"
-)
 # 展示占位符用 ⟦⟧：[] 可能是用户原文（如真的输入"[图片]"），⟦⟧ 用户几乎不会打
 MEDIA_KIND_LABELS = {
     "image": "⟦图片⟧",
@@ -101,15 +56,33 @@ POKE_TYPE_LABELS = {
 }
 # 参与归档的 kind：media 条目 id 为 32 位 hex 归档 id；其余 kind 的 id 语义不同
 _ARCHIVE_KIND_SET = {"image", "video", "voice", "file"}
+VALID_ROLES = {"user", "assistant"}
+# 软删除筛选三态：all=全部 / visible=未删除（默认） / deleted=仅已删除
+VALID_DELETED_STATES = {"all", "visible", "deleted"}
+VALID_STATUSES = {"", "llm_pending", "llm_success", "proactive", "orphan"}
+VALID_KINDS = {
+    "text", "image", "video", "voice", "file", "emoji", "forward", "event",
+    # poke 既是旧值也是当前值（消息链里带 Poke 组件时 content_kind 就是 ["poke"]）
+    "poke",
+}
+
+# 事件子类（event.type）——查询台「事件子类」过滤的合法值
+VALID_EVENT_TYPES = {
+    "ban", "member", "title", "recall", "resource", "poke", "reaction", "system",
+}
+AT_TOKEN_RE = re.compile(r"⟦CM_AT:(\d+)⟧")
+# 与 chat_memory.relation_codec 对称：用户正文 ⟦/⟧ 的哨兵字符，展示侧还原
+_SENTINEL_LEFT = "⦑"
+_SENTINEL_RIGHT = "⦒"
+# 媒体/动作位置 token（relation v1 新增 media 数组），UI 渲染为可读占位
+MEDIA_TOKEN_RE = re.compile(
+    r"⟦CM_(?:IMAGE|VIDEO|VOICE|FILE|EMOJI|FORWARD|POKE):(\d+)⟧"
+)
 _HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
 
-# 合并存储（schema 2）→ 旧表列的只读投影：**一条物理消息一行**（多实例共享同一条）。
-# 查询台原本按 chat_memory_records 读——那条表按 (umo, cid) 存，三个 BOT 看同一个群
-# 就有三行，于是同一条消息在页面上出现三次。这里改成：
-#   ① 双写开始之后的时段读 chat_memory_messages（单例，一条一行）；
-#   ② 双写之前的旧历史仍读 chat_memory_records（那时候没有合并存储），但按
-#      (会话, 发送者, 正文, 平台时间) 去重——旧历史同样被多实例各存过一份。
-# id 空间靠偏移区分（>= _MERGED_ID_OFFSET 的是合并存储行，写路径按这个判定目标表）。
+# 合并存储的只读投影：**一条物理消息一行**（多实例共享同一条）。
+# 页面 id 用 `messages.rowid + _MERGED_ID_OFFSET`，把页面 id 空间与
+# 工具行 id（`tool_calls.id`）、以及历史快照的小 id 隔开。
 _MERGED_ID_OFFSET = 1_000_000_000
 
 _SHADOW_CTES = """
@@ -171,62 +144,11 @@ LEFT JOIN picked AS b ON b.msg_uid = m.msg_uid AND b.rn = 1
 LEFT JOIN umos AS u ON u.msg_uid = m.msg_uid
 """
 
-# 旧历史（双写开始之前）按去重键折叠：多实例各存一份 → 只留一行，umo 列表供过滤匹配。
-# 只带一个 MIN() 聚合，SQLite 保证其余裸列取自 id 最小的那一行（结果稳定可复核）。
-_LEGACY_CACHE_NAME = "_cm_legacy_rows"
-# 合并读源的物化副本：把「v2 投影 + 旧历史去重」那次 UNION 一次算好存进 TEMP 表。
-# 那个 UNION 里带窗口函数（每实例挑一行），每次查询重算要 200~400ms；
-# 物化一次 ~565ms，之后取一页 0.2ms、聚合十几到几十 ms。
+# 合并读源的物化副本：把上面那段投影（带窗口函数，每实例挑一行）一次算好存进 TEMP 表。
+# 每次查询重算要 200~400ms；物化一次 ~565ms，之后取一页 0.2ms、聚合十几到几十 ms。
 _MERGED_CACHE_NAME = "_cm_merged_rows"
 # 物化副本最短重建间隔：活跃写入时避免"每条消息都重建一次"（效果等同 2 秒快照）
 _MERGED_REBUILD_MIN_SEC = 2.0
-
-_LEGACY_CUT = (
-    "(SELECT COALESCE((SELECT value FROM chat_memory_shadow_meta "
-    "WHERE key = 'dual_write_started_at'), '9999-12-31'))"
-)
-
-_LEGACY_DEDUPE_SELECT = """
-SELECT MIN(r.id)                          AS id,
-       r.umo                              AS umo,
-       GROUP_CONCAT(DISTINCT r.umo)        AS umo_list,
-       r.conversation_id                   AS conversation_id,
-       r.role                              AS role,
-       r.user_id                           AS user_id,
-       -- 旧表没有 sender_id：role=user 时 user_id 就是发送者，其余无从得知（留空）
-       CASE WHEN r.role = 'user' THEN r.user_id END AS sender_id,
-       NULL                                AS msg_uid,
-       r.content                           AS content,
-       r.content_kind                      AS content_kind,
-       r.relation_data                     AS relation_data,
-       r.created_at                        AS created_at,
-       NULL                                AS platform_timestamp,
-       NULL                                AS platform_seq,
-       r.message_id                        AS message_id,
-       r.pair_id                           AS pair_id,
-       r.turn_id                           AS turn_id,
-       r.llm_status                        AS llm_status,
-       r.send_status                       AS send_status,
-       r.persona_id                        AS persona_id,
-       r.raw_timestamp                     AS raw_timestamp,
-       r.recalled_at                       AS recalled_at,
-       r.deleted_at                        AS deleted_at,
-       r.platform_name                     AS platform_name,
-       r.message_type                      AS message_type,
-       r.session_id                        AS session_id,
-       r.self_id                           AS self_id,
-       CASE WHEN r.message_type = 'GroupMessage' THEN r.session_id ELSE '' END AS group_id,
-       r.sender_nickname                   AS sender_nickname,
-       r.at_id                             AS at_id,
-       r.reply_id                          AS reply_id,
-       r.forward_id                        AS forward_id
-  FROM chat_memory_records AS r
- WHERE r.created_at < """ + _LEGACY_CUT + """
- GROUP BY r.message_type, r.session_id, COALESCE(r.user_id, ''), r.content,
-          COALESCE(r.raw_timestamp, 0)
-"""
-
-_LEGACY_CTES = "legacy AS (" + _LEGACY_DEDUPE_SELECT + ")"
 
 _SHADOW_TABLES = ("chat_memory_messages", "chat_memory_message_bots",
                   "chat_memory_shadow_meta")
@@ -268,7 +190,6 @@ class ChatMemoryRepository:
         writable_path: str | Path | None = None,
         keep_open: bool = False,
         expected_shadow_version: str = "",
-        shadow_read_enabled: bool = False,
     ) -> None:
         self.db_path = Path(db_path).expanduser().resolve(strict=False)
         self.timezone = timezone or _default_timezone()
@@ -276,21 +197,13 @@ class ChatMemoryRepository:
         self.max_page_size = max(20, min(500, int(max_page_size)))
         self.default_page_size = min(self.default_page_size, self.max_page_size)
         self.allow_immutable_fallback = allow_immutable_fallback
-        # 只读连接复用：合并存储的旧历史去重要落一张 TEMP 表（0.4s+），每次请求重建太贵。
+        # 只读连接复用：合并源要落一张 TEMP 物化副本（0.5s+），每次请求重建太贵。
         # 只给长期存活的查询台开（keep_open）；一次性/测试用实例仍是一请求一连接，
         # 否则临时库目录在 Windows 上删不掉（文件被持有）。
         self.keep_open = bool(keep_open)
-        # keep_open 连接会把旧历史去重结果冻在 TEMP 表里（含 deleted_at），
-        # 软删除/恢复后必须重建，否则页面永远读到删除前的快照。
-        self._legacy_cache_dirty = False
         # 期望的合并存储结构版本（由写入侧常量传入）。空串＝不校验版本，只校验表结构。
         self._expected_shadow_version = str(expected_shadow_version or "")
-        # 插件的切读开关/门槛结论（由 main 传入）：False 时查询台照旧读旧表，
-        # 与上下文、公开 API 保持同一个读源。原来只判表结构+7 天，默认配置下
-        # 会出现"模型读旧表、页面读合并存储"两套数据。
-        self.read_source = "v2" if shadow_read_enabled else "v1"
-        # 物化副本的两把钥匙：库指纹（含 WAL）+ 旧历史缓存代数
-        self._legacy_generation = 0
+        # 物化副本的两把钥匙：库指纹（含 WAL）+ 重建最短间隔
         self._merged_key: tuple | None = None
         self._merged_ready = False
         self._merged_built_at = 0.0
@@ -334,23 +247,22 @@ class ChatMemoryRepository:
 
         return self._run_read(operation)
 
-    def release_snapshot(self) -> None:
-        """解除锁定：之后按库指纹自动重建（数据源切换等场景用）。"""
-        self._snapshot_locked = False
-        self._overview_cache = None
-
     def warm(self) -> None:
-        """同步预热：建好旧历史缓存与物化副本（插件加载后在后台线程调一次）。
+        """同步预热：建好物化副本与概览结果（插件加载后在后台线程调一次）。
 
-        为什么：两条缓存合计约 0.9 秒，放在"用户第一次点开查询台"里就是纯等待；
+        为什么：合计约 0.9 秒，放在"用户第一次点开查询台"里就是纯等待；
         放到加载后台跑，用户点进来时已经在跑 76ms 的快路径。
         """
         try:
-            # 三样都先算好：旧历史缓存、物化副本（_records_source 内部负责）、概览结果
+            # 物化副本（_records_source 内部负责）+ 概览结果
             self._run_read(lambda connection: self._records_source(connection))
             self._run_read(self._overview_query)
-        except Exception:  # noqa: BLE001 - 预热失败不影响后续按需重建
-            pass
+        except Exception as exc:  # noqa: BLE001 - 预热可选，按需重建等价
+            # 降级必须可见：预热失败后查询台仍能按需重建（等价但明显变慢），
+            # 但运维得知道"页面上每次都在重建"是因为预热挂了。只记类型，不带数据。
+            logger.warning(
+                f"[ChatMemory] 查询台预热失败（将退回按需重建）: {type(exc).__name__}"
+            )
 
     async def health(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._run_read, self._health_query)
@@ -421,7 +333,7 @@ class ChatMemoryRepository:
         """写目标表：record=主表，tool=工具调用表（两者 ID 空间独立）。"""
         normalized = str(target or "record").strip().lower()
         if normalized == "record":
-            return TABLE_NAME
+            return SHADOW_MESSAGE_TABLE
         if normalized == "tool":
             return TOOL_TABLE_NAME
         raise ValueError("未知的删除目标")
@@ -478,107 +390,88 @@ class ChatMemoryRepository:
         self, table: str, row_id: int, target: str, deleted: bool
     ) -> dict[str, Any]:
         if not self.db_path.is_file():
-            raise DatabaseUnavailableError(f"未找到 ChatMemory 数据库：{self.db_path}")
+            # 同 `_run_read`：异常文案会回到 HTTP 客户端，路径只进服务端日志。
+            logger.warning("[ChatMemoryUI] 未找到 ChatMemory 数据库：%s", self.db_path)
+            raise DatabaseUnavailableError("未找到 ChatMemory 数据库文件，请检查数据源设置")
         connection = sqlite3.connect(str(self.db_path), timeout=5)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 5000")
             self._validate_schema(connection)
-            # id >= _MERGED_ID_OFFSET 的是合并存储行（chat_memory_messages 的 rowid）：
-            # 删除/恢复必须写那张表，否则按 id 去改旧表会改到另一条消息（或改不到）。
-            shadow_read = (
-                table == TABLE_NAME
-                and row_id >= _MERGED_ID_OFFSET
-                and self._shadow_ready(connection)
-            )
-            has_column = (
-                (self._has_deleted_column(connection) or shadow_read)
-                if table == TABLE_NAME
-                else self._has_tool_deleted_column(connection)
-            )
-            if not has_column:
-                raise ValueError("该数据库没有软删除列（schema < v8），无法软删除")
-            if shadow_read:
+            if table == TOOL_TABLE_NAME:
+                result = self._apply_tool_deleted_at(row_id, target, deleted, connection)
+            else:
                 result = self._apply_shadow_deleted_at(
                     connection, row_id, target, deleted
                 )
-                # 与旧表分支同样的失效动作：只置 legacy 脏标记不够——页面已锁快照时
-                # `_ensure_merged_cache` 会直接返回锁定缓存，详情抽屉读到的仍是删除前状态。
-                self._legacy_cache_dirty = True
-                self._merged_key = None
-                self._merged_ready = False
-                self._snapshot_locked = False
-                self._overview_cache = None
-                return result
-            # 取整行：除状态校验外，还要拿 umo/cid/role/message_id/turn_id 去影子里
-            # 定位同一条消息，把软删除一并写过去（双写期两边必须一致）
-            current_row = connection.execute(
-                f"SELECT * FROM {table} WHERE id = ?", (row_id,)
-            ).fetchone()
-            if current_row is None:
-                # 区分「不存在」与「状态不符」，排障时不会被合成一条消息误导
-                raise ValueError("记录不存在")
-            current = str(current_row["deleted_at"] or "").strip()
-            if deleted and current:
-                raise ValueError("记录已被软删除")
-            if not deleted and not current:
-                raise ValueError("记录未被软删除")
-            now_raw = (
-                datetime.now(dt_timezone.utc)
-                .replace(tzinfo=None)
-                .strftime("%Y-%m-%d %H:%M:%S.%f")
-            )
-            if deleted:
-                connection.execute(
-                    f"UPDATE {table} SET deleted_at = :now WHERE id = :rid",
-                    {"now": now_raw, "rid": row_id},
-                )
-                deleted_at_raw = now_raw
-            else:
-                connection.execute(
-                    f"UPDATE {table} SET deleted_at = NULL WHERE id = :rid",
-                    {"rid": row_id},
-                )
-                deleted_at_raw = ""
-            self._mirror_shadow_deleted_at(
-                connection, table, current_row, now_raw if deleted else ""
-            )
-            connection.commit()
-            self._legacy_cache_dirty = True
-            self._merged_key = None      # 自己的写入立刻失效，不受节流与锁影响
+            # 只置缓存脏标记不够：页面已锁快照时 `_ensure_merged_cache` 会直接返回
+            # 锁定缓存，详情抽屉读到的仍是删除前状态。
+            self._merged_key = None
             self._merged_ready = False
             self._snapshot_locked = False
-            return {
-                "id": row_id,
-                "target": target,
-                "deleted": bool(deleted_at_raw),
-                "deleted_at": (
-                    self._time_pair(deleted_at_raw)[1] if deleted_at_raw else ""
-                ),
-            }
+            self._overview_cache = None
+            return result
         except sqlite3.DatabaseError as exc:
             raise DatabaseUnavailableError(f"写入失败：{exc}") from exc
         finally:
             connection.close()
 
-    @staticmethod
-    def _has_table(connection: sqlite3.Connection, name: str) -> bool:
-        return (
-            connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
-            ).fetchone()
-            is not None
+    def _apply_tool_deleted_at(
+        self,
+        row_id: int,
+        target: str,
+        deleted: bool,
+        connection: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        """工具调用表的单条软删除/恢复：改 ``chat_memory_tool_calls.deleted_at``。
+
+        工具行的 id 是**它自己的**自增主键，没有 ``_MERGED_ID_OFFSET`` 偏移——按记录
+        那套减偏移去查会算成负 rowid，任何工具都"找不到"，删除按钮永远报错。
+        """
+        row = connection.execute(
+            f"SELECT id, deleted_at FROM {TOOL_TABLE_NAME} WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("记录不存在")
+        current = str(row["deleted_at"] or "").strip()
+        if deleted and current:
+            raise ValueError("记录已被软删除")
+        if not deleted and not current:
+            raise ValueError("记录未被软删除")
+        now_raw = (
+            datetime.now(dt_timezone.utc)
+            .replace(tzinfo=None)
+            .strftime("%Y-%m-%d %H:%M:%S.%f")
         )
+        if deleted:
+            connection.execute(
+                f"UPDATE {TOOL_TABLE_NAME} SET deleted_at = :now WHERE id = :rid",
+                {"now": now_raw, "rid": row_id},
+            )
+            deleted_at_raw = now_raw
+        else:
+            connection.execute(
+                f"UPDATE {TOOL_TABLE_NAME} SET deleted_at = NULL WHERE id = :rid",
+                {"rid": row_id},
+            )
+            deleted_at_raw = ""
+        connection.commit()
+        return {
+            "id": row_id,
+            "target": target,
+            "deleted": bool(deleted_at_raw),
+            "deleted_at": (
+                self._time_pair(deleted_at_raw)[1] if deleted_at_raw else ""
+            ),
+        }
 
     def _shadow_ready(self, connection: sqlite3.Connection) -> bool:
-        """合并存储能否当读源：**插件已切读** + 三张表齐 + 结构版本一致 + 双写窗口已满。
+        """合并存储能否当读源：三张表齐 + 结构版本一致。
 
-        最后两条与插件侧（上下文 / 公开 API）用同一判据，但前提是插件本身就切了读：
-        默认 ``shadow_read=false`` 时查询台必须一起读旧表，否则用户看到的记录与模型
-        记住的不是同一套（页面显示分段合并后的文本，模型读到的却是计划全文）。
+        它是唯一读源；返回 False 只发生在"库里还没有合并存储表"（未升级的老库 /
+        指向了别的快照文件），由 `_require_shadow` 转成明确的不可用错误。
         """
-        if getattr(self, "read_source", "v1") != "v2":
-            return False
         try:
             present = {
                 str(row[0])
@@ -594,87 +487,39 @@ class ChatMemoryRepository:
                 "SELECT value FROM chat_memory_shadow_meta WHERE key = 'schema_version'"
             ).fetchone()
             # 版本号必须与写入侧同源：调用方传入（main 用 shared_store.SHADOW_SCHEMA_VERSION），
-            # 写死字符串会在结构线升级时静默退回旧表（症状：昵称全变号码、同一条消息重复）。
+            # 写死字符串会在结构线升级时静默判成不可用（症状：查询台整页报数据库不可用）。
             expected = str(getattr(self, "_expected_shadow_version", "") or "")
             if expected and str(row[0] if row else "") != expected:
                 return False
-            return self._dual_write_window_full(connection)
+            return True
         except sqlite3.DatabaseError:
             return False
 
-    @staticmethod
-    def _dual_write_window_full(connection: sqlite3.Connection) -> bool:
-        """双写是否已跑满 ``SHADOW_READ_MIN_DAYS`` 天（与插件侧同一判据）。"""
-        try:
-            row = connection.execute(
-                "SELECT value FROM chat_memory_shadow_meta "
-                "WHERE key = 'dual_write_started_at'"
-            ).fetchone()
-        except sqlite3.DatabaseError:
-            return False
-        raw = str(row[0] if row else "").strip()
-        if not raw:
-            return False
-        try:
-            started = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=dt_timezone.utc)
-        elapsed = datetime.now(dt_timezone.utc) - started.astimezone(dt_timezone.utc)
-        return elapsed.total_seconds() >= SHADOW_READ_MIN_DAYS * 86400
+    def _require_shadow(self, connection: sqlite3.Connection) -> None:
+        """合并存储不可用时直接失败：旧表已停用，没有可降级的读源。
 
-    def _v2_source(self, connection: sqlite3.Connection) -> str:
-        """只有合并存储那一段（双写之后的物理消息，一条一行）。
-
-        物化副本就绪时直接切它的高 id 段：合并视图里 v2 行的 id 都 ≥ 偏移、旧历史行都
-        < 偏移（旧历史用 MIN(id) 折叠），所以两个来源天然一致，切出来等价于内联投影。
-        """
-        if self._merged_ready:
-            return (
-                f"(SELECT * FROM temp.{_MERGED_CACHE_NAME} "
-                f"WHERE id >= {_MERGED_ID_OFFSET})"
-            )
-        shadow = _SHADOW_SELECT.replace("{offset}", str(_MERGED_ID_OFFSET))
-        return "(WITH " + _SHADOW_CTES + ", v2 AS (" + shadow + ") SELECT * FROM v2)"
-
-    def _legacy_total(
-        self, connection: sqlite3.Connection, where: str, params: dict[str, Any]
-    ) -> int | None:
-        """旧历史（双写之前）在同样过滤条件下的条数。
-
-        ``None`` = 临时表不在（``_prepare_legacy_cache`` 建表失败），此时**不能**返回 0：
-        列表照样会从内联 UNION 里取到旧历史行，而 ``total`` 少算会让页码/末页对不上。
-        调用方必须改用整段 COUNT。
-        """
-        cached = connection.execute(
-            "SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
-            (_LEGACY_CACHE_NAME,),
-        ).fetchone()
-        if not cached:
-            return None
-        return int(
-            connection.execute(
-                f"SELECT COUNT(*) FROM temp.{_LEGACY_CACHE_NAME} AS r WHERE {where}",
-                params,
-            ).fetchone()[0]
-        )
-
-    def _records_source(self, connection: sqlite3.Connection) -> str:
-        """记录表的 FROM 片段：优先物化副本，否则退回内联合并投影。
-
-        物化副本（``temp._cm_merged_rows``）由 ``_ensure_merged_cache`` 按库指纹维护：
-        库或旧历史缓存一变就重建，没变就直接查表（取一页 0.2ms 级）。
+        静默降级去读旧表会让"页面显示的是废弃数据"，而且库结构与写路径早已不一致。
         """
         if not self._shadow_ready(connection):
-            return TABLE_NAME
+            raise DatabaseUnavailableError(
+                "该数据库没有可用的合并存储（chat_memory_messages / "
+                "chat_memory_message_bots），当前版本已不再读取旧表"
+            )
+
+    def _records_source(self, connection: sqlite3.Connection) -> str:
+        """记录表的 FROM 片段：优先物化副本，否则退回内联影子投影。
+
+        物化副本（``temp._cm_merged_rows``）由 ``_ensure_merged_cache`` 按库指纹维护：
+        库一变就重建，没变就直接查表（取一页 0.2ms 级）。
+        """
+        self._require_shadow(connection)
         if self._ensure_merged_cache(connection):
             return f"temp.{_MERGED_CACHE_NAME}"
         return self._inline_records_source(connection)
 
     def _ensure_merged_cache(self, connection: sqlite3.Connection) -> bool:
         """物化合并源到 TEMP 表；建不出来返回 False（调用方退回内联源，功能不变只慢些）。"""
-        key = (self._db_fingerprint(), self._legacy_generation)
+        key = self._db_fingerprint()
         # 先确认 TEMP 表真在**这条连接**上：连接被兜底重建过时布尔值还是 True，
         # 但表已经随旧连接销毁了（不确认就会报 no such table: temp._cm_merged_rows）。
         present = False
@@ -722,119 +567,13 @@ class ChatMemoryRepository:
         return ready
 
     def _inline_records_source(self, connection: sqlite3.Connection) -> str:
-        """内联合并投影（每个查询现算，慢但不占 temp）。"""
-        if not self._shadow_ready(connection):
-            return TABLE_NAME
-        shadow = _SHADOW_SELECT.replace("{offset}", str(_MERGED_ID_OFFSET))
-        cached = connection.execute(
-            "SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
-            (_LEGACY_CACHE_NAME,),
-        ).fetchone()
-        if cached:
-            return (
-                "(WITH " + _SHADOW_CTES + ", v2 AS (" + shadow + ") "
-                "SELECT * FROM v2 UNION ALL "
-                f"SELECT * FROM temp.{_LEGACY_CACHE_NAME})"
-            )
-        return (
-            "(WITH " + _SHADOW_CTES + ", v2 AS (" + shadow + "), "
-            + _LEGACY_CTES + " "
-            "SELECT * FROM v2 UNION ALL SELECT * FROM legacy)"
-        )
+        """内联影子投影（每个查询现算，慢但不占 temp）。
 
-    @classmethod
-    def _mirror_shadow_deleted_at(
-        cls,
-        connection: sqlite3.Connection,
-        table: str,
-        row: sqlite3.Row,
-        value: str,
-    ) -> None:
-        """把单条软删除/恢复镜像到合并存储（影子层），尽力而为、绝不外抛。
-
-        为什么需要：查询台的删除只写旧表，切读之后被删的记录会"复活"。影子表可能不存在
-        （查询台指向快照库、或影子开关关着）——那种情况直接跳过。
-        定位规则（旧表里不会有"既没 mid 又没 turn_id"的行，实测 0 行）：
-        ① 平台 message_id → 参与行 ``(umo, cid, mid, role)``；
-        ② 定不到（assistant 行的旧表 ``message_id`` 恒为空）→ 按
-           ``(umo, cid, turn_id, role)`` 取出这一轮该实例的**全部实发行**逐个标删
-           （一轮回复可能是多段），再标这一轮的**计划行**。
-           user 行**不走**这条兜底——计划成员代表的是这一轮 assistant 的产出，把用户
-           记录的删除标上去会连带藏掉 BOT 的那句回复。
-        注意：影子层一条物理消息只有一行（跨实例共享），所以删除是**消息级**的——
-        同一个群里别的 BOT 实例在切读后也看不到它（旧表那边仍显示各自的未删除状态）。
+        调用方已确认影子表可用（``_records_source`` / ``_ensure_merged_cache``），
+        这里不再重复校验——重复校验会与物化流程互相递归。
         """
-        try:
-            if table == TABLE_NAME:
-                if not cls._has_table(connection, SHADOW_MESSAGE_TABLE):
-                    return
-                msg_uid = cls._resolve_shadow_msg_uid(connection, row)
-                if msg_uid:
-                    connection.execute(
-                        f"UPDATE {SHADOW_MESSAGE_TABLE} SET deleted_at = :v WHERE msg_uid = :uid",
-                        {"v": value or None, "uid": msg_uid},
-                    )
-                    return
-                role = str(row["role"] or "")
-                turn = str(row["turn_id"] or "")
-                if role == "assistant" and turn:
-                    params = {
-                        "v": value or None,
-                        "umo": row["umo"],
-                        "cid": row["conversation_id"],
-                        "turn": turn,
-                    }
-                    # 这一轮的实发行（回显/拉取写进来的那几条，可能多个 msg_uid）
-                    connection.execute(
-                        f"UPDATE {SHADOW_MESSAGE_TABLE} SET deleted_at = :v WHERE msg_uid IN ("
-                        "  SELECT msg_uid FROM chat_memory_message_bots "
-                        "   WHERE umo = :umo AND conversation_id = :cid "
-                        "     AND turn_id = :turn AND role = 'assistant')",
-                        params,
-                    )
-                    if cls._has_table(connection, SHADOW_REPLY_TABLE):
-                        connection.execute(
-                            f"UPDATE {SHADOW_REPLY_TABLE} SET deleted_at = :v "
-                            "WHERE umo = :umo AND conversation_id = :cid "
-                            "AND turn_id = :turn",
-                            params,
-                        )
-                return
-            if not cls._has_table(connection, SHADOW_TOOL_TABLE):
-                return
-            connection.execute(
-                f"UPDATE {SHADOW_TOOL_TABLE} SET deleted_at = :v WHERE umo = :umo "
-                "AND conversation_id = :cid AND turn_id = :turn AND call_index = :idx",
-                {
-                    "v": value or None,
-                    "umo": row["umo"],
-                    "cid": row["conversation_id"],
-                    "turn": row["turn_id"],
-                    "idx": row["call_index"],
-                },
-            )
-        except (sqlite3.DatabaseError, IndexError, KeyError, TypeError):
-            # 镜像失败不能让查询台的删除/恢复失败：旧表那笔已经写好了。
-            # IndexError/KeyError：老库缺 turn_id / message_id 列时按名取会抛，同样降级。
-            return
-
-    @staticmethod
-    def _resolve_shadow_msg_uid(
-        connection: sqlite3.Connection, row: sqlite3.Row
-    ) -> str:
-        """按平台 mid 找物理消息；找不到返回空（计划成员行由调用方单独处理）。"""
-        umo = str(row["umo"] or "")
-        cid = str(row["conversation_id"] or "")
-        role = str(row["role"] or "")
-        mid = str(row["message_id"] or "")
-        hit = None
-        if mid:
-            hit = connection.execute(
-                f"SELECT msg_uid FROM chat_memory_message_bots WHERE umo = ? "
-                "AND conversation_id = ? AND platform_message_id = ? AND role = ? LIMIT 1",
-                (umo, cid, mid, role),
-            ).fetchone()
-        return str(hit[0]) if hit is not None else ""
+        shadow = _SHADOW_SELECT.replace("{offset}", str(_MERGED_ID_OFFSET))
+        return "(WITH " + _SHADOW_CTES + ", v2 AS (" + shadow + ") SELECT * FROM v2)"
 
     async def tool_records(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_tool_filters(payload)
@@ -842,14 +581,16 @@ class ChatMemoryRepository:
 
     def _run_read(self, operation: Callable[..., T], *args: Any) -> T:
         if not self.db_path.is_file():
-            raise DatabaseUnavailableError(f"未找到 ChatMemory 数据库：{self.db_path}")
+            # 文案里不带库绝对路径：这条异常会被 `_call` 原样回给 HTTP 客户端。
+            # 需要定位时看服务端日志——那里有完整路径。
+            logger.warning("[ChatMemoryUI] 未找到 ChatMemory 数据库：%s", self.db_path)
+            raise DatabaseUnavailableError("未找到 ChatMemory 数据库文件，请检查数据源设置")
 
         try:
             if self.keep_open:
                 connection = self._shared_connection()
                 with self._cache_lock:
                     self._validate_schema(connection)
-                    self._prepare_legacy_cache(connection)
                     payload = operation(connection, *args)
                     # 访问信息也要在**这把锁里**算：它同样是 `connection.execute`
                     # （PRAGMA / sqlite_master）。放在锁外时，查询台并发拉多张媒体
@@ -861,7 +602,6 @@ class ChatMemoryRepository:
             else:
                 with closing(self._connect(immutable=False)) as connection:
                     self._validate_schema(connection)
-                    self._prepare_legacy_cache(connection)
                     payload = operation(connection, *args)
                     access = self._access_info(connection, immutable=False)
         except sqlite3.DatabaseError as exc:
@@ -871,7 +611,6 @@ class ChatMemoryRepository:
             try:
                 with closing(self._connect(immutable=True)) as connection:
                     self._validate_schema(connection)
-                    self._prepare_legacy_cache(connection)
                     payload = operation(connection, *args)
                     access = self._access_info(connection, immutable=True)
             except sqlite3.DatabaseError as fallback_exc:
@@ -907,8 +646,12 @@ class ChatMemoryRepository:
             if self._cache_conn is not None:
                 try:
                     self._cache_conn.close()
-                except sqlite3.DatabaseError:
-                    pass
+                except sqlite3.DatabaseError as exc:
+                    # 指针必须丢掉（留着会继续用一条坏连接），但失败本身要留痕：
+                    # 关闭失败通常意味着文件句柄还攥着，排查"删不掉库"时只有这条线索。
+                    logger.debug(
+                        f"[ChatMemory] 关闭查询台复用连接失败: {type(exc).__name__}"
+                    )
                 self._cache_conn = None
             self._merged_key = None
             self._merged_ready = False
@@ -922,96 +665,38 @@ class ChatMemoryRepository:
             check_same_thread=not shared,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only = ON")
-        connection.execute("PRAGMA busy_timeout = 3000")
-        # 合并读源一次查询要扫十几万行、且同一份数据反复扫：64MB 页缓存 + 256MB mmap
-        # 实测把重复扫描从 ~35ms 压到 ~16ms（内存映射读，不走每次 read()）
         try:
-            connection.execute("PRAGMA cache_size = -65536")
-            connection.execute("PRAGMA mmap_size = 268435456")
-        except sqlite3.DatabaseError:
-            pass
-        return connection
-
-    def _prepare_legacy_cache(self, connection: sqlite3.Connection) -> None:
-        """把"双写前的旧历史去重结果"一次性落成 TEMP 表（只读连接允许建 temp 表）。
-
-        为什么：旧段要按 (会话, 发送者, 正文, 平台时间) 折叠，116k 行每查一次 GROUP BY
-        太贵（实测整页 2.3s）；折叠结果在双写之前的行上是**静止**的，一次建好后续都在
-        0.1s 量级。建不出来（只读库/权限/旧 SQLite）就回落成每次查的 CTE。
-        """
-        if not self._shadow_ready(connection):
-            return
-        exists = connection.execute(
-            "SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?",
-            (_LEGACY_CACHE_NAME,),
-        ).fetchone()
-        if exists and not self._legacy_cache_dirty:
-            return
-        try:
-            # query_only 会连 TEMP 表一起禁掉：重建这段时间放开，建完立刻收回。
-            # DROP 也必须在这个区间里做，否则只读 pragma 会把它挡掉、缓存永远不刷新。
-            connection.execute("PRAGMA query_only = OFF")
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA busy_timeout = 3000")
+            # 合并读源一次查询要扫十几万行、且同一份数据反复扫：64MB 页缓存 + 256MB
+            # mmap 实测把重复扫描从 ~35ms 压到 ~16ms（内存映射读，不走每次 read()）。
+            # 这两条是可选优化，失败不影响功能。
             try:
-                if exists:
-                    # 有过软删除/恢复：旧缓存里的 deleted_at 已经过期，丢掉重建
-                    connection.execute("DROP TABLE temp." + _LEGACY_CACHE_NAME)
-                connection.execute(
-                    "CREATE TEMP TABLE " + _LEGACY_CACHE_NAME + " AS "
-                    + _LEGACY_DEDUPE_SELECT
-                )
-                connection.execute(
-                    f"CREATE INDEX temp.ix_{_LEGACY_CACHE_NAME}_created "
-                    f"ON {_LEGACY_CACHE_NAME}(created_at)"
-                )
-                self._legacy_cache_dirty = False
-                self._legacy_generation += 1
-            finally:
-                connection.execute("PRAGMA query_only = ON")
-        except sqlite3.DatabaseError:
-            # 建不出来就当没有：_records_source 会走每次 GROUP BY 的版本（结果一样，慢些）
-            try:
-                connection.execute("PRAGMA query_only = ON")
+                connection.execute("PRAGMA cache_size = -65536")
+                connection.execute("PRAGMA mmap_size = 268435456")
             except sqlite3.DatabaseError:
                 pass
-
-    @staticmethod
-    def _has_tool_deleted_column(connection: sqlite3.Connection) -> bool:
-        """工具表是否有 deleted_at（schema >= v8）。"""
-        try:
-            info = connection.execute(
-                f"PRAGMA table_info({TOOL_TABLE_NAME})"
-            ).fetchall()
-        except sqlite3.DatabaseError:
-            return False
-        return any(str(row[1]) == "deleted_at" for row in info)
-
-    @staticmethod
-    def _has_deleted_column(connection: sqlite3.Connection) -> bool:
-        """主表是否有 deleted_at（schema >= v8）。旧库/旧快照按无软删除处理。"""
-        try:
-            info = connection.execute(
-                f"PRAGMA table_info({TABLE_NAME})"
-            ).fetchall()
-        except sqlite3.DatabaseError:
-            return False
-        return any(str(row[1]) == "deleted_at" for row in info)
+        except BaseException:
+            # 初始化本身就是条失败路径：刚建的连接必须自己关掉再外抛，
+            # 否则反复失败会一直攥着数据库文件（Windows 上连目录都删不掉）。
+            connection.close()
+            raise
+        return connection
 
     def _validate_schema(self, connection: sqlite3.Connection) -> None:
-        table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            (TABLE_NAME,),
-        ).fetchone()
-        if table is None:
-            raise DatabaseUnavailableError("数据库中不存在 chat_memory_records 表")
-        columns = {
-            str(row["name"])
-            for row in connection.execute(f'PRAGMA table_info("{TABLE_NAME}")')
+        """只校验合并存储表：旧表已停用，缺它不再是错误。"""
+        present = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+                "(?, ?, ?)",
+                _SHADOW_TABLES,
+            )
         }
-        missing = sorted(REQUIRED_COLUMNS - columns)
-        if missing:
+        if present != set(_SHADOW_TABLES):
             raise DatabaseUnavailableError(
-                "ChatMemory 数据库缺少必要字段：" + ", ".join(missing)
+                "数据库中不存在合并存储表（chat_memory_messages / "
+                "chat_memory_message_bots / chat_memory_shadow_meta）"
             )
 
     def _access_info(
@@ -1066,11 +751,10 @@ class ChatMemoryRepository:
 
     def _health_query(self, connection: sqlite3.Connection) -> dict[str, Any]:
         source = self._records_source(connection)
-        has_deleted = self._has_deleted_column(connection) or source != TABLE_NAME
-        visible = "WHERE r.deleted_at IS NULL" if has_deleted else ""
         row = connection.execute(
             f"SELECT COUNT(*) AS total, MIN(r.created_at) AS oldest, "
-            f"MAX(r.created_at) AS newest FROM {source} AS r {visible}"
+            f"MAX(r.created_at) AS newest FROM {source} AS r "
+            f"WHERE r.deleted_at IS NULL"
         ).fetchone()
         return {
             "healthy": True,
@@ -1096,42 +780,28 @@ class ChatMemoryRepository:
                 and now - cached[1] < 30):
             return cached[2]
         source = self._records_source(connection)
-        has_deleted = self._has_deleted_column(connection) or source != TABLE_NAME
+        # 合并存储投影恒定带 deleted_at（`_SHADOW_SELECT` 里就是 messages.deleted_at），
+        # 不存在"旧库没有这一列"的分支了。
         # 软删除行不算进概览（与列表口径一致），另用 deleted_records 单独说明。
         # 同一次扫描里用 CASE 区分：不筛 WHERE（否则统计不到被删的行），只跳过计数。
-        visible = "WHERE deleted_at IS NULL" if has_deleted else ""
-        if has_deleted:
-            summary = connection.execute(
-                f"""
-                SELECT
-                    SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS total_records,
-                    COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN umo END) AS total_umos,
-                    COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN conversation_id END)
-                        AS total_conversations,
-                    COUNT(DISTINCT CASE WHEN deleted_at IS NULL AND role = 'user'
-                                        THEN user_id END) AS total_users,
-                    MIN(CASE WHEN deleted_at IS NULL THEN created_at END) AS oldest_at,
-                    MAX(CASE WHEN deleted_at IS NULL THEN created_at END) AS newest_at,
-                    SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS deleted_count
-                FROM {source} AS r
-                """
-            ).fetchone()
-        else:
-            summary = connection.execute(
-                f"""
-                SELECT
-                    COUNT(*) AS total_records,
-                    COUNT(DISTINCT umo) AS total_umos,
-                    COUNT(DISTINCT conversation_id) AS total_conversations,
-                    COUNT(DISTINCT CASE WHEN role = 'user' THEN user_id END) AS total_users,
-                    MIN(created_at) AS oldest_at,
-                    MAX(created_at) AS newest_at,
-                    0 AS deleted_count
-                FROM {source} AS r
-                """
-            ).fetchone()
+        summary = connection.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS total_records,
+                COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN umo END) AS total_umos,
+                COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN conversation_id END)
+                    AS total_conversations,
+                COUNT(DISTINCT CASE WHEN deleted_at IS NULL AND role = 'user'
+                                    THEN user_id END) AS total_users,
+                MIN(CASE WHEN deleted_at IS NULL THEN created_at END) AS oldest_at,
+                MAX(CASE WHEN deleted_at IS NULL THEN created_at END) AS newest_at,
+                SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS deleted_count
+            FROM {source} AS r
+            """
+        ).fetchone()
+        visible = "WHERE deleted_at IS NULL"
         # role 与 llm_status 用同一次扫描算：二维分组后各自求和即得边际分布，
-        # 省掉一遍「v2 ∪ legacy」的重算（每条 overview 查询都在重算它）。
+        # 省掉两遍全表聚合。
         pair_rows = connection.execute(
             f"SELECT role AS role, llm_status AS status, COUNT(*) AS amount "
             f"FROM {source} AS r {visible} GROUP BY role, llm_status"
@@ -1161,7 +831,6 @@ class ChatMemoryRepository:
             )
         )
         # created_at 存 UTC naive；按插件时区偏移分桶，避免日界与展示口径不一致
-        soft_and = "r.deleted_at IS NULL" if has_deleted else "1 = 1"
         tz_offset = self.timezone.utcoffset(datetime.now(self.timezone))
         offset_seconds = int((tz_offset or timedelta(0)).total_seconds())
         daily_rows = connection.execute(
@@ -1169,7 +838,7 @@ class ChatMemoryRepository:
             SELECT date(created_at, :tz_offset) AS day, COUNT(*) AS amount
             FROM {source} AS r
             WHERE r.created_at >= datetime('now', '-29 days')
-              AND {soft_and}
+              AND r.deleted_at IS NULL
             GROUP BY day
             ORDER BY day ASC
             """,
@@ -1178,8 +847,7 @@ class ChatMemoryRepository:
         tools = self._tools_overview(connection)
         media = self._media_overview(connection)
         payload = {
-            # 当前读源：页面必须能看出"这份数据来自旧表还是合并存储"（两套口径不同）。
-            "read_source": self.read_source,
+            # 当前读源只有合并存储一套，页面不再需要按读源切换口径。
             "summary": {
                 "total_records": int(summary["total_records"] or 0),
                 "total_umos": int(summary["total_umos"] or 0),
@@ -1218,10 +886,8 @@ class ChatMemoryRepository:
         return tuple(parts)
 
     def _deleted_count(self, connection: sqlite3.Connection) -> int:
-        """已软删除（deleted_at 非空）的记录数；旧库无该列时返回 0。"""
+        """已软删除（deleted_at 非空）的记录数。"""
         source = self._records_source(connection)
-        if not self._has_deleted_column(connection) and source == TABLE_NAME:
-            return 0
         row = connection.execute(
             f"SELECT COUNT(*) AS amount FROM {source} AS r "
             f"WHERE r.deleted_at IS NOT NULL"
@@ -1253,7 +919,6 @@ class ChatMemoryRepository:
 
     @staticmethod
     def _tools_overview(connection: sqlite3.Connection) -> dict[str, Any]:
-        tool_visible = ChatMemoryRepository._has_tool_deleted_column(connection)
         present = (
             connection.execute(
                 "SELECT 1 FROM sqlite_master "
@@ -1269,7 +934,7 @@ class ChatMemoryRepository:
                 "deleted_calls": 0,
                 "tool_names": {},
             }
-        visible = " WHERE deleted_at IS NULL" if tool_visible else ""
+        visible = " WHERE deleted_at IS NULL"
         total = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM {TOOL_TABLE_NAME}{visible}"
@@ -1284,15 +949,13 @@ class ChatMemoryRepository:
             ),
             empty_label="(empty)",
         )
-        deleted_calls = 0
-        if tool_visible:
-            deleted_calls = int(
-                connection.execute(
-                    f"SELECT COUNT(*) FROM {TOOL_TABLE_NAME} "
-                    "WHERE deleted_at IS NOT NULL"
-                ).fetchone()[0]
-                or 0
-            )
+        deleted_calls = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM {TOOL_TABLE_NAME} "
+                "WHERE deleted_at IS NOT NULL"
+            ).fetchone()[0]
+            or 0
+        )
         return {
             "present": True,
             "total_calls": total,
@@ -1305,7 +968,6 @@ class ChatMemoryRepository:
     ) -> dict[str, Any]:
         """筛选项只保留「内容类型」的下拉候选（其余条件都是手填/固定选项）。"""
         source = self._records_source(connection)
-        shadow = source != TABLE_NAME
         scoped = {
             key: value
             for key, value in filters.items()
@@ -1322,9 +984,6 @@ class ChatMemoryRepository:
         conditions, params = self._where_clause(
             scoped,
             alias="r",
-            soft_delete=self._has_deleted_column(connection) or shadow,
-            sender_column="sender_id" if shadow else "user_id",
-            shadow=shadow,
         )
         where = " AND ".join(conditions) if conditions else "1 = 1"
         kind_rows = connection.execute(
@@ -1353,69 +1012,36 @@ class ChatMemoryRepository:
         self, connection: sqlite3.Connection, filters: dict[str, Any]
     ) -> dict[str, Any]:
         source = self._records_source(connection)
-        shadow = source != TABLE_NAME
         conditions, params = self._where_clause(
             filters,
             alias="r",
-            soft_delete=self._has_deleted_column(connection) or shadow,
-            sender_column="sender_id" if shadow else "user_id",
-            shadow=shadow,
         )
         where = " AND ".join(conditions) if conditions else "1 = 1"
         page = filters["page"]
         page_size = filters["page_size"]
         offset = (page - 1) * page_size
         page_params = {**params, "page_size": page_size, "offset": offset}
-        if shadow:
-            # 取页统一走整段来源：原来按"v2 段整体在旧段之前"分片取（offset 落在 v2 段就只查
-            # v2），但 `_SHADOW_SELECT` 对 created_at 没有下界——一旦合并存储里出现比双写
-            # 起点更早的行（导入/回填/对拍写入），排序与分片切分就错位，跨页重复或漏行。
-            # 物化副本就绪后整段取一页本来就是 76ms 级，不值得为它冒这个风险。
-            legacy_total = self._legacy_total(connection, where, params)
-            if legacy_total is None:
-                # 临时表建不出来（如旧 SQLite / 只读限制）：退回整段 COUNT，别用 0 冒充
-                total = int(
-                    connection.execute(
-                        f"SELECT COUNT(*) FROM {source} AS r WHERE {where}", params
-                    ).fetchone()[0]
-                )
-            else:
-                v2_total = int(
-                    connection.execute(
-                        f"SELECT COUNT(*) FROM {self._v2_source(connection)} AS r "
-                        f"WHERE {where}",
-                        params,
-                    ).fetchone()[0]
-                )
-                total = v2_total + legacy_total
-            rows = connection.execute(
-                f"SELECT r.* FROM {source} AS r WHERE {where} "
-                "ORDER BY r.created_at DESC, r.id DESC "
-                "LIMIT :page_size OFFSET :offset",
-                page_params,
-            ).fetchall()
-        else:
-            total = int(
-                connection.execute(
-                    f"SELECT COUNT(*) FROM {source} AS r WHERE {where}", params
-                ).fetchone()[0]
-            )
-            rows = connection.execute(
-                f"SELECT r.* FROM {source} AS r WHERE {where} "
-                "ORDER BY r.created_at DESC, r.id DESC "
-                "LIMIT :page_size OFFSET :offset",
-                page_params,
-            ).fetchall()
+        # 取页统一走整段来源：`_SHADOW_SELECT` 对 created_at 没有下界，一旦合并存储里
+        # 出现比双写起点更早的行（导入/回填/对拍写入），按段切分就会跨页重复或漏行。
+        # 物化副本就绪后整段取一页本来就是 76ms 级。
+        total = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM {source} AS r WHERE {where}", params
+            ).fetchone()[0]
+        )
+        rows = connection.execute(
+            f"SELECT r.* FROM {source} AS r WHERE {where} "
+            "ORDER BY r.created_at DESC, r.id DESC "
+            "LIMIT :page_size OFFSET :offset",
+            page_params,
+        ).fetchall()
         reply_targets = self._fetch_reply_targets(connection, rows)
         media_archive = self._fetch_media_archive(connection, rows)
-        # 昵称补全依赖 messages.sender_id（合并存储专有列）：旧表库不启用，
-        # V1 读路径与改造前完全一致。
-        sender_names = (
-            self._fetch_sender_names(connection, rows) if shadow else {}
-        )
+        # 昵称补全依赖 messages.sender_id（合并存储专有列）。
+        sender_names = self._fetch_sender_names(connection, rows)
         notes = (
             self._advanced_notes(connection, rows, filters.get("persona_id") or "")
-            if filters.get("advanced") and shadow
+            if filters.get("advanced")
             else {}
         )
         return {
@@ -1488,8 +1114,10 @@ class ChatMemoryRepository:
                     """,
                     named,
                 ).fetchall()
-            except sqlite3.DatabaseError:
-                return names
+            except sqlite3.DatabaseError as exc:
+                # 不许伪装成"没有可补的名字"：那会让全是号码的昵称当成正常数据显示，
+                # 用户看不出这条记录其实没补到名字。
+                raise DatabaseUnavailableError(f"补全发送者昵称失败：{exc}") from exc
             for item in found:
                 key = str(item["value"])
                 if key not in names:
@@ -1556,8 +1184,10 @@ class ChatMemoryRepository:
                     """,
                     params,
                 ).fetchall()
-            except sqlite3.DatabaseError:
-                return notes
+            except sqlite3.DatabaseError as exc:
+                # 不许返回无标记的部分 notes：轮次/配对/状态悄悄缺失，用户会以为
+                # 这些记录本来就没有这些属性。
+                raise DatabaseUnavailableError(f"读取高级注解失败：{exc}") from exc
             for item in found:
                 key = str(item["msg_uid"])
                 current = notes.get(key)
@@ -1580,19 +1210,22 @@ class ChatMemoryRepository:
         self, connection: sqlite3.Connection
     ) -> dict[str, Any]:
         """高级只读模式的 persona 候选（参与行上出现过的 persona + 条数）。"""
-        shadow = self._records_source(connection) != TABLE_NAME
-        table = "chat_memory_message_bots" if shadow else TABLE_NAME
+        # 与其他读路径同源校验：库没有合并存储（或结构版本不对）时明确报不可用，
+        # 否则这里会跑在旧结构上，各端点表现不一致。
+        self._require_shadow(connection)
         # 参与行是"每实例一行"，同一轮会被 N 个 BOT 各记一次；按 msg_uid 去重才是
         # 用户理解的"这个 persona 有多少条记录"。
-        counted = "COUNT(DISTINCT msg_uid)" if shadow else "COUNT(*)"
         try:
             rows = connection.execute(
-                f"SELECT COALESCE(persona_id, '') AS value, {counted} AS amount "
-                f"FROM {table} GROUP BY COALESCE(persona_id, '') "
-                f"ORDER BY amount DESC LIMIT 200"
+                "SELECT COALESCE(persona_id, '') AS value, "
+                "COUNT(DISTINCT msg_uid) AS amount "
+                "FROM chat_memory_message_bots GROUP BY COALESCE(persona_id, '') "
+                "ORDER BY amount DESC LIMIT 200"
             ).fetchall()
-        except sqlite3.DatabaseError:
-            return {"personas": []}
+        except sqlite3.DatabaseError as exc:
+            # 不许伪装成"没有 persona"：筛选下拉会静默变空，用户以为库里的 persona
+            # 候选原本就是空的。
+            raise DatabaseUnavailableError(f"读取 persona 候选失败：{exc}") from exc
         return {
             "personas": [
                 {"value": str(row["value"]), "count": int(row["amount"])}
@@ -1648,8 +1281,10 @@ class ChatMemoryRepository:
                     f"WHERE media_id IN ({placeholders})",
                     chunk,
                 ).fetchall()
-            except sqlite3.DatabaseError:
-                archive_rows = []
+            except sqlite3.DatabaseError as exc:
+                # 不许把失败当成"未归档"：归档媒体会显示成未归档，音视频播放/下载
+                # 入口整块消失、语音气泡被禁用，而页面看起来一切正常。
+                raise DatabaseUnavailableError(f"读取媒体归档信息失败：{exc}") from exc
             for archive_row in archive_rows:
                 result[str(archive_row["media_id"])] = {
                     "media_id": str(archive_row["media_id"]),
@@ -1669,7 +1304,8 @@ class ChatMemoryRepository:
         库文件不存在时抛 DatabaseUnavailableError（与查询路径 503 语义一致）。
         """
         if not self.db_path.is_file():
-            raise DatabaseUnavailableError(f"数据库不存在：{self.db_path}")
+            logger.warning("[ChatMemoryUI] 导出时未找到数据库：%s", self.db_path)
+            raise DatabaseUnavailableError("未找到 ChatMemory 数据库文件，请检查数据源设置")
         with closing(self._connect(immutable=False)) as source:
             dest_conn = sqlite3.connect(str(dest))
             try:
@@ -1728,33 +1364,25 @@ class ChatMemoryRepository:
                 if turn_id:
                     needed.setdefault(str(row["umo"]), set()).add(turn_id)
         targets: dict[tuple[str, str], dict[str, Any]] = {}
-        source = self._records_source(connection)
-        shadow = source != TABLE_NAME
         for umo, turn_ids in needed.items():
             placeholders = ", ".join("?" * len(turn_ids))
-            if shadow:
-                # 合并存储里同一条 user 消息可能挂在别的实例的 umo 下（代表实例不一定是
-                # 被回复的那个），只按 turn_id 取；走参与行 + 消息表的窄查询，别为了几行
-                # 把整个单例投影再物化一遍（实测 0.31s → 0.02s）。
-                sql = (
-                    "SELECT m.content, m.content_kind, m.relation_data, "
-                    "m.sender_nickname, b.turn_id FROM chat_memory_message_bots AS b "
-                    "JOIN chat_memory_messages AS m ON m.msg_uid = b.msg_uid "
-                    f"WHERE b.role = 'user' AND b.turn_id IN ({placeholders}) "
-                    "ORDER BY m.created_at ASC"
-                )
-                args: tuple = tuple(sorted(turn_ids))
-            else:
-                sql = (
-                    f"SELECT * FROM {TABLE_NAME} "
-                    f"WHERE umo = ? AND role = 'user' AND turn_id IN ({placeholders}) "
-                    "ORDER BY created_at ASC, id ASC"
-                )
-                args = (umo, *sorted(turn_ids))
+            # 合并存储里同一条 user 消息可能挂在别的实例的 umo 下（代表实例不一定是
+            # 被回复的那个），只按 turn_id 取；走参与行 + 消息表的窄查询，别为了几行
+            # 把整个单例投影再物化一遍（实测 0.31s → 0.02s）。
+            sql = (
+                "SELECT m.content, m.content_kind, m.relation_data, "
+                "m.sender_nickname, b.turn_id FROM chat_memory_message_bots AS b "
+                "JOIN chat_memory_messages AS m ON m.msg_uid = b.msg_uid "
+                f"WHERE b.role = 'user' AND b.turn_id IN ({placeholders}) "
+                "ORDER BY m.created_at ASC"
+            )
+            args: tuple = tuple(sorted(turn_ids))
             try:
                 target_rows = connection.execute(sql, args).fetchall()
-            except sqlite3.DatabaseError:
-                target_rows = []
+            except sqlite3.DatabaseError as exc:
+                # 不许伪装成"查不到目标"：引用块会显示「未知成员」+ 空原文，
+                # 与真正的快照缺失无法区分。
+                raise DatabaseUnavailableError(f"读取引用目标失败：{exc}") from exc
             for target in target_rows:
                 raw = str(target["content"] or "")
                 rel = _parse_relation_data(_row_value(target, "relation_data"))
@@ -1779,11 +1407,7 @@ class ChatMemoryRepository:
         reply_targets = self._fetch_reply_targets(connection, [row])
         media_archive = self._fetch_media_archive(connection, [row])
         # 昵称补全与列表同一口径：不然同一行在列表里有名字、点进详情又变回号码
-        sender_names = (
-            self._fetch_sender_names(connection, [row])
-            if self._records_source(connection) != TABLE_NAME
-            else {}
-        )
+        sender_names = self._fetch_sender_names(connection, [row])
         return {
             "record": self._serialize_record(
                 row,
@@ -1797,6 +1421,8 @@ class ChatMemoryRepository:
     def _tool_records_query(
         self, connection: sqlite3.Connection, filters: dict[str, Any]
     ) -> dict[str, Any]:
+        # 结构版本与其他读路径同源校验（缺表在下面单独报，这里管版本不符）。
+        self._require_shadow(connection)
         present = (
             connection.execute(
                 "SELECT 1 FROM sqlite_master "
@@ -1806,14 +1432,11 @@ class ChatMemoryRepository:
             is not None
         )
         if not present:
-            return {
-                "items": [],
-                "total": 0,
-                "page": filters["page"],
-                "page_size": filters["page_size"],
-                "page_count": 0,
-                "filters": filters,
-            }
+            # 合并存储契约里工具表是必需的。缺表被报成"零次调用"会让用户以为
+            # 这个库从来没记录过工具调用，而不是库结构不对。
+            raise DatabaseUnavailableError(
+                f"该数据库没有工具调用表（{TOOL_TABLE_NAME}），当前版本无法列出工具调用"
+            )
         conditions: list[str] = []
         params: dict[str, Any] = {}
         # 人话口径：umo 是 "平台:类型:会话号"，拆成三个可填的筛选，不再让人手抄 UMO
@@ -1839,13 +1462,8 @@ class ChatMemoryRepository:
             params["conversation_id"] = filters["conversation_id"]
         persona_id = filters.get("persona_id")
         if persona_id is not None:
-            persona_table = (
-                "chat_memory_reply_messages"
-                if self._shadow_ready(connection)
-                else "chat_memory_records"
-            )
             conditions.append(
-                f"EXISTS (SELECT 1 FROM {persona_table} AS p "
+                f"EXISTS (SELECT 1 FROM {SHADOW_REPLY_TABLE} AS p "
                 f"WHERE p.umo = {TOOL_TABLE_NAME}.umo "
                 f"AND p.turn_id = {TOOL_TABLE_NAME}.turn_id "
                 "AND COALESCE(p.persona_id, '') = :persona_id)"
@@ -1860,12 +1478,11 @@ class ChatMemoryRepository:
         if filters.get("until"):
             conditions.append("created_at <= :until")
             params["until"] = filters["until"]
-        # 软删除（v8）：与主表同一套三态筛选；旧库无该列时自动降级
-        soft_delete = self._has_tool_deleted_column(connection)
+        # 软删除三态：与主表同一套筛选
         deleted_state = filters.get("deleted_state") or "visible"
-        if soft_delete and deleted_state == "visible":
+        if deleted_state == "visible":
             conditions.append("deleted_at IS NULL")
-        elif soft_delete and deleted_state == "deleted":
+        elif deleted_state == "deleted":
             conditions.append("deleted_at IS NOT NULL")
         where = " AND ".join(conditions) if conditions else "1 = 1"
         total = int(
@@ -1920,7 +1537,7 @@ class ChatMemoryRepository:
     ) -> dict[tuple[str, str], tuple[str, str]]:
         """本页调用所属轮次的"谁调的"：persona_id 与 self_id（BOT 的 QQ）。
 
-        工具表只存 umo / turn_id；人格与 BOT 号码要从这一轮的参与行（V1 是记录行）取。
+        工具表只存 umo / turn_id；人格与 BOT 号码要从这一轮的参与行取。
         """
         pairs = {
             (str(row["umo"]), str(row["turn_id"] or ""))
@@ -1929,11 +1546,7 @@ class ChatMemoryRepository:
         }
         if not pairs:
             return {}
-        table = (
-            "chat_memory_message_bots"
-            if self._shadow_ready(connection)
-            else "chat_memory_records"
-        )
+        table = SHADOW_MESSAGE_TABLE.replace("messages", "message_bots")
         found: dict[tuple[str, str], tuple[str, str]] = {}
         wanted = sorted(pairs)
         for start in range(0, len(wanted), 200):
@@ -1951,8 +1564,10 @@ class ChatMemoryRepository:
                     "GROUP BY umo, turn_id",
                     params,
                 ).fetchall()
-            except sqlite3.DatabaseError:
-                return found
+            except sqlite3.DatabaseError as exc:
+                # 不许返回无标记的部分 found：persona/self_id 变空会让"谁调的"
+                # 显示成无归属调用，与真的没有归属无法区分。
+                raise DatabaseUnavailableError(f"读取工具调用归属失败：{exc}") from exc
             for item in result:
                 found[(str(item["umo"]), str(item["turn_id"] or ""))] = (
                     str(item["persona_id"] or ""),
@@ -2053,11 +1668,8 @@ class ChatMemoryRepository:
         filters: dict[str, Any],
         *,
         alias: str,
-        soft_delete: bool = True,
-        sender_column: str = "user_id",
-        shadow: bool = False,
     ) -> tuple[list[str], dict[str, Any]]:
-        """筛选条件 → SQL 片段。列名按读源切换（旧表没有 sender_id，用 user_id 顶）。"""
+        """筛选条件 → SQL 片段（列名固定按合并存储投影取）。"""
         conditions: list[str] = []
         params: dict[str, Any] = {}
 
@@ -2078,9 +1690,9 @@ class ChatMemoryRepository:
         sender = filters.get("sender") or ""
         if sender:
             if sender.isdigit():
-                conditions.append(f"{alias}.{sender_column} = :sender")
+                conditions.append(f"{alias}.sender_id = :sender")
                 params["sender"] = sender
-            elif shadow:
+            else:
                 # 库里存的昵称可能只是号码（历史行），显示时是补出来的；
                 # 所以按昵称筛要同时命中"该昵称所属的发送者"，否则看到的名字搜不到。
                 conditions.append(
@@ -2091,11 +1703,6 @@ class ChatMemoryRepository:
                     "   WHERE COALESCE(sender_nickname, '') LIKE :sender ESCAPE '\\' "
                     "     AND COALESCE(sender_id, '') <> '')"
                     ")"
-                )
-                params["sender"] = f"%{_escape_like(sender)}%"
-            else:
-                conditions.append(
-                    f"COALESCE({alias}.sender_nickname, '') LIKE :sender ESCAPE '\\'"
                 )
                 params["sender"] = f"%{_escape_like(sender)}%"
 
@@ -2110,48 +1717,41 @@ class ChatMemoryRepository:
             # "下拉可点可改、结果没筛"，用户看不出自己没筛成功——直接报错更诚实。
             raise ValueError("角色/状态/仅成对筛选需要先选择 persona")
         if persona is not None:
-            if shadow:
-                extra = ""
-                if persona_role:
-                    extra += " AND pb.role = :persona_role"
-                    params["persona_role"] = persona_role
+            extra = ""
+            if persona_role:
+                extra += " AND pb.role = :persona_role"
+                params["persona_role"] = persona_role
+            conditions.append(
+                "(EXISTS (SELECT 1 FROM chat_memory_message_bots pb "
+                f"WHERE pb.msg_uid = {alias}.msg_uid "
+                "AND COALESCE(pb.persona_id, '') = :persona_id"
+                f"{extra}) "
+                f"OR ({alias}.msg_uid IS NULL "
+                f"AND COALESCE({alias}.persona_id, '') = :persona_id))"
+            )
+            if persona_status:
+                # 该轮回复的状态：assistant 行按 (turn_id, role) 索引取，子查询只算一次
                 conditions.append(
-                    "(EXISTS (SELECT 1 FROM chat_memory_message_bots pb "
+                    "EXISTS (SELECT 1 FROM chat_memory_message_bots pb "
                     f"WHERE pb.msg_uid = {alias}.msg_uid "
-                    "AND COALESCE(pb.persona_id, '') = :persona_id"
-                    f"{extra}) "
-                    f"OR ({alias}.msg_uid IS NULL "
-                    f"AND COALESCE({alias}.persona_id, '') = :persona_id))"
+                    "AND COALESCE(pb.persona_id, '') = :persona_id "
+                    "AND pb.turn_id IN ("
+                    "  SELECT turn_id FROM chat_memory_message_bots "
+                    "   WHERE role = 'assistant' AND COALESCE(turn_id, '') <> '' "
+                    "     AND COALESCE(llm_status, '') = :persona_llm_status))"
                 )
-                if persona_status:
-                    # 该轮回复的状态：assistant 行按 (turn_id, role) 索引取，子查询只算一次
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM chat_memory_message_bots pb "
-                        f"WHERE pb.msg_uid = {alias}.msg_uid "
-                        "AND COALESCE(pb.persona_id, '') = :persona_id "
-                        "AND pb.turn_id IN ("
-                        "  SELECT turn_id FROM chat_memory_message_bots "
-                        "   WHERE role = 'assistant' AND COALESCE(turn_id, '') <> '' "
-                        "     AND COALESCE(llm_status, '') = :persona_llm_status))"
-                    )
-                    params["persona_llm_status"] = persona_status
-                if filters.get("paired_only"):
-                    # 可选：只看成对的消息（本轮必须有一条 assistant 行）。
-                    # IN 子查询只算一次；用 JOIN 写法 + 缺 (turn_id, role) 索引时会退化成分钟级。
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM chat_memory_message_bots pb "
-                        f"WHERE pb.msg_uid = {alias}.msg_uid "
-                        "AND COALESCE(pb.persona_id, '') = :persona_id "
-                        "AND pb.turn_id IN ("
-                        "  SELECT turn_id FROM chat_memory_message_bots "
-                        "   WHERE role = 'assistant' AND COALESCE(turn_id, '') <> ''))"
-                    )
-            else:
-                condition = f"COALESCE({alias}.persona_id, '') = :persona_id"
-                if persona_role:
-                    condition += f" AND {alias}.role = :persona_role"
-                    params["persona_role"] = persona_role
-                conditions.append(condition)
+                params["persona_llm_status"] = persona_status
+            if filters.get("paired_only"):
+                # 可选：只看成对的消息（本轮必须有一条 assistant 行）。
+                # IN 子查询只算一次；用 JOIN 写法 + 缺 (turn_id, role) 索引时会退化成分钟级。
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM chat_memory_message_bots pb "
+                    f"WHERE pb.msg_uid = {alias}.msg_uid "
+                    "AND COALESCE(pb.persona_id, '') = :persona_id "
+                    "AND pb.turn_id IN ("
+                    "  SELECT turn_id FROM chat_memory_message_bots "
+                    "   WHERE role = 'assistant' AND COALESCE(turn_id, '') <> ''))"
+                )
             params["persona_id"] = persona
 
         if filters.get("content_kind"):
@@ -2188,9 +1788,7 @@ class ChatMemoryRepository:
         if filters.get("until"):
             conditions.append(f"{alias}.created_at <= :until")
             params["until"] = filters["until"]
-        # 软删除（schema v7）：旧库无该列时调用方传 soft_delete=False 降级
-        if not soft_delete:
-            return conditions, params
+        # 软删除三态（默认只看未删除）
         deleted_state = filters.get("deleted_state") or "visible"
         if deleted_state == "visible":
             conditions.append(f"{alias}.deleted_at IS NULL")
@@ -2345,9 +1943,9 @@ class ChatMemoryRepository:
         )
         # 事件：有 event 结构时按自然语言句子展示（与上下文同一套模板，
         # UI 为纯文本、无 cm 标签）；老数据无 event 结构保持原摘要文本。
-        if ("event" in content_kind or "system_event" in content_kind) and (
-            isinstance(relation_data, dict)
-        ):
+        # `"event"` 字面量与 `models.K_SYSTEM` 同值：查询台是只读投影，
+        # 刻意不 import 插件内部模块（它有自己的 VALID_KINDS 清单）。
+        if "event" in content_kind and isinstance(relation_data, dict):
             event = relation_data.get("event")
             if isinstance(event, dict):
                 rendered_content = self._ui_event_sentence(
@@ -2577,8 +2175,8 @@ def _parse_relation_data(value: Any) -> dict[str, Any] | None:
         "media": media,
         "event": event,
     }
-    # 合并存储不建 at_id/reply_id/forward_id 三列（写进 relation_data 了）：原样带出来，
-    # 旧表那三列仍在，两条路都能取到（序列化时优先列、其次这里）。
+    # at_id/reply_id/forward_id 在合并存储里不是列（写进 relation_data 了）：原样带出来，
+    # 让渲染层按同一套字段取值。
     for key in ("at_id", "reply_id", "forward_id"):
         value = str(parsed.get(key) or "").strip()
         if value:

@@ -1,4 +1,4 @@
-"""chat_memory — 多 BOT 合并存储（阶段一：影子双写，只写不读）。
+"""chat_memory — 多 BOT 合并存储：本插件唯一的持久化模型。
 
 问题：同一 AstrBot 进程里多个 BOT（platform 实例）都会收到同一条群消息，
 旧表 ``chat_memory_records`` 按 (umo, cid) 存，于是同一条消息被每个实例各存一份
@@ -14,11 +14,11 @@
 - ``chat_memory_message_bots``：参与行，一行 = 某实例在某会话里看到/发出了这条消息，
   外键 ``msg_uid``；每实例状态（cid、role、llm_status、send_status、turn_id…）在此。
 - ``chat_memory_tool_calls``：工具调用，锚到 ``msg_uid``（可空）。
-- ``chat_memory_shadow_meta``：影子表自身 schema 版本。
+- ``chat_memory_shadow_meta``：结构版本与起点时间。
 
-阶段一：旧表照旧写，同时尽力镜像到新表，不参与任何读路径；失败隔离在调用方
-（``DBManager._shadow_write``）。切换读取（阶段二）前必须先用
-``integration/shared_store_audit.py`` 对拍确认零差异。
+写入与读取都只走这一套表；旧表 ``chat_memory_records`` / ``chat_memory_tool_records``
+自 2.1 起不再读写（表本身留在库里，由用户自行清理）。写失败隔离在调用方
+（``DBManager._shadow_write``）。
 
 字段命名约定：``msg_uid`` 是消息主键（跨实例共享或本地确定性）；``platform_message_id``
 是该实例眼中的平台消息 id（实测跨实例一致率 0.03%，只用于撤回/引用定位）。
@@ -38,11 +38,11 @@ from astrbot.api import logger
 
 from . import shadow_diag
 
-# 影子表自身的 schema 版本（记在 chat_memory_shadow_meta，不动旧库 user_version）。
+# 合并存储自身的 schema 版本（记在 chat_memory_shadow_meta，不动旧库 user_version）。
 #
-# 它是**内部结构线**，从 `1` 起算：合并存储随本版第一次发布，之前那些数字只是开发期在
+# 它是**内部结构线**，从 `1` 起算：合并存储随 2.0 第一次发布，之前那些数字只是开发期在
 # 测试端来回改了十几次的内部编号，没有对外含义，也不该让第一个正式版本背着一串历史。
-# 以后每次改影子层结构就 +1（**不要跳号**）；与插件版本号、旧表 `PRAGMA user_version`
+# 以后每次改结构就 +1（**不要跳号**）；与插件版本号、旧表 `PRAGMA user_version`
 # 都不对齐。结构变更走 `SHADOW_MIGRATIONS`（累积应用），**不再丢弃重建**。
 # 6：工具表唯一键收窄到 `(turn_id, call_index)`、计划表主键收窄到 `turn_id`、
 #    删掉 `messages.reply_group` 与两张无匹配查询的索引、给计划表/工具表/元信息表加 CHECK。
@@ -141,7 +141,7 @@ _TABLE_STATEMENTS = (
 )""",
     """CREATE TABLE IF NOT EXISTS chat_memory_shadow_meta (
     -- 只允许已知的键：以前是无约束 KV，键名拼错会静默插入一个新键
-    -- （症状：双写窗口"未满"、切读永远不生效，而日志里一切正常）。
+    -- （症状：起点时间读不到、状态接口一片空白，而日志里一切正常）。
     key   TEXT PRIMARY KEY CHECK (key IN ('schema_version', 'dual_write_started_at',
                                           'shadow_migrate')),
     value TEXT NOT NULL
@@ -257,12 +257,12 @@ def _obsolete_table_statements() -> list[str]:
     return [f"DROP TABLE IF EXISTS {name}" for name in _OBSOLETE_TABLES]
 
 
-# 影子层结构**迁移**（数据保留）：认识的旧编号 → 幂等 SQL 步骤。
+# 结构**迁移**（数据保留）：认识的旧编号 → 幂等 SQL 步骤。
 #
-# 合并存储随本版第一次发布，内部结构线从 `1` 起算——没有"从很远的旧编号跳过来"的历史，
+# 合并存储随 2.0 第一次发布，内部结构线从 `1` 起算——没有"从很远的旧编号跳过来"的历史，
 # 也不为开发期编号留兼容。以后每次改结构：版本 +1，能 ALTER / 建索引解决的都往这里加一条，
 # 不要让用户丢数据；不认识的编号才回落到"丢弃重建"（见 `storage.init_db`，重建也会沿用
-# 切读窗口起点）。
+# 起点时间）。
 SHADOW_MIGRATIONS: dict[str, tuple[str, ...]] = {
     # 5 → 6：收窄两个唯一键、删掉只写不读的列与无消费者的索引、给三张表补 CHECK。
     # 全部走"建新表 → 搬 → 改名"（SQLite 改不了主键/唯一键/约束），数据一行不丢：
@@ -331,7 +331,7 @@ SHADOW_MIGRATIONS: dict[str, tuple[str, ...]] = {
         "DROP TABLE IF EXISTS chat_memory_reply_messages",
         "ALTER TABLE chat_memory_reply_messages_new RENAME TO chat_memory_reply_messages",
         # 元信息表补键白名单：拼错键名以后会被库直接拒绝（原来是静默新增一个键 →
-        # "双写窗口未满"、切读永远不生效，而日志里一切正常）。
+        # 起点时间读不到、状态接口一片空白，而日志里一切正常）。
         """CREATE TABLE IF NOT EXISTS chat_memory_shadow_meta_new (
             key   TEXT PRIMARY KEY CHECK (key IN ('schema_version', 'dual_write_started_at',
                                                   'shadow_migrate')),
@@ -345,7 +345,7 @@ SHADOW_MIGRATIONS: dict[str, tuple[str, ...]] = {
     ),
     # 2 → 3：`seq` 从"会话内 MAX+1"改成"会话计数器只增不减"。
     # 不重写已有 seq（外部读者的游标继续有效），只把计数器种到当前最大值。
-    # 3 → 4：补齐按时间扫描的索引（只建索引，不动数据、不重置切读窗口）。
+    # 3 → 4：补齐按时间扫描的索引（只建索引，不动数据）。
     # 4 → 5：新增群名快照表；顺手删掉与唯一键重复的 ix_cmtc_turn 与
     # ix_cmm_reply_group 的部分索引（该列在 5 → 6 里被删掉）。只改索引/建表，不动数据。
     "4": (
@@ -407,7 +407,7 @@ def shadow_migration_statements(recorded_version: str) -> Optional[tuple[str, ..
 
     必须累积：``SHADOW_MIGRATIONS`` 每个键只存"该版到下一版"的增量，只执行一层就把
     ``schema_version`` 写成当前值，会让从结构线 2/3 升上来的库跳过 3→4、4→5
-    （``reply_messages`` 不重建 → 随后所有 ``ON CONFLICT (umo, turn_id)`` 写都失败）。
+    （``reply_messages`` 不重建 → 随后所有 ``ON CONFLICT`` 轮次写都失败）。
     """
     try:
         start = int(str(recorded_version or ""))
@@ -432,7 +432,7 @@ def shadow_migration_statements(recorded_version: str) -> Optional[tuple[str, ..
 
 
 def shadow_schema_statements() -> list[str]:
-    """建表在前、建索引在后（旧库教训：索引不得早于其列存在，有单测守卫）。"""
+    """建表在前、建索引在后（旧库教训：索引不得早于其列存在）。"""
     return [
         *_obsolete_table_statements(),
         *_TABLE_STATEMENTS,
@@ -444,7 +444,7 @@ def shadow_schema_statements() -> list[str]:
 
 
 def drop_shadow_statements() -> list[str]:
-    """影子表结构升级时丢弃重建（阶段一明确不迁移影子数据）。"""
+    """结构升级时丢弃重建（不认识的旧编号才走这条；认识的走迁移）。"""
     return [
         *shadow_diag.diag_drop_statements(),
         "DROP TABLE IF EXISTS chat_memory_tool_calls",
@@ -509,7 +509,7 @@ def local_msg_uid(fingerprint_value: str, occurrence: int) -> str:
 
 
 def normalize_record(params: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """把旧表 ``insert`` 的绑定参数归一化为 ``{"message": …, "participation": …}``。
+    """把写入的绑定参数归一化为 ``{"message": …, "participation": …}``。
 
     返回 ``None`` 表示缺少物理身份（platform_name / message_type / session_id /
     platform_id / 发送者 / 平台时间戳），无法合并——调用方计入 skipped 而不是猜测。
@@ -542,7 +542,7 @@ def normalize_record(params: dict[str, Any]) -> Optional[dict[str, Any]]:
     # 「这一条是不是计划正文」只是**写入前的路由标记**，不落库：发送路径的 assistant
     # 正文是计划（进轮次表），其余（入站观察 / push 回显 / pull 拉回）都是平台消息。
     is_plan = role == "assistant" and not is_echo
-    # 出站行的 sender_id 是 BOT 自己，但旧表 audit 里的 sender_nickname 取的是 event
+    # 出站行的 sender_id 是 BOT 自己，但写入参数里的 sender_nickname 取的是 event
     # 发送者（＝被回复的用户）昵称，不能搬成"发送者昵称"。留空，等观察侧补真实昵称。
     nickname = "" if role == "assistant" else str(params.get("nick") or "")
     # 出站（发送路径）行的时间用**本次发送尝试时刻**（本地写入时刻），不用触发它的那条
@@ -564,7 +564,7 @@ def normalize_record(params: dict[str, Any]) -> Optional[dict[str, Any]]:
                 platform_name, message_type, session_id, sender_id, platform_ts, content
             ),
             # 平台共享 id（各实例相同）；客户端不提供时为空，归一时退化到内容指纹。
-            # 注意 payload 键名用 puid：旧表 payload 的 uid 是"发送者 user_id"，不能复用。
+            # 注意 payload 键名用 puid：payload 的 uid 是"发送者 user_id"，不能复用。
             #
             # **出站（assistant）行绝不采用它**：发送路径上 event 是"触发这条回复的用户消息"，
             # 其 real_seq 属于那条用户消息。照搬会让回复与用户消息共享 msg_uid，从而折进同一行
@@ -618,11 +618,10 @@ def normalize_record(params: dict[str, Any]) -> Optional[dict[str, Any]]:
 
 
 def _merge_link_ids(params: dict[str, Any]) -> Optional[str]:
-    """把旧表的三列引用 id 并进 ``relation_data``（影子层不建这三列）。
+    """把三列引用 id 并进 ``relation_data``（合并存储不建这三列）。
 
-    V1 的 ``query_history`` 会带回 ``at_id`` / ``reply_id`` / ``forward_id``；影子层不存
-    独立列，所以写进 ``relation_data``，读侧再取回来——否则切读后回显段的 @ 目标与
-    引用目标直接丢失（对拍时表现为一大片"假差异"）。
+    对外查询会带回 ``at_id`` / ``reply_id`` / ``forward_id``；合并存储不存独立列，
+    所以写进 ``relation_data``，读侧再取回来——否则回显段的 @ 目标与引用目标直接丢失。
     只在有值时写；已有同名字段不覆盖（观察侧先写的那份更权威）。
     """
     raw = params.get("relation_data")
@@ -777,7 +776,7 @@ async def inherit_turn_persona(session: AsyncSession, participation: dict) -> st
 async def lookup_sender_nickname(session: AsyncSession, message: dict[str, Any]) -> str:
     """查同平台会话下该发送者的最近非空昵称（用于补齐出站行：BOT 自己的名字）。
 
-    出站行的昵称在旧表里存的是"被回复者昵称"，不能搬；但同一进程里其它实例观察
+    出站行的昵称写进参数时是"被回复者昵称"，不能搬；但同一进程里其它实例观察
     该 BOT 发言时会存下它真实的昵称，落在同一张表的其它物理消息上，这里取回来。
     """
     result = await session.execute(
@@ -1161,13 +1160,6 @@ async def backfill_turn_persona(session: AsyncSession) -> int:
     return filled
 
 
-# 切读门槛：双写必须跑满这么多天，UI / 上下文 / 公开 API 才一起读合并存储。
-# 放在这里是因为三个读侧（main 的上下文、ui.repository 的查询台）都要看同一个数。
-SHADOW_READ_MIN_DAYS = 7
-
-
-
-
 async def mirror_tool_call(
     session: AsyncSession,
     *,
@@ -1190,7 +1182,7 @@ async def mirror_tool_call(
         {"umo": umo, "cid": conversation_id, "turn_id": turn_id},
     )
     row = result.first()
-    await session.execute(
+    result = await session.execute(
         text(
             "INSERT OR IGNORE INTO chat_memory_tool_calls "
             "(msg_uid, umo, conversation_id, turn_id, call_index, tool_name, "
@@ -1210,15 +1202,21 @@ async def mirror_tool_call(
             "now": now,
         },
     )
+    # 如实回报这一行是**新插入**（True）还是幂等键冲突已存在（False）。两种都算数据
+    # 到位；调用方要区分的是"新写"与"重放"，不是"成功"与"失败"——把它当失败记进
+    # skipped 会让健康统计一直涨，而上层若按失败重试会永久重试同一个幂等键。
+    return bool(int(result.rowcount or 0))
 
 
 async def mirror_delete_conversation(
     session: AsyncSession, umo: str, conversation_id: str
-) -> None:
-    """镜像 /reset：删该实例该会话的参与行与归属行，物理消息仅在无参与时回收。
+) -> int:
+    """``/reset``：删该实例该会话的参与行与归属行，物理消息仅在无参与时回收。
 
     归属行（``chat_memory_reply_messages``）必须跟着删：计划成员行没有物理消息可回收，
-    留着会让被 reset 掉的那一轮在切读后**重新出现**（读侧拿计划成员兜底）。
+    留着会让被 reset 掉的那一轮**重新出现**（读侧拿计划成员兜底）。
+
+    返回被删的参与行数。
     """
     result = await session.execute(
         text(
@@ -1228,13 +1226,14 @@ async def mirror_delete_conversation(
         {"umo": umo, "cid": conversation_id},
     )
     msg_uids = [str(row[0]) for row in result.fetchall()]
-    await session.execute(
+    deleted = await session.execute(
         text(
             "DELETE FROM chat_memory_message_bots "
             "WHERE umo = :umo AND conversation_id = :cid"
         ),
         {"umo": umo, "cid": conversation_id},
     )
+    affected = int(deleted.rowcount or 0)
     await session.execute(
         text(
             "DELETE FROM chat_memory_reply_messages "
@@ -1250,6 +1249,7 @@ async def mirror_delete_conversation(
         {"umo": umo, "cid": conversation_id},
     )
     await _drop_orphan_messages(session, msg_uids)
+    return affected
 
 
 async def mirror_delete_before(session: AsyncSession, before: Any) -> None:

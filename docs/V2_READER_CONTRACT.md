@@ -3,8 +3,8 @@
 给**不 import AstrBot、不 import `chat_memory`、只用 `mode=ro` 打开数据库**的独立进程。
 进程内消费者用插件实例的公开方法（见 README §9.3），本文只讲表契约。
 
-- 适用结构线：`chat_memory_shadow_meta.schema_version = 6`（插件 2.0.x）
-- 表全部带前缀 `chat_memory_`，与旧存档表（`chat_memory_records` 等，退役中）同库共存
+- 适用结构线：`chat_memory_shadow_meta.schema_version = 6`（插件 2.0.x / 2.1.x）
+- 表全部带前缀 `chat_memory_`，与旧存档表（`chat_memory_records` 等，2.1 起停用不再读写）同库共存
 
 ---
 
@@ -33,8 +33,9 @@ con = sqlite3.connect("file:.../plugin_data/chat_memory/chat_memory.db?mode=ro",
 | `chat_memory_session_seq` | `platform_name`、`message_type`、`session_id`、`last_seq` |
 | `chat_memory_shadow_meta` | `key`、`value`（键值表；本文用到 `key='schema_version'` 与 `'dual_write_started_at'`） |
 
-**内部面**（不作为契约）：`fingerprint`（去重辅助）、所有 `id`/`rowid`、`chat_memory_records` /
-`chat_memory_tool_records` / `chat_memory_media_archive`（1.x 旧表）、查询台的物化视图与 TEMP 表。
+**内部面**（不作为契约）：`fingerprint`（去重辅助）、所有 `id`/`rowid`、`chat_memory_media_archive`
+（媒体归档，属数据层而非读者契约）、查询台的物化视图与 TEMP 表。旧表 `chat_memory_records` /
+`chat_memory_tool_records` 自 2.1 起不再读写，**更不是契约**——它们留在库里只是等用户清理。
 
 模型三条：**物理消息**（一行，跨实例唯一）／**参与行**（每个适配器实例一份视角）／**轮次**
 （`turn_id` 把一条提问、它的回复、这轮工具调用绑在一起）。
@@ -94,8 +95,8 @@ from chat_memory.relation_codec import KNOWN_CONTENT_TOKENS   # 需要能 import
 SELECT value FROM chat_memory_shadow_meta WHERE key = 'schema_version';
 ```
 
-进程内消费者用插件实例的 `get_shared_store_status()`（返回 `source` / `schema_version` /
-`dual_write_started_at` / `shadow_read_ready`），比直接读 meta 表更稳。
+进程内消费者用插件实例的 `get_shared_store_status()`（返回 `schema_version` /
+`expected_schema_version` / `dual_write_started_at`），比直接读 meta 表更稳。
 
 > **代际（epoch）暂不提供**：给会话加代际号需要动结构线（新表或新列 + 全部部署端迁移一次），
 > 而 2.0 的 `seq` 已经不会因删除回绕，剩下能打破游标的只有“结构重建”，用上面的分区键就能

@@ -5,6 +5,7 @@ from html import escape as _xml_escape
 import re
 from typing import Optional
 
+from .models import K_SYSTEM as _K_SYSTEM
 from .relation_codec import build_event_sentence as _build_event_sentence
 from .qq_face import face_name as _face_name
 
@@ -75,12 +76,14 @@ MEDIA_PLACEHOLDER_LABELS = {
     "file": "<cm_file/>",
     "emoji": "<cm_emoji/>",
     "forward": "<cm_forward/>",
-    # 1.5.0 前落库的旧 poke 消息：兼容渲染为事件占位
+    # poke 在入站侧是事件（content_kind=["event"]），这里给出可读占位
     "poke": '<cm_event type="poke">戳一戳</cm_event>',
 }
 
-# capture 阶段写入的旧英文占位：展示层视为"无实际内容"，统一替换成上面的占位。
-_LEGACY_EN_PLACEHOLDERS = {
+# 写入侧对纯媒体消息填的占位正文（与 storage / 分类器写库时用的字面一致）：
+# 命中它说明"这条消息本身没有可读文本"，展示层应只输出上面的 cm 占位标签，
+# 而不是把 "[image]" 当正文再拼一遍占位。
+_MEDIA_ONLY_PLACEHOLDERS = {
     "[image]", "[video]", "[voice]", "[file]", "[emoji]",
     "[forward]", "[poke]",
 }
@@ -121,9 +124,6 @@ CROSS_SESSION_CONTEXT_INSTRUCTION = """[ChatMemory 跨会话来源规则]
 
 
 
-LEGACY_ASSISTANT_SOURCE_PREFIX_RE = re.compile(
-    r"^(?:\s*\[(?:(?:群|私|会)\d+|未知)\])+\s*"
-)
 CM_XML_TAG_RE = re.compile(
     r"</?cm_(?:[A-Za-z0-9_.:-]+)?(?:\s[^<>]*?)?\s*/?>",
     re.IGNORECASE,
@@ -143,11 +143,6 @@ CM_TIME_UNCLOSED_RE = re.compile(
     r"(?:\s*<cm_time(?:\s[^<>]*?)?\s*>)?",
     re.IGNORECASE,
 )
-
-
-def strip_legacy_assistant_source_prefix(text: str) -> str:
-    """仅清理 assistant 正文开头由旧版 CM 注入的来源标签。"""
-    return LEGACY_ASSISTANT_SOURCE_PREFIX_RE.sub("", text or "", count=1)
 
 
 def strip_cm_xml_tags(text: str) -> str:
@@ -370,8 +365,6 @@ class TakeoverContextBuilder:
         for record in records:
             content = strip_reasoning_prefix(record.get("content", "") or "")
             role = record.get("role", "user")
-            if role == "assistant":
-                content = strip_legacy_assistant_source_prefix(content)
             # 用户侧手动伪造的 cm_ XML 提前清除，防止其元数据被 LLM 采信；
             # 有 relation_data 的正文已由 storage 层渲染成可信 <cm_mention>，跳过。
             if not record.get("relation_data"):
@@ -439,11 +432,10 @@ class TakeoverContextBuilder:
     def _render_event(self, record: dict) -> Optional[str]:
         """事件记录渲染为 <cm_event>（内含自然语言句子）。
 
-        非事件（event / 旧值 system_event）或无 event 结构返回 None，
-        走普通消息渲染。
+        非事件（kind 无 ``event``）或无 event 结构返回 None，走普通消息渲染。
         """
         kinds = record.get("content_kind") or []
-        if "event" not in kinds and "system_event" not in kinds:
+        if _K_SYSTEM not in kinds:
             return None
         relation = record.get("relation_data")
         event = relation.get("event") if isinstance(relation, dict) else None
@@ -484,7 +476,7 @@ class TakeoverContextBuilder:
             return content
         placeholder_text = " ".join(labels)
         stripped = (content or "").strip()
-        if not stripped or stripped in _LEGACY_EN_PLACEHOLDERS:
+        if not stripped or stripped in _MEDIA_ONLY_PLACEHOLDERS:
             return placeholder_text
         return f"{content} {placeholder_text}".rstrip()
 

@@ -1,5 +1,4 @@
 TODO.md
-REFACTOR_NOTES.md
 __pycache__/
 *.pyc
 logo-*/
@@ -7,7 +6,7 @@ dumps/
 data/
 # 内部开发文档（本地保留，不对外）：只忽略这几份，docs/V2_READER_CONTRACT.md 随仓库发布
 docs/PROJECT_CONTEXT.md
-docs/HANDOFF.md
+docs/HANDOFF*.md
 docs/multi_bot_shared_store.md
 docs/EXTERNAL_READER_API.md
 docs/media_insight_design.md

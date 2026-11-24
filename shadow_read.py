@@ -1,7 +1,6 @@
-"""合并存储（影子层）只读查询——**V2 读路径**，旧表的 V1 读路径保持不变。
+"""合并存储只读查询——本插件唯一的读路径。
 
-切换读取时两边要能对拍、能回退，所以 V1 一行不改，V2 全部从
-``chat_memory_messages``（物理消息，跨实例唯一）+ ``chat_memory_message_bots``
+数据来自 ``chat_memory_messages``（物理消息，跨实例唯一）+ ``chat_memory_message_bots``
 （每实例参与行：role / llm_status / send_status / persona / target / 本实例 mid 与时刻）
 + ``chat_memory_reply_messages``（本轮的计划正文与轮次状态，一轮一条）读。
 
@@ -9,7 +8,7 @@
 
 1. **每实例视图**：同一条物理消息只有一行，参与行每实例一份。查询按 ``(msg_uid, umo)``
    取一行（同一实例换过账号时会有多份 self_id，取信息最全的那份），于是"某个会话看到的
-   样子"与旧表的每实例视图等价。
+   样子"就是该实例眼中的样子。
 2. **一轮一条逻辑回复**：按 ``turn_id`` 归组（``turn_id`` 是发送侧生成的 uuid4，全局唯一），
    实际发出的每段并进同一组，段序用平台号 ``platform_seq``。所以一轮的"实际形态"＝该轮
    平台键行按 ``platform_seq`` 拼接（就是群里看到的样子），该轮没有任何平台键行时才回落
@@ -81,7 +80,6 @@ _VIEW_COLS = ", ".join(_COLS)
 _C = {name: index for index, name in enumerate(_COLS)}
 
 _PLAN_PREFIX = "l:"        # 发送前写的计划全文（本地键）
-_PLATFORM_PREFIX = "p:"    # 平台上真实存在的那条消息（平台键）
 # 一轮 assistant 侧有"计划行 + 1~3 段实际形态"，按逻辑条数取数时要按倍数多取
 _LOGICAL_OVERFETCH = 4
 # "交付未知"的宽限期：发送流程结束后回显可能还没到，这段时间里"没有实发段"不代表没发出去。
@@ -109,7 +107,7 @@ def _parse_created_at(raw: Any) -> Optional[datetime]:
 
 
 def _time_pair(raw: Any, tz: Optional[ZoneInfo]) -> tuple[str, str]:
-    """``(配置时区 naive 字符串, UTC ISO 8601)``——与 V1 ``_row_to_dict`` 口径一致。"""
+    """``(配置时区 naive 字符串, UTC ISO 8601)``——对外 API 的时间口径。"""
     if tz is None or not raw:
         return str(raw or ""), str(raw or "")
     try:
@@ -122,7 +120,7 @@ def _time_pair(raw: Any, tz: Optional[ZoneInfo]) -> tuple[str, str]:
 
 
 def _record(row: Any, tz: Optional[ZoneInfo]) -> dict:
-    """影子视图行 → 与 V1 ``query_history`` 同形的 dict（额外带 V2 字段）。"""
+    """视图行 → 对外查询返回的 dict（额外带合并存储专有字段）。"""
     template = str(row[_C["content"]] or "")
     relation = parse_relation_data(row[_C["relation_data"]]) or {}
     created_at, created_at_utc = _time_pair(row[_C["created_at"]], tz)
@@ -154,7 +152,7 @@ def _record(row: Any, tz: Optional[ZoneInfo]) -> dict:
         "relation_data": relation,
         # takeover 规整阶段按它兜底过滤"撤回不进上下文"
         "recalled_at": row[_C["recalled_at"]],
-        # V2 专有：影子层身份与段序（V1 没有这些列）
+        # 合并存储专有：物理消息身份与段序
         "record_id": int(row[_C["seq"]] or 0),
         "msg_uid": row[_C["msg_uid"]],
         "platform_seq": row[_C["platform_seq"]],
@@ -163,7 +161,6 @@ def _record(row: Any, tz: Optional[ZoneInfo]) -> dict:
         "recalled": bool(row[_C["recalled_at"]]),
         "segments": [row[_C["msg_uid"]]],
         "segment_count": 1,
-        "source": "shadow",
     }
 
 
@@ -206,7 +203,7 @@ def _filter_conditions(
     after_id: Optional[int],
     after_seq: Optional[int] = None,
 ) -> tuple[list[str], dict, tuple[str, ...]]:
-    """公共 WHERE 片段（消息级 + 参与行级），与 V1 同名参数一一对应。"""
+    """公共 WHERE 片段（消息级 + 参与行级），参数名与对外查询一一对应。"""
     conditions = ["deleted_at IS NULL"]
     params: dict[str, Any] = {}
     expanding: list[str] = []
@@ -285,12 +282,14 @@ async def fetch_messages(
     after_id: Optional[int] = None,
     after_seq: Optional[int] = None,
     collapse_turns: bool = True,
+    extra_conditions: Optional[list[str]] = None,
+    extra_params: Optional[dict] = None,
 ) -> list[dict]:
-    """按 V1 ``query_latest`` / ``query_messages_raw`` 的语义从影子层取消息。
+    """按对外查询的语义从合并存储取消息。
 
     ``collapse_turns``：assistant 行按"一轮一条逻辑回复"合并（计划行让位、平台键行按
     ``platform_seq`` 拼接）。**必须默认开**——影子层一轮有"计划行 + N 条实际形态行"，
-    不合并的话切读后同一句回复会重复出现 N+1 次（V1 那边一轮只有一行）。逻辑行比物理行
+    不合并的话同一句回复会重复出现 N+1 次。逻辑行比物理行
     少，所以取数时按倍数多取，再按逻辑条数截断。
     """
     conditions, params, expanding = _filter_conditions(
@@ -304,6 +303,12 @@ async def fetch_messages(
     if cid:
         conditions.append("conversation_id = :cid")
         params["cid"] = cid
+    if extra_conditions:
+        # 调用方追加的精确过滤（按平台 message_id 定位等）：直接拼进同一条 WHERE，
+        # 与内置条件共用参数命名空间。
+        conditions.extend(extra_conditions)
+        if extra_params:
+            params.update(extra_params)
     params = {**scope_params, **params}
     wanted = max(1, min(1000, int(limit)))
     fetch_limit = min(1000, wanted * _LOGICAL_OVERFETCH) if collapse_turns else wanted
@@ -311,7 +316,7 @@ async def fetch_messages(
     rows = list(
         await _select(
             session, conditions=conditions, params=params, expanding=expanding,
-            # 平手用 seq（会话内序号）稳定排序；V1 用的是旧表自增 id，语义一致
+            # 平手用 seq（会话内序号）稳定排序
             order=f"ORDER BY created_at {direction}, seq {direction}",
             limit=fetch_limit,
         )
@@ -331,8 +336,8 @@ async def fetch_messages(
         )
     if plan_fallback and after_id is None:
         # 只有计划、没有任何实际段的轮次（回显还没到 / 这台机器上就没订上 push）：
-        # 用计划成员兜底，一轮一条。漏掉的话这些轮次在切读后**整句消失**，而 V1 那边
-        # 是看得到的（计划行本来就写进旧表）。只补"本轮别的行已经在范围内"的轮次——
+        # 用计划成员兜底，一轮一条。漏掉的话这些轮次会**整句消失**（计划行是真实存在的
+        # 回复内容）。只补"本轮别的行已经在范围内"的轮次——
         # 这样用户过滤/会话过滤由那行自己带来，不需要在链接表上重算一遍范围条件。
         # ``role_filter="user"`` 时**不能**补：那是配对查询在取 user 侧，补进来就成了
         # 把 assistant 行当 user 行返回（一轮双份）。
@@ -393,7 +398,10 @@ def _plan_passes_filters(
     if include_kinds is not None:
         kinds = set(_kinds_of(plan.get("content_kind")))
         if all_match:
-            if not include_kinds <= kinds:
+            # ALL 语义与主 SQL 一致：该行 kinds 非空且**全部**在允许集合内
+            # （``kinds ⊆ include_kinds``）。写成 ``include_kinds <= kinds`` 会反过来：
+            # 白名单 {text} 遇上 {text,image} 时为真，把含图的回复放进「只要 text」。
+            if not kinds or not kinds <= include_kinds:
                 return False
         elif not (kinds & include_kinds):
             return False
@@ -403,8 +411,8 @@ def _plan_passes_filters(
 def _collapse_rows(rows: list[Any], *, tz: Optional[ZoneInfo]) -> list[dict]:
     """把"同一轮的 assistant 行"合并成一条（顺序按每轮第一行的位置保持不变）。
 
-    一轮的 assistant 侧在影子层是"计划行 + 各段实际形态"，V1 那边只有一行——消息级读
-    路径也要守同一个不变量，否则切读后同一句回复会重复出现。没有 ``turn_id`` 的行
+    一轮的 assistant 侧是"计划行 + 各段实际形态"——消息级读路径也要守同一个不变量，
+    否则同一句回复会重复出现。没有 ``turn_id`` 的行
     （孤儿消息、别人的发言）原样返回。
     """
     groups: dict[str, list[Any]] = {}
@@ -488,7 +496,7 @@ async def _fetch_plan_members(
         conditions.append("conversation_id = :cid")
         params["cid"] = cid
     # 时间窗与 persona 必须和 user 侧同一套：否则窗口之后才生成的计划全文、或别的
-    # persona 的回复会被兜底带进上下文（V1 的时间窗是同时作用于两侧的）。
+    # persona 的回复会被兜底带进上下文（时间窗是同时作用于两侧的）。
     if since is not None:
         conditions.append("created_at >= :since")
         params["since"] = since
@@ -540,7 +548,7 @@ async def fetch_rounds(
     """配对查询：每轮 ``[user_dict, assistant_dict]``（assistant 侧是合并后的完整回复）。"""
     wanted = max(1, min(1000, int(limit_rounds)))
     # 先按 wanted 取、再按"有没有回复"过滤，会把返回轮数压到远小于 wanted（群里 bot 只回
-    # 一部分消息）。改为先超取再裁：配对密度足够时轮数稳定等于 wanted，与 V1 的 LIMIT 对齐。
+    # 一部分消息）。改为先超取再裁：配对密度足够时轮数稳定等于 wanted。
     user_rows = await fetch_messages(
         session, scope_cond=scope_cond, scope_params=scope_params, tz=tz, cid=cid,
         limit=min(1000, wanted * 6), statuses=statuses,
@@ -565,7 +573,7 @@ async def fetch_rounds(
     ]
     # ``user_rows`` 出来是**升序**（fetch_messages 内部先 DESC 取窗口再 reverse），
     # 所以取"最近 wanted 轮"必须从尾部切：``[:wanted]`` 会把最新窗口里最旧的几轮留下、
-    # 把用户刚聊的那几轮丢掉（V1 是 ORDER BY ... DESC LIMIT，语义相反）。
+    # 把用户刚聊的那几轮丢掉（方向取反，取最近而不是最早）。
     if len(paired) > wanted:
         paired = paired[:wanted] if from_oldest else paired[-wanted:]
     return paired
@@ -598,7 +606,10 @@ async def _fetch_turn_replies(
         conditions.append("created_at >= :since")
         params["since"] = since
     if until is not None:
-        conditions.append("created_at < :until")
+        # 与 user 侧 `_filter_conditions`、计划兜底 `_fetch_plan_members` 的 `<=` 对齐：
+        # 同一条消息在两侧的窗口判定必须一致，否则 assistant 段恰好落在 until 那一秒时
+        # 整轮被丢（user 行进了窗口、回复行没进，fetch_rounds 只返回有回复的轮次）。
+        conditions.append("created_at <= :until")
         params["until"] = until
     if filter_by_persona:
         conditions.append("COALESCE(persona_id, '') = :persona")
@@ -699,7 +710,7 @@ async def fetch_turn_targets(
 ) -> dict[tuple[str, str], dict]:
     """V2 版 ``query_turn_targets``：``{(turn_id, role): record}``。
 
-    与 V1 同形（``{(turn_id, role): 记录}``），但 assistant 侧是**这一轮合并后的一条
+    返回 ``{(turn_id, role): 记录}``，assistant 侧是**这一轮合并后的一条
     逻辑回复**：被引用的那句回复本来就由多段组成，只取最早一段会让引用只剩半句。
     user 侧仍取最早一条（一轮只有一条用户消息）。
     """
@@ -722,7 +733,7 @@ async def fetch_turn_targets(
         targets.setdefault(key, _record(row, tz))
     for turn, group in assistant_rows.items():
         targets[(turn, "assistant")] = _collapse_turn(group, tz=tz)
-    # 只有计划、没有实际段的轮次：照样能用计划成员当引用目标（与 V1 一致）
+    # 只有计划、没有实际段的轮次：照样能用计划成员当引用目标
     missing = [turn for turn in clean_ids if turn not in assistant_rows]
     if missing:
         replies = await _fetch_turn_replies(

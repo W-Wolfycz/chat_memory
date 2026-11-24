@@ -32,8 +32,8 @@ UNIT_MESSAGE = "message"
 
 
 def row_coord(row: dict, key_field: str = "record_id") -> int:
-    """取一行的窗口坐标：V1 是旧表自增 ``id``、V2 是会话内 ``seq``，都在
-    ``record_id`` 字段里。缺失（桩数据/老格式）返回 0，调用方据此跳过锚点写入。
+    """取一行的窗口坐标：合并存储的会话内 ``seq``，落在 ``record_id`` 字段里。
+    缺失（桩数据/老格式）返回 0，调用方据此跳过锚点写入。
 
     全库只在这里解释"坐标从哪个字段取"，避免调用方各自兜底导致语义漂移。
     """
@@ -76,7 +76,7 @@ def window_disabled_reason(total: int, retain_pct: int) -> str:
 class AnchorState:
     """一个窗口的锚点状态（只存在内存里）。"""
 
-    anchor: int                                  # 窗口起点：V2 是 seq，V1 是 id
+    anchor: int                                  # 窗口起点（会话内 seq）
     hits: int = 0                                # 复用次数（诊断用）
     advances: int = 0                            # 跳块次数（诊断用）
 
@@ -96,7 +96,7 @@ class AnchorStore:
         self._max = max(1, int(max_entries))
 
     def get(self, key: str, *, floor: int = 0) -> Optional[int]:
-        """取锚点；``floor`` 是本次查询能取到的最小坐标（V2 是 0，V1 是 1）。
+        """取锚点；``floor`` 是本次查询能取到的最小坐标（会话内 ``seq`` 从 1 起）。
 
         锚点小于 floor 说明库被重建过（结构线迁移把 seq 归零）或会话被清空过，
         此时返回 None 让调用方重新起算——不能拿一个指向"未来"的锚点去查。
@@ -148,7 +148,6 @@ def scope_key(
     unit: str,
     total: int,
     retain_pct: int,
-    source: str = "",
 ) -> str:
     """构造锚点的作用域键。
 
@@ -159,13 +158,10 @@ def scope_key(
     键里必须包含：可见集合的边界（umo/cid/user/persona/scope）+ 过滤条件 +
     窗口参数（单位/上限/比例）。窗口参数变化等于用户换了窗口，锚点自然失效。
 
-    ``source``：读源（``"v1"`` / ``"v2"``）。**必须进 key**——两边的坐标值域
-    不同（旧表自增 id vs 会话内 seq），混用会让窗口瞬间错位甚至查空。
     """
     kinds = ",".join(sorted(include_kinds)) if include_kinds else ""
     stat = ",".join(sorted(statuses)) if statuses else ""
     parts = [
-        f"src={source}",
         f"unit={unit}",
         f"umo={umo}",
         f"cid={cid or ''}",

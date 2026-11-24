@@ -1,88 +1,42 @@
-"""chat_memory — 异步 SQLite 存储层（旧表 schema v8）。
+"""chat_memory — 异步 SQLite 存储层。
+
+数据落在合并存储（``chat_memory_messages`` / ``chat_memory_message_bots`` /
+``chat_memory_reply_messages`` / ``chat_memory_tool_calls``）；旧表
+``chat_memory_records`` / ``chat_memory_tool_records`` 自 2.1 起不再读写。
 
 Schema 说明：
 - ``llm_status``：LLM 配对状态（单值）。'' = 默认（未走 LLM），
   其他取值：'llm_pending' / 'llm_success' / 'proactive' / 'orphan'。
 - ``content_kind``：消息内容形态（JSON 数组字符串，如 '["text","image"]'）。
   支持值：'text' / 'image' / 'video' / 'voice' / 'file' / 'emoji' / 'forward' / 'poke'
-  / 'event'（旧值 'system_event' 仅兼容读取）。空数组 '[]' 表示 empty（如纯 @ 无文本）。
-- ``at_id`` / ``reply_id`` / ``forward_id``：上下文引用 ID，仅在对应组件出现时存。
+  / 'event'。空数组 '[]' 表示 empty（如纯 @ 无文本）。
+- ``at_id`` / ``reply_id`` / ``forward_id``：上下文引用 ID，合并存储里折进 ``relation_data``。
 - ``turn_id``：内部轮次 ID，新记录不依赖平台 message_id 即可配对。
 - ``send_status``：assistant 发送流程状态（prepared / send_attempted），不表示平台回执。
-
-缺列（1.4.0 之前的 schema）不做猜测性字段映射也不自动迁移：``init_db`` 直接抛错说明缺哪一列，
-由用户按 README 的升级步骤处理；已有基础列的测试版 schema 则增量补齐后续新增列。
 """
 
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import bindparam, event, text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from astrbot.api import logger
 
 from . import shadow_read, shared_store
 from .models import VALID_LLM_STATUSES, VALID_SEND_STATUSES
-from .relation_codec import parse_relation_data, render_content_template
 
-
-_CREATE_TABLE_SQL = """\
-CREATE TABLE IF NOT EXISTS chat_memory_records (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    umo             TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    user_id         TEXT NOT NULL,
-    role            TEXT NOT NULL,
-    content         TEXT NOT NULL DEFAULT '',
-    message_id      TEXT,
-    pair_id         TEXT,
-    llm_status      TEXT NOT NULL DEFAULT '',
-    content_kind    TEXT NOT NULL DEFAULT '[]',
-    platform_id     TEXT,
-    platform_name   TEXT,
-    message_type    TEXT,
-    session_id      TEXT,
-    self_id         TEXT,
-    group_id        TEXT,
-    sender_nickname TEXT,
-    raw_timestamp   INTEGER,
-    at_id           TEXT,
-    reply_id        TEXT,
-    forward_id      TEXT,
-    persona_id      TEXT,
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    turn_id         TEXT,
-    send_status     TEXT NOT NULL DEFAULT '',
-    relation_data   TEXT,
-    recalled_at     DATETIME,
-    deleted_at      DATETIME
-)"""
-
-# 工具调用独立存档（schema v4）：不回放进主表的 user/assistant 配对，
-# 只在 takeover 时按轮次渲染成 OpenAI 格式（assistant tool_calls + role=tool）。
-_CREATE_TOOL_TABLE_SQL = """\
-CREATE TABLE IF NOT EXISTS chat_memory_tool_records (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    umo             TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    turn_id         TEXT NOT NULL,
-    call_index      INTEGER NOT NULL,
-    tool_name       TEXT NOT NULL,
-    tool_args       TEXT NOT NULL DEFAULT '',
-    tool_result     TEXT NOT NULL DEFAULT '',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at      DATETIME
-)"""
 
 # 媒体归档（schema v5）：user 侧媒体落盘后登记，CM_UI 据此回看。
 # 只在归档成功时插行；失败不落行。文件路径不落库：由 file_name + created_at
 # 推导（media/<YYYYMM>/<内容哈希>.<ext>）；v8 起文件名是内容寻址的哈希，不含隐私标识。
+_MEDIA_ARCHIVE_TABLE_NAME = "chat_memory_media_archive"
+
 _CREATE_MEDIA_ARCHIVE_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS chat_memory_media_archive (
     media_id        TEXT PRIMARY KEY,
@@ -118,9 +72,6 @@ _MEDIA_ARCHIVE_INDEX_DEFINITIONS = {
     ),
 }
 
-_SCHEMA_VERSION = 8
-
-
 async def _mirror_record_payload(
     session,
     payload: dict,
@@ -128,7 +79,7 @@ async def _mirror_record_payload(
     platform_uid,
     post_type: str,
 ) -> bool:
-    """影子专用镜像（不写旧表）：供平台回显使用。"""
+    """只写这一条到合并存储（供平台回显使用，不写计划行）。"""
     return await shared_store.mirror_record(
         session,
         {
@@ -139,126 +90,84 @@ async def _mirror_record_payload(
         },
     )
 
-# 现有库必须已具备的列：缺失说明是 1.4.0 之前的 schema，不再自动迁移。
-# 这里必须覆盖**索引与 SELECT 实际依赖的列**：只查核心列的话，缺列不会走到下面那条
-# 友好的 RuntimeError，而是在建索引/查询时中途报 `no such column`，用户看不出怎么修。
-_REQUIRED_COLUMNS = {
-    "id", "umo", "conversation_id", "user_id", "role", "content", "llm_status",
-    "content_kind", "created_at", "persona_id", "turn_id", "send_status",
-    "relation_data", "message_id", "pair_id", "platform_id", "group_id",
-    "session_id", "message_type", "self_id", "at_id", "reply_id", "forward_id",
-    "raw_timestamp", "deleted_at", "recalled_at",
-}
 
-_INDEX_DEFINITIONS = {
-    "ix_cm_umo_cid_user": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_umo_cid_user "
-        "ON chat_memory_records (umo, conversation_id, user_id)"
-    ),
-    "ix_cm_created": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_created "
-        "ON chat_memory_records (created_at)"
-    ),
-    "ix_cm_pair_id": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_pair_id "
-        "ON chat_memory_records (pair_id)"
-    ),
-    "ix_cm_platform_group_time": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_platform_group_time "
-        "ON chat_memory_records (platform_id, group_id, created_at)"
-    ),
-    "ix_cm_platform_user_time": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_platform_user_time "
-        "ON chat_memory_records (platform_id, user_id, created_at)"
-    ),
-    # 撤回/表情回应的 message_id 本地关联（此前无索引，每条通知全表扫描）
-    "ix_cm_umo_message_id": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_umo_message_id "
-        "ON chat_memory_records (umo, message_id)"
-    ),
-    "ix_cm_llm_status": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_llm_status "
-        "ON chat_memory_records (llm_status)"
-    ),
-    "ix_cm_umo_role_time": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_umo_role_time "
-        "ON chat_memory_records (umo, role, created_at)"
-    ),
-    "ix_cm_persona": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_persona "
-        "ON chat_memory_records (persona_id)"
-    ),
-    # 软删除过滤（schema v7）：所有读路径都带 deleted_at IS NULL
-    "ix_cm_umo_deleted": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_umo_deleted "
-        "ON chat_memory_records (umo, deleted_at)"
-    ),
-    "ux_cm_turn_role": (
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_cm_turn_role "
-        "ON chat_memory_records (turn_id, role) "
-        "WHERE turn_id IS NOT NULL AND turn_id <> ''"
-    ),
-}
+async def _collect_media_rows(session, where: str, params: dict) -> list[dict]:
+    """取待删归档行（file_name + created_at），供调用方删物理文件。
 
-_TOOL_INDEX_DEFINITIONS = {
-    "ux_cm_tool_turn_seq": (
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_cm_tool_turn_seq "
-        "ON chat_memory_tool_records (turn_id, call_index)"
-    ),
-    "ix_cm_tool_umo_cid_time": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_tool_umo_cid_time "
-        "ON chat_memory_tool_records (umo, conversation_id, created_at)"
-    ),
-    # 软删除过滤（schema v7）：查询台单条软删除记录后的读路径过滤
-    "ix_cm_tool_deleted": (
-        "CREATE INDEX IF NOT EXISTS ix_cm_tool_deleted "
-        "ON chat_memory_tool_records (umo, deleted_at)"
-    ),
-}
-
-
-def schema_statements(
-    existing_columns: set, existing_tool_columns: set, existing_media_columns: set = None
-) -> list:
-    """按**执行顺序**返回建表 / 迁移 / 建索引语句（纯函数，便于测试顺序）。
-
-    顺序约定（踩过的坑）：**必须先 `ALTER TABLE ADD COLUMN` 再建该列的索引**，
-    否则存量旧库执行 `CREATE INDEX ... (umo, deleted_at)` 会因缺列直接失败，
-    插件加载阶段就崩。传入的两组列名来自 `PRAGMA table_info`；空集合表示建新表
-    （新表定义里已含新列，无需 ALTER）。
+    必须在**同一个事务**里、删行之前取：先提交删行再取会漏掉刚落库的行，
+    取不到就等于文件永久留在磁盘上。``where`` 只接受本模块内写死的条件片段。
     """
-    statements: list = [_CREATE_TABLE_SQL]
-    if existing_columns and "recalled_at" not in existing_columns:
-        # v5 → v6：撤回感知需要标记被撤回的原消息（NULL=未撤回）
-        statements.append(
-            "ALTER TABLE chat_memory_records ADD COLUMN recalled_at DATETIME"
+    result = await session.execute(
+        text(f"SELECT file_name, created_at FROM chat_memory_media_archive WHERE {where}"),
+        params,
+    )
+    return [{"file_name": row[0], "created_at": row[1]} for row in result.fetchall()]
+
+
+async def _preserve_shadow_tables(conn, recorded: str) -> list[str]:
+    """不认识的旧结构：把合并存储表改名留档，而不是直接 DROP。
+
+    ``DROP`` 会把用户全部聊天历史一次删光，而返回值仍是"加载成功"——一次结构编号
+    异常就等于数据丢失。改名后数据仍在这份库里（可用任何 SQLite 工具导出），
+    新结构照常建立，代价只是多占一份空间，由用户自己决定何时清理。
+
+    留档表名**唯一**：同名已存在时追加序号（`_before_99` → `_before_99_2` → …），
+    绝不删掉上一份。重跑一次不代表上一份留档可以先扔——那是同样的用户数据，
+    再次丢弃等于把"别删数据"的初衷做反。
+
+    返回实际留档的新表名（空列表＝没有可留档的表，例如全新库）。
+    """
+    keep = (
+        "chat_memory_messages",
+        "chat_memory_message_bots",
+        "chat_memory_reply_messages",
+        "chat_memory_tool_calls",
+        "chat_memory_session_seq",
+        "chat_memory_shadow_meta",
+    )
+    base = "_before_" + "".join(
+        ch if ch.isalnum() else "_" for ch in str(recorded or "unknown")
+    )[:20]
+    preserved: list[str] = []
+    for table in keep:
+        exists = await conn.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :name"
+            ),
+            {"name": table},
         )
-    if existing_columns and "deleted_at" not in existing_columns:
-        # v6 → v7：软删除标记（NULL=正常；非空=被查询台单条标记删除）
-        statements.append(
-            "ALTER TABLE chat_memory_records ADD COLUMN deleted_at DATETIME"
+        if exists.first() is None:
+            continue
+        renamed = await _unique_table_name(conn, f"{table}{base}")
+        # 表名来自本函数内的白名单与清洗过的版本串，仍需防御性校验后拼进 DDL
+        # （SQLite 不支持把标识符做成绑定参数）。
+        if not (table.isidentifier() and renamed.isidentifier()):
+            raise RuntimeError(f"留档表名不合法：{renamed!r}")
+        await conn.execute(text(f'ALTER TABLE "{table}" RENAME TO "{renamed}"'))
+        preserved.append(renamed)
+    return preserved
+
+
+async def _unique_table_name(conn, base: str) -> str:
+    """在 ``base`` 上找一个尚未占用的表名（``x`` → ``x_2`` → ``x_3`` …）。
+
+    留档必须**每份都留**：同名就换个序号，不覆盖。重跑一次结构异常说明用户又
+    多了一份历史数据，上一份留档不是废料。
+    """
+    candidate = base
+    for n in range(2, 1000):
+        exists = await conn.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :name"),
+            {"name": candidate},
         )
-    statements.extend(_INDEX_DEFINITIONS.values())
-    # 工具调用表（schema v4 起）：独立存档，不进主表配对。
-    statements.append(_CREATE_TOOL_TABLE_SQL)
-    if existing_tool_columns and "deleted_at" not in existing_tool_columns:
-        statements.append(
-            "ALTER TABLE chat_memory_tool_records ADD COLUMN deleted_at DATETIME"
-        )
-    statements.extend(_TOOL_INDEX_DEFINITIONS.values())
-    # 媒体归档表（schema v5 起）：CREATE IF NOT EXISTS 幂等，无数据迁移。
-    statements.append(_CREATE_MEDIA_ARCHIVE_TABLE_SQL)
-    if existing_media_columns and "content_hash" not in existing_media_columns:
-        # v7 → v8：媒体内容哈希（同图多实例去重 + 出现次数查询）
-        statements.append(
-            "ALTER TABLE chat_memory_media_archive ADD COLUMN content_hash TEXT"
-        )
-    statements.extend(_MEDIA_ARCHIVE_INDEX_DEFINITIONS.values())
-    return statements
+        if exists.first() is None:
+            return candidate
+        candidate = f"{base}_{n}"
+    raise RuntimeError(f"留档表名用尽：{base}")
 
 
 async def _shadow_step_is_noop(conn, statement: str) -> tuple[bool, str]:
-    """影子层迁移步骤是否"已经生效过"（只对可重复执行的步骤判定）。
+    """合并存储的迁移步骤是否"已经生效过"（只对可重复执行的步骤判定）。
 
     ``ALTER TABLE <表> DROP COLUMN <列>`` 没有 ``IF EXISTS`` 写法：上次迁移中途失败后
     重跑会报 ``no such column``。这里先查一次 ``PRAGMA table_info``，列已不在就跳过；
@@ -300,20 +209,20 @@ class DBManager:
         self._init_lock = asyncio.Lock()
         # 输出时区：created_at 存 UTC naive，查询返回时转此 tz naive；None 则原样输出 UTC
         self._tz = tz
-        # 合并存储（影子双写，阶段一）：只写新表，读路径仍走旧表。
+        # 合并存储是唯一存储：写入只落新表。
         self.shadow_enabled = bool(shadow)
         self.shadow_stats = {"writes": 0, "skipped": 0, "failures": 0, "last_error": ""}
-        # 影子写出现的"非运行期异常"（代码/结构问题）只 ERROR 报一次，避免刷屏
+        # 写入链路出现的"非运行期异常"（代码/结构问题）只 ERROR 报一次，避免刷屏
         self._shadow_code_error_logged = False
         self._register_pragmas()
 
     async def _shadow_write(self, operation) -> bool:
-        """尽力而为地镜像到合并存储表；返回是否**真的写入**了影子行。
+        """把一条数据写进合并存储；返回是否**真的写入**了。
 
-        影子写失败必须完全隔离：只累加计数 + 记异常类型（异常串可能带 SQL 参数
-        ＝聊天正文），绝不让旧表的主写入链路失败。
+        写失败必须完全隔离：只累加计数 + 记异常类型（异常串可能带 SQL 参数
+        ＝聊天正文），不让一次写失败拖垮调用方的其余流程。
 
-        返回假（数据不足被跳过 / 影子层关闭 / 写异常）时调用方**不得**当成功上报：
+        返回假（数据不足被跳过 / 存储未启用 / 写异常）时调用方**不得**当成功上报：
         平台回显曾因此记成 ``echo/fetched`` 而实际一行没落，线上看着像通道正常。
         """
         if not self.shadow_enabled:
@@ -322,12 +231,12 @@ class DBManager:
             async with self.async_session() as session:
                 mirrored = await operation(session)
                 await session.commit()
-        except Exception as exc:  # noqa: BLE001 - 影子链路整体兜底
+        except Exception as exc:  # noqa: BLE001 - 写入链路整体兜底
             self.shadow_stats["failures"] += 1
             self.shadow_stats["last_error"] = type(exc).__name__
             # DBAPI/驱动类错误是可重试的运行期故障；其它（NameError/AttributeError/
             # ProgrammingError＝代码或结构问题）第一次就以 ERROR 报一次——它们不会自愈，
-            # 只记 DEBUG 会让"镜像从来没写全"一路静默到切读那天。
+            # 只记 DEBUG 会让"从来没写全"一路静默下去。
             module = type(exc).__module__ or ""
             if not module.startswith("sqlalchemy.exc") and not isinstance(exc, OSError):
                 if not self._shadow_code_error_logged:
@@ -367,78 +276,29 @@ class DBManager:
             if self._initialized:
                 return
             async with self.engine.begin() as conn:
-                # 1.4.0 之前的旧 schema 不再迁移（市场首发 1.4.0）：
-                # 缺列时直接给出可诊断的失败，而不是静默增量迁移。
-                result = await conn.execute(text("PRAGMA table_info(chat_memory_records)"))
-                existing_cols = {row[1] for row in result.fetchall()}
-                missing = (
-                    sorted(_REQUIRED_COLUMNS - existing_cols) if existing_cols else []
-                )
-                if missing:
-                    raise RuntimeError(
-                        "检测到 1.4.0 之前的旧数据库 schema（缺少列："
-                        + ", ".join(missing)
-                        + "）。请先用 1.4.0 升级该数据库，或移走旧库文件后重启。"
-                    )
-                tool_info = await conn.execute(
-                    text("PRAGMA table_info(chat_memory_tool_records)")
-                )
-                existing_tool_cols = {row[1] for row in tool_info.fetchall()}
+                # 旧表（chat_memory_records / chat_memory_tool_records）自 2.1 起不再
+                # 建表、不再迁移、不再读写；用户自己清掉之前它们就静静躺在库里。
+                # 媒体归档表仍是本插件的数据，继续维护。
+                await conn.execute(text(_CREATE_MEDIA_ARCHIVE_TABLE_SQL))
+                # 存量库（v7 及更早建的媒体归档表）缺 content_hash 列：索引建在该列上，
+                # 不先补列会以 `no such column: content_hash` 在加载阶段崩掉。
                 media_info = await conn.execute(
-                    text("PRAGMA table_info(chat_memory_media_archive)")
+                    text(f"PRAGMA table_info({_MEDIA_ARCHIVE_TABLE_NAME})")
                 )
-                existing_media_cols = {row[1] for row in media_info.fetchall()}
-                # 建表 → 补列（v5→v6 recalled_at、v6→v7 deleted_at、v7→v8 content_hash）
-                # → 建索引：顺序写死在 schema_statements 里并有单测守卫（索引不得早于补列）。
-                if existing_cols:
-                    # ux_cm_turn_role 是唯一索引：1.6.0 之前没有该约束，存量库里**可能**
-                    # 已有重复 (turn_id, role)。直接建索引会在本事务里抛 IntegrityError，
-                    # 插件加载阶段就崩。索引已存在时跳过这步（无重复可谈，别每次加载都扫）。
-                    has_unique = await conn.execute(
+                media_columns = {row[1] for row in media_info.fetchall()}
+                if "content_hash" not in media_columns:
+                    await conn.execute(
                         text(
-                            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
-                            "AND name = 'ux_cm_turn_role'"
+                            f"ALTER TABLE {_MEDIA_ARCHIVE_TABLE_NAME} "
+                            "ADD COLUMN content_hash TEXT"
                         )
                     )
-                    if has_unique.first() is None:
-                        dup_result = await conn.execute(
-                            text(
-                                "SELECT COUNT(*) FROM chat_memory_records "
-                                "WHERE COALESCE(turn_id, '') <> '' AND id NOT IN ("
-                                "  SELECT MIN(id) FROM chat_memory_records "
-                                "  WHERE COALESCE(turn_id, '') <> '' "
-                                "  GROUP BY turn_id, role)"
-                            )
-                        )
-                        dup_rows = int(dup_result.scalar() or 0)
-                        if dup_rows:
-                            logger.warning(
-                                "[ChatMemory] 旧库存在 %d 条重复 (turn_id, role) 记录："
-                                "保留每轮最早的一条、删除其余，以便建立唯一约束",
-                                dup_rows,
-                            )
-                            await conn.execute(
-                                text(
-                                    "DELETE FROM chat_memory_records "
-                                    "WHERE COALESCE(turn_id, '') <> '' AND id NOT IN ("
-                                    "  SELECT MIN(id) FROM chat_memory_records "
-                                    "  WHERE COALESCE(turn_id, '') <> '' "
-                                    "  GROUP BY turn_id, role)"
-                                )
-                            )
-                for statement in schema_statements(
-                    existing_cols, existing_tool_cols, existing_media_cols
-                ):
+                for statement in _MEDIA_ARCHIVE_INDEX_DEFINITIONS.values():
                     await conn.execute(text(statement))
-                # 防止备份表残留的同名索引再次让 IF NOT EXISTS 静默跳过。
-                for index_name, table_name in [
-                    *((name, "chat_memory_records")
-                      for name in _INDEX_DEFINITIONS),
-                    *((name, "chat_memory_tool_records")
-                      for name in _TOOL_INDEX_DEFINITIONS),
-                    *((name, "chat_memory_media_archive")
-                      for name in _MEDIA_ARCHIVE_INDEX_DEFINITIONS),
-                ]:
+                # 防止同名索引残留在别的表上时 `IF NOT EXISTS` 静默跳过：
+                # 逐个确认索引真绑在媒体归档表上。注意 `.items()` 的值是**建索引 SQL**，
+                # 不能拿来当期望表名（那会让校验永远不通过，插件加载即失败）。
+                for index_name in _MEDIA_ARCHIVE_INDEX_DEFINITIONS:
                     index_result = await conn.execute(
                         text(
                             "SELECT tbl_name FROM sqlite_master "
@@ -446,14 +306,15 @@ class DBManager:
                         ),
                         {"name": index_name},
                     )
-                    if index_result.scalar() != table_name:
+                    bound_table = index_result.scalar()
+                    if bound_table != _MEDIA_ARCHIVE_TABLE_NAME:
                         raise RuntimeError(
-                            f"ChatMemory index {index_name} 未绑定到 {table_name}"
+                            f"ChatMemory index {index_name} 未绑定到 "
+                            f"{_MEDIA_ARCHIVE_TABLE_NAME}（实际：{bound_table or '不存在'}）"
                         )
                 if self.shadow_enabled:
-                    # 合并存储影子表：只增不改，旧表结构不受影响；版本记在
-                    # chat_memory_shadow_meta，不动旧库 user_version。结构升级（版本不等）
-                    # 时按迁移步骤走；不认识的旧结构丢弃重建，但**切读窗口沿用**。
+                    # 合并存储表：结构版本记在 chat_memory_shadow_meta。结构升级
+                    # （版本不等）时按迁移步骤走；不认识的旧结构丢弃重建。
                     carried_start = ""
                     migrate_trace = ""
                     meta_exists = await conn.execute(
@@ -471,12 +332,14 @@ class DBManager:
                         )
                         recorded = str(current.scalar() or "")
                         if recorded != str(shared_store.SHADOW_SCHEMA_VERSION):
-                            # 认识的旧结构走**迁移**（数据与切读窗口都保住）；不认识的
+                            # 认识的旧结构走**迁移**（数据与起点时间都保住）；不认识的
                             # 才丢弃重建。
                             steps = shared_store.shadow_migration_statements(recorded)
                             if steps is None:
-                                # 重建等于把镜像清空，但**切读窗口沿用**：窗口记的是"双写
-                                # 连续启用了多久"，不该因为一次结构升级就让人重等 7 天。
+                                # 不认识的旧编号：**不能直接丢弃重建**——那是把用户
+                                # 全部聊天历史一次删光，而且看起来像"加载成功"。改为把
+                                # 旧表改名留档（数据仍在这份库里，可人工导出/恢复），
+                                # 再按当前结构建一套空的；日志点名留档表名。
                                 kept = await conn.execute(
                                     text(
                                         "SELECT value FROM chat_memory_shadow_meta "
@@ -484,9 +347,19 @@ class DBManager:
                                     )
                                 )
                                 carried_start = str(kept.scalar() or "")
+                                preserved = await _preserve_shadow_tables(
+                                    conn, recorded or "unknown"
+                                )
                                 for statement in shared_store.drop_shadow_statements():
                                     await conn.execute(text(statement))
                                 migrate_trace = "rebuild:unknown_version"
+                                if preserved:
+                                    logger.warning(
+                                        "[ChatMemory] 合并存储结构版本无法识别（记录值 %r），"
+                                        "已把旧表改名留档，不会自动删除：%s。"
+                                        "需要旧数据请直接从这些表导出；确认不要后自行 DROP。",
+                                        recorded or "空", "、".join(preserved),
+                                    )
                             else:
                                 for statement in steps:
                                     # `ALTER TABLE … DROP COLUMN` 不是幂等的：上次迁移
@@ -510,7 +383,7 @@ class DBManager:
                                 # 日志里一片空白，没法判断）。
                                 logger.info(
                                     "[ChatMemory] 合并存储结构迁移完成：%s（%d 步，"
-                                    "切读窗口沿用）",
+                                    "双写起点沿用）",
                                     migrate_trace, len(steps),
                                 )
                     for statement in shared_store.shadow_schema_statements():
@@ -533,8 +406,8 @@ class DBManager:
                             ),
                             {"detail": migrate_trace},
                         )
-                    # 双写起点：只在第一次建立影子层时写一次。有历史数据就取最早的一条
-                    # （从旧 beta 升上来时窗口接着算，不白扔）；全新库取当前时刻。
+                    # 起点时间：只在第一次建立合并存储时写一次。有历史数据就取最早的
+                    # 一条（升级上来的接着算，不白扔）；全新库取当前时刻。
                     if carried_start:
                         await conn.execute(
                             text(
@@ -553,33 +426,8 @@ class DBManager:
                         ),
                         {"now": _utc_now_str()},
                     )
-                await conn.execute(text(f"PRAGMA user_version = {_SCHEMA_VERSION}"))
+                # 旧表已停用：不再写 user_version（那是旧表的结构版本号，写了反而误导）
             self._initialized = True
-
-    async def dual_write_window_days(self) -> float:
-        """双写已经跑了几天（影子层起点 → 现在）；没有起点或影子关闭时返回 -1。
-
-        切读门槛用（见 ``main._SHADOW_READ_MIN_DAYS``）：一份新装的库在跑满门槛之前
-        只写不读，避免拿只有几小时的数据就切读。读失败按 -1 处理＝未满。
-        """
-        if not self.shadow_enabled:
-            return -1.0
-        try:
-            await self.init_db()
-            async with self.async_session() as session:
-                result = await session.execute(
-                    text(
-                        "SELECT value FROM chat_memory_shadow_meta "
-                        "WHERE key = 'dual_write_started_at'"
-                    )
-                )
-                started = str(result.scalar() or "")
-            if not started:
-                return -1.0
-            begin = datetime.fromisoformat(started.replace("T", " "))
-            return (datetime.now(timezone.utc).replace(tzinfo=None) - begin).total_seconds() / 86400
-        except Exception:  # noqa: BLE001 - 取不到就当未满（宁可晚切，不可早切）
-            return -1.0
 
     async def upsert_group_names(
         self, rows: list[tuple[str, str, str]]
@@ -637,7 +485,7 @@ class DBManager:
         """读合并存储的结构元信息（``chat_memory_shadow_meta`` 整表键值）。
 
         供 ``get_shared_store_status`` 这类只读状态接口用：键只有几个、值都是短字符串，
-        一次查完比按需逐键查询省事。影子层关闭或读失败返回空字典（调用方给默认值）。
+        一次查完比按需逐键查询省事。存储未启用或读失败返回空字典（调用方给默认值）。
         """
         if not self.shadow_enabled:
             return {}
@@ -694,7 +542,13 @@ class DBManager:
                 )
                 row = result.first()
                 return str(row[0]) if row is not None else ""
-        except Exception:  # noqa: BLE001 - 查不到就按"没有 cid"处理，交给拉取通道
+        except Exception as exc:  # noqa: BLE001 - 回显通道的兜底查 cid
+            # DB 故障与"确实没有 cid"必须分得开：前者会让回显整条通道静默断流
+            # （表现为 push 一直 no_cid、库里 origin=echo 零行，日志里看不出原因）。
+            logger.warning(
+                "[ChatMemory] 回显查 cid 失败（本次按无 cid 处理）: %s",
+                type(exc).__name__,
+            )
             return ""
 
     async def insert(
@@ -732,15 +586,13 @@ class DBManager:
     ) -> Optional[bool]:
         """写入一条记录。
 
-        ``shadow_only=True``：**只**镜像到合并存储影子表，不写旧表/不更新旧表状态。
-        用于"影子层专属"的事实：**自己发言的实际形态**——它由两条供货通道之一带回
-        （push＝NapCat 回显，主通道；pull＝发送后拉群历史，兜底），旧表已有发送路径写的
-        assistant 行，重复写会让现有读路径看到两份。
+        ``shadow_only=True``：**只**写这一条、不更新计划行状态。用于"自己发言的实际
+        形态"——它由两条供货通道之一带回（push＝NapCat 回显，主通道；pull＝发送后拉
+        群历史，兜底），发送路径已经写过计划行，重复写会让读路径看到两份。
 
-        返回值：普通路径返回**这条记录是否进入了任一层存储**——旧表插入成功、或旧表
-        因唯一键冲突跳过但合并存储镜像成功，都算成功（``shadow_only=True`` 时只看影子层）。
-        只有"旧表冲突**且**合并存储没写进去"才返回 ``False``：那才是真的什么都没记下来，
-        上层必须当失败处理（别把"这轮没写进去"记成写成功、assistant 照旧升级 llm_status）。
+        返回值：``bool(mirrored)``——这条记录是否**真的**写进了合并存储。
+        返回 ``False`` 时上层必须当失败处理（别把"这轮没写进去"记成写成功、
+        assistant 照旧升级 llm_status）。
 
         ``claim_turn=True`` 表示"这是本实例自己发出的一条"（push/pull 供货路径）：
         调拨层会把它记进逻辑表并并回本轮计划行的组；否则只写物理行与参与行。
@@ -786,58 +638,18 @@ class DBManager:
             "claim_turn": bool(claim_turn),
         }
         if shadow_only:
-            # 平台回显：只镜像到影子表（旧表已有发送路径写的 assistant 行，不能写第二份）
+            # 平台回显：只写这一条（发送路径已写过计划行，不能写第二份）
             return await self._shadow_write(
                 lambda session: _mirror_record_payload(
                     session, payload, platform_timestamp, platform_uid, post_type
                 )
             )
-        async with self.async_session() as session:
-            # assistant 最终写入时，把对应 user 状态升级放在同一事务中。
-            # 1.0.0 的实时写入链路统一使用 turn_id；pair_id 仅保留给历史查询。
-            if role == "assistant" and update_user_llm_status is not None:
-                if not turn_id:
-                    raise ValueError("assistant finalize requires turn_id")
-                await session.execute(
-                    text(
-                        "UPDATE chat_memory_records SET llm_status = :status "
-                        "WHERE umo = :umo AND conversation_id = :cid "
-                        "AND turn_id = :turn_id AND role = 'user' "
-                        "AND deleted_at IS NULL"
-                    ),
-                    {
-                        "status": update_user_llm_status,
-                        "umo": umo,
-                        "cid": conversation_id,
-                        "turn_id": turn_id,
-                    },
-                )
-            insert_result = await session.execute(
-                text(
-                    "INSERT OR IGNORE INTO chat_memory_records "
-                    "(umo, conversation_id, user_id, role, content, message_id, pair_id, "
-                    "llm_status, content_kind, "
-                    "platform_id, platform_name, message_type, session_id, self_id, "
-                    "group_id, sender_nickname, raw_timestamp, "
-                    "at_id, reply_id, forward_id, persona_id, created_at, "
-                    "turn_id, send_status, relation_data) "
-                    "VALUES (:umo, :cid, :uid, :role, :content, :mid, :pid, "
-                    ":lstatus, :ckind, "
-                    ":pid_plat, :pname, :mtype, :sid, :self_id, "
-                    ":gid, :nick, :rts, :at_id, :reply_id, :fwd_id, :per_id, :now, "
-                    ":turn_id, :send_status, :relation_data)"
-                ),
-                payload,
-            )
-            inserted_rows = int(insert_result.rowcount or 0)
-            await session.commit()
+        # assistant 最终写入时，把对应 user 状态升级放在同一事务中。
+        if role == "assistant" and update_user_llm_status is not None and not turn_id:
+            raise ValueError("assistant finalize requires turn_id")
 
         async def _mirror_record_and_status(session):
-            """镜像记录本身；assistant 落库顺带把 user 行的 llm_status 提升也镜像过去。
-
-            旧表这条状态提升是 insert() 内的内联 UPDATE（不走 update_llm_status_by_turn），
-            **只挂钩后者会漏掉**——线上实测影子 user 行的 llm_status 全为空。
-            """
+            """写记录本身；assistant 落库顺带提升 user 行的 ``llm_status``。"""
             mirrored = await shared_store.mirror_record(
                 session,
                 {
@@ -853,40 +665,17 @@ class DBManager:
                 )
             return mirrored
 
-        # 镜像**不以"旧表插入成功"为前提**：旧表的 ``ux_cm_turn_role`` 只允许一轮一条，
-        # 所以"同一轮的第二段"（tool loop 里工具调用前后的多段回复）、以及 LLM 触发时的
-        # 补捕获重试，都会落到 ``INSERT OR IGNORE`` 的冲突分支——这是**设计内**行为
-        # （2.0 的一轮多段模型由平台回显补齐分段），不该让旧表的限制连坐主模型：
-        # 连坐会同时丢掉合并存储的计划行与 user 行 ``llm_status`` 提升。
-        # 镜像本身按 ``msg_uid`` / 计划行主键 upsert（计划行"只补空"），重复写是幂等的。
+        # 合并存储是唯一存储：按 ``msg_uid`` / 计划行主键 upsert（计划行"只补空"），
+        # 重复写幂等——多段回复、补捕获重试都不会撞唯一键。
         mirrored = await self._shadow_write(_mirror_record_and_status)
-        if not inserted_rows:
-            if mirrored:
-                # 旧表跳过但合并存储已记录：一轮多段 / 补捕获重试的正常路径，只留 DEBUG。
-                logger.debug(
-                    "[ChatMemory] 旧表跳过（同轮已有 %s 行，旧表一轮一条），"
-                    "合并存储已镜像: turn=%s send_status=%s",
-                    role, turn_id or "-", send_status or "-",
-                )
-            else:
-                # 区分两种"没镜像"：影子层根本没启用 ≠ 启用但这次没写成功。
-                if not self.shadow_enabled:
-                    logger.debug(
-                        "[ChatMemory] 记录跳过（同轮已有 %s 行，旧表一轮一条；"
-                        "合并存储未启用）: turn=%s send_status=%s",
-                        role, turn_id or "-", send_status or "-",
-                    )
-                else:
-                    # 影子层开着却没写进去才是真失败：让调用方看见（否则这轮 user 没落库、
-                    # assistant 却会被标 llm_success）。只记 id/状态，不带正文。
-                    logger.warning(
-                        "[ChatMemory] 记录未落库（旧表唯一键冲突且合并存储未镜像）: "
-                        "role=%s turn=%s send_status=%s",
-                        role, turn_id or "-", send_status or "-",
-                    )
-        # 返回值＝"这条记录是否进入了任一层存储"。旧表冲突但合并存储写成功时算成功：
-        # 上层用它决定要不要继续（补捕获重试、状态升级），按旧表判会把已记录的当成没写。
-        return bool(inserted_rows or mirrored)
+        if not mirrored and self.shadow_enabled:
+            # 开着却没写进去才是真失败：让调用方看见（否则这轮 user 没落库、
+            # assistant 却会被标 llm_success）。只记 id/状态，不带正文。
+            logger.warning(
+                "[ChatMemory] 记录未落库: role=%s turn=%s send_status=%s",
+                role, turn_id or "-", send_status or "-",
+            )
+        return bool(mirrored)
 
     async def mark_plan_send_attempted(
         self, umo: str, conversation_id: str, turn_id: str
@@ -942,29 +731,17 @@ class DBManager:
             # insert() 对同名字段是严格校验的；这里不校验会让脏状态直接落库，
             # 之后所有按状态过滤的读路径（含 <cm_unsent/> 判定）一起被污染。
             raise ValueError(f"unsupported send_status: {new_status}")
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "UPDATE chat_memory_records SET send_status = :status "
-                    "WHERE umo = :umo AND conversation_id = :cid "
-                    "AND turn_id = :turn_id AND role = 'assistant' "
-                    "AND deleted_at IS NULL"
-                ),
-                {
-                    "status": new_status,
-                    "umo": umo,
-                    "cid": conversation_id,
-                    "turn_id": turn_id,
-                },
-            )
-            await session.commit()
-            rowcount = int(result.rowcount or 0)
-        await self._shadow_write(
-            lambda session: shared_store.mirror_send_status(
+        updated = 0
+
+        async def _mark(session):
+            nonlocal updated
+            updated = await shared_store.mirror_send_status(
                 session, umo, conversation_id, turn_id, new_status
             )
-        )
-        return rowcount
+            return True
+
+        await self._shadow_write(_mark)
+        return int(updated or 0)
 
     async def update_llm_status_by_turn(
         self, umo: str, conversation_id: str, turn_id: str, new_status: str
@@ -973,429 +750,17 @@ class DBManager:
         await self.init_db()
         if new_status not in VALID_LLM_STATUSES:
             raise ValueError(f"unsupported llm_status: {new_status}")
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "UPDATE chat_memory_records SET llm_status = :status "
-                    "WHERE umo = :umo AND conversation_id = :cid "
-                    "AND turn_id = :turn_id AND role = 'user' "
-                    "AND deleted_at IS NULL"
-                ),
-                {
-                    "status": new_status,
-                    "umo": umo,
-                    "cid": conversation_id,
-                    "turn_id": turn_id,
-                },
-            )
-            await session.commit()
-            rowcount = int(result.rowcount or 0)
-        await self._shadow_write(
-            lambda session: shared_store.mirror_llm_status(
+        updated = 0
+
+        async def _mark(session):
+            nonlocal updated
+            updated = await shared_store.mirror_llm_status(
                 session, umo, conversation_id, turn_id, new_status
             )
-        )
-        return rowcount
+            return True
 
-    async def query_latest(
-        self,
-        umo: str,
-        conversation_id: str,
-        user_id: Optional[str] = None,
-        limit: int = 20,
-        llm_status: Optional[Union[str, list[str]]] = None,
-        content_kind: Optional[Union[str, list[str]]] = None,
-        role_filter: Optional[str] = None,
-        persona_id: Optional[str] = None,
-        since: Optional[datetime] = None,
-        until: Optional[datetime] = None,
-        from_oldest: bool = False,
-        after_id: Optional[int] = None,
-        content_kind_all_match: bool = False,
-        skip_recalled: bool = False,
-    ) -> list[dict]:
-        """查询最近 N 条记录（按时间升序返回）。
-
-        ``user_id`` 为 None / 空字符串时不按用户过滤，返回该会话下所有用户的混合记录。
-        ``llm_status`` 支持 str 或 list[str]：按 LLM 状态过滤（list 用 IN）。
-        ``content_kind`` 支持 str 或 list[str]：默认返回 content_kind JSON 数组中
-        **任一包含**这些值的记录；``content_kind_all_match=True`` 时只保留非空且
-        全部 kind 都属于白名单的记录。
-        ``role_filter`` 给定时仅返回 role 匹配的记录。
-        ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``（与 takeover 对齐）。
-        ``since`` / ``until`` 给定时按 ``created_at`` 过滤时间窗口（含端点）；
-        ``after_id`` 必须与 ``since`` 一起使用，此时下界变为严格的
-        ``(created_at, id) > (since, after_id)`` keyset 游标。
-        ``datetime`` 为 tz-aware 时自动转 UTC naive，naive 假定已是 UTC（与落库 ``CURRENT_TIMESTAMP`` 对齐）。
-        ``limit`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）导致全库返回。
-        ``skip_recalled``：跳过被撤回的消息（``recalled_at`` 非空）。
-        """
-        await self.init_db()
-        limit = max(1, min(1000, int(limit)))
-        async with self.async_session() as session:
-            conditions = [
-                "umo = :umo",
-                "conversation_id = :cid",
-                "deleted_at IS NULL",
-            ]
-            params: dict = {"umo": umo, "cid": conversation_id}
-            expanding_binds: list[str] = []
-
-            if user_id:
-                conditions.append("user_id = :uid")
-                params["uid"] = user_id
-            if role_filter:
-                conditions.append("role = :role")
-                params["role"] = role_filter
-            if llm_status:
-                if isinstance(llm_status, str):
-                    status_list = [llm_status]
-                else:
-                    status_list = list(llm_status)
-                if status_list:
-                    conditions.append("llm_status IN :statuses")
-                    params["statuses"] = status_list
-                    expanding_binds.append("statuses")
-            if content_kind:
-                if isinstance(content_kind, str):
-                    kind_list = [content_kind]
-                else:
-                    kind_list = list(content_kind)
-                if kind_list:
-                    if content_kind_all_match:
-                        conditions.append(
-                            "EXISTS (SELECT 1 FROM json_each(content_kind)) "
-                            "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
-                            "WHERE value NOT IN :kinds)"
-                        )
-                    else:
-                        conditions.append(
-                            "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                            "WHERE value IN :kinds)"
-                        )
-                    params["kinds"] = kind_list
-                    expanding_binds.append("kinds")
-
-            if skip_recalled:
-                # 撤回标记在消息级（旧表同样有 recalled_at 列）：消费者落库前要能排除。
-                conditions.append("recalled_at IS NULL")
-
-            since_norm = _normalize_dt(since)
-            until_norm = _normalize_dt(until)
-            if after_id is not None and since_norm is None:
-                raise ValueError("after_id requires since")
-            if since_norm:
-                if after_id is None:
-                    conditions.append("created_at >= :since")
-                else:
-                    conditions.append(
-                        "(created_at > :since OR "
-                        "(created_at = :since AND id > :after_id))"
-                    )
-                    params["after_id"] = int(after_id)
-                params["since"] = since_norm
-            if until_norm:
-                conditions.append("created_at <= :until")
-                params["until"] = until_norm
-            if persona_id is not None:
-                if persona_id:
-                    conditions.append("persona_id = :persona_id")
-                    params["persona_id"] = persona_id
-                else:
-                    conditions.append("(persona_id IS NULL OR persona_id = '')")
-
-            where = " AND ".join(conditions)
-            params["lim"] = limit
-
-            order = "ASC" if from_oldest else "DESC"
-            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           f"ORDER BY created_at {order}, id {order} LIMIT :lim")
-            for name in expanding_binds:
-                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
-
-            result = await session.execute(sql_text, params)
-            rows = result.fetchall()
-            if not from_oldest:
-                rows.reverse()
-            return [_row_to_dict(r, self._tz) for r in rows]
-
-    async def query_rounds(
-        self,
-        umo: str,
-        conversation_id: str,
-        user_id: Optional[str] = None,
-        limit_rounds: int = 10,
-        llm_status: Optional[Union[str, list[str]]] = None,
-        content_kind: Optional[Union[str, list[str]]] = None,
-        persona_id: Optional[str] = None,
-        since: Optional[datetime] = None,
-        until: Optional[datetime] = None,
-        from_oldest: bool = False,
-        after_id: Optional[int] = None,
-        content_kind_all_match: bool = False,
-        skip_recalled: bool = False,
-    ) -> list[list[dict]]:
-        """按配对返回对话轮次。每轮保证 ``[user_dict, assistant_dict]`` 两条。
-
-        仅返回**有 assistant 配对**的 user（用 EXISTS 子查询过滤单边），
-        因此 ``limit_rounds`` 轮对应 ``2 * limit_rounds`` 条记录。
-
-        ``llm_status`` / ``content_kind`` 仅过滤 user 侧（assistant 按配对字段返回）。
-        ``content_kind_all_match=True`` 时，user 的 content_kind 必须非空且全部属于
-        ``content_kind`` 白名单。
-        ``persona_id``：None 不过滤；非空按值过滤；空串严格过滤 ``IS NULL OR ''``。persona
-        条件同时作用于 user、assistant 和配对 EXISTS 子查。
-        ``since`` / ``until`` 给定时按 ``created_at`` 过滤，条件同时作用于 user、assistant
-        和配对 EXISTS 子查；``after_id`` 与 ``since`` 同时使用时，下界改为严格的
-        ``(created_at, id)`` keyset 游标；``datetime`` tz-aware 自动转 UTC naive。
-        结果严格为完整 ``[user_dict, assistant_dict]``，不会返回孤立 user；历史重复 assistant
-        时按 ``created_at ASC, id ASC`` 取最早的一条。
-        ``limit_rounds`` 钳到 ``[1, 1000]``：防第三方调用方传 -1 触发 SQLite ``LIMIT -1``（=不限制）。
-        ``skip_recalled``：user 侧被撤回的轮次整轮不返回（``recalled_at`` 非空）。
-        """
-        await self.init_db()
-        limit_rounds = max(1, min(1000, int(limit_rounds)))
-        async with self.async_session() as session:
-            conditions = [
-                "umo = :umo",
-                "conversation_id = :cid",
-                "role = 'user'",
-                "deleted_at IS NULL",
-            ]
-            user_params: dict = {"umo": umo, "cid": conversation_id}
-            expanding_binds: list[str] = []
-            if user_id:
-                conditions.append("user_id = :uid")
-                user_params["uid"] = user_id
-            if llm_status:
-                if isinstance(llm_status, str):
-                    status_list = [llm_status]
-                else:
-                    status_list = list(llm_status)
-                if status_list:
-                    conditions.append("llm_status IN :statuses")
-                    user_params["statuses"] = status_list
-                    expanding_binds.append("statuses")
-            if content_kind:
-                if isinstance(content_kind, str):
-                    kind_list = [content_kind]
-                else:
-                    kind_list = list(content_kind)
-                if kind_list:
-                    if content_kind_all_match:
-                        conditions.append(
-                            "EXISTS (SELECT 1 FROM json_each(content_kind)) "
-                            "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
-                            "WHERE value NOT IN :kinds)"
-                        )
-                    else:
-                        conditions.append(
-                            "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                            "WHERE value IN :kinds)"
-                        )
-                    user_params["kinds"] = kind_list
-                    expanding_binds.append("kinds")
-
-            since_norm = _normalize_dt(since)
-            until_norm = _normalize_dt(until)
-            if after_id is not None and since_norm is None:
-                raise ValueError("after_id requires since")
-            if since_norm:
-                if after_id is None:
-                    conditions.append("created_at >= :since")
-                else:
-                    conditions.append(
-                        "(created_at > :since OR "
-                        "(created_at = :since AND id > :after_id))"
-                    )
-                    user_params["after_id"] = int(after_id)
-                user_params["since"] = since_norm
-            if until_norm:
-                conditions.append("created_at <= :until")
-                user_params["until"] = until_norm
-            if persona_id is not None:
-                if persona_id:
-                    conditions.append("persona_id = :persona_id")
-                    user_params["persona_id"] = persona_id
-                else:
-                    conditions.append("(persona_id IS NULL OR persona_id = '')")
-            if skip_recalled:
-                # 撤回标记打在消息行上：user 侧被撤回则整轮不返回（assistant 侧随之消失）。
-                conditions.append("recalled_at IS NULL")
-
-            pair_exists = [
-                "EXISTS (SELECT 1 FROM chat_memory_records a",
-                "WHERE a.umo = chat_memory_records.umo",
-                "AND a.conversation_id = chat_memory_records.conversation_id",
-                "AND a.role = 'assistant'",
-                "AND a.deleted_at IS NULL",
-                "AND ((chat_memory_records.turn_id IS NOT NULL "
-                "AND a.turn_id = chat_memory_records.turn_id) OR "
-                "(chat_memory_records.turn_id IS NULL "
-                "AND a.pair_id = chat_memory_records.message_id))",
-            ]
-            if since_norm:
-                if after_id is None:
-                    pair_exists.append("AND a.created_at >= :since")
-                else:
-                    pair_exists.append(
-                        "AND (a.created_at > :since OR "
-                        "(a.created_at = :since AND a.id > :after_id))"
-                    )
-            if until_norm:
-                pair_exists.append("AND a.created_at <= :until")
-            if persona_id is not None:
-                if persona_id:
-                    pair_exists.append("AND a.persona_id = :persona_id")
-                else:
-                    pair_exists.append("AND (a.persona_id IS NULL OR a.persona_id = '')")
-            pair_exists.append(")")
-            conditions.append(" ".join(pair_exists))
-
-            where = " AND ".join(conditions)
-            user_params["lim"] = limit_rounds
-
-            order = "ASC" if from_oldest else "DESC"
-            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           f"ORDER BY created_at {order}, id {order} LIMIT :lim")
-            for name in expanding_binds:
-                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
-
-            result = await session.execute(sql_text, user_params)
-            user_rows = list(result.fetchall())
-            if not from_oldest:
-                user_rows.reverse()
-
-            if not user_rows:
-                return []
-
-            user_msg_ids = [r[3] for r in user_rows if r[3]]
-            user_turn_ids = [r[20] for r in user_rows if r[20]]
-            assistant_map: dict[tuple[str, str], list[dict]] = {}
-            if user_msg_ids or user_turn_ids:
-                asst_conditions = [
-                    "umo = :umo",
-                    "conversation_id = :cid",
-                    "role = 'assistant'",
-                    "(turn_id IN :turn_ids OR pair_id IN :pids)",
-                    "deleted_at IS NULL",
-                ]
-                asst_params: dict = {
-                    "umo": umo,
-                    "cid": conversation_id,
-                    "turn_ids": user_turn_ids or ["__no_turn_id__"],
-                    "pids": user_msg_ids or ["__no_message_id__"],
-                }
-                if since_norm:
-                    if after_id is None:
-                        asst_conditions.append("created_at >= :since")
-                    else:
-                        asst_conditions.append(
-                            "(created_at > :since OR "
-                            "(created_at = :since AND id > :after_id))"
-                        )
-                        asst_params["after_id"] = int(after_id)
-                    asst_params["since"] = since_norm
-                if until_norm:
-                    asst_conditions.append("created_at <= :until")
-                    asst_params["until"] = until_norm
-                if persona_id is not None:
-                    if persona_id:
-                        asst_conditions.append("persona_id = :persona_id")
-                        asst_params["persona_id"] = persona_id
-                    else:
-                        asst_conditions.append("(persona_id IS NULL OR persona_id = '')")
-                asst_sql = (
-                    _SELECT_COLS + " FROM chat_memory_records WHERE "
-                    + " AND ".join(asst_conditions) +
-                    " ORDER BY created_at ASC, id ASC"
-                )
-                asst_result = await session.execute(
-                    text(asst_sql)
-                    .bindparams(bindparam("turn_ids", expanding=True))
-                    .bindparams(bindparam("pids", expanding=True)),
-                    asst_params,
-                )
-                for r in asst_result.fetchall():
-                    record = _row_to_dict(r, self._tz)
-                    if r[20]:
-                        assistant_map.setdefault(("turn", r[20]), []).append(record)
-                    if r[4]:
-                        assistant_map.setdefault(("pair", r[4]), []).append(record)
-
-            rounds: list[list[dict]] = []
-            for r in user_rows:
-                if r[20]:
-                    assistants = assistant_map.get(("turn", r[20]), [])
-                else:
-                    assistants = assistant_map.get(("pair", r[3]), [])
-                if assistants:
-                    rounds.append([_row_to_dict(r, self._tz), assistants[0]])
-            return rounds
-
-    async def resolve_user_reply_target(
-        self,
-        umo: str,
-        platform_id: str,
-        reply_id: str,
-    ) -> Optional[dict]:
-        """用平台 Reply.id 唯一解析同一 UMO 内的 user turn；歧义时拒绝猜测。"""
-        await self.init_db()
-        if not umo or not reply_id:
-            return None
-        conditions = [
-            "umo = :umo",
-            "role = 'user'",
-            "message_id = :reply_id",
-            "turn_id IS NOT NULL",
-            "turn_id <> ''",
-            "deleted_at IS NULL",
-        ]
-        params = {"umo": umo, "reply_id": reply_id}
-        if platform_id:
-            conditions.append("platform_id = :platform_id")
-            params["platform_id"] = platform_id
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    _SELECT_COLS + " FROM chat_memory_records WHERE "
-                    + " AND ".join(conditions)
-                    + " ORDER BY created_at DESC, id DESC LIMIT 2"
-                ),
-                params,
-            )
-            rows = result.fetchall()
-            if len(rows) != 1:
-                return None
-            return _row_to_dict(rows[0], self._tz)
-
-    async def query_turn_targets(
-        self,
-        umo: str,
-        turn_ids: list[str],
-    ) -> dict[tuple[str, str], dict]:
-        """在当前 UMO 内批量读取引用目标，key 为 ``(turn_id, role)``。"""
-        await self.init_db()
-        clean_ids = sorted({str(value) for value in turn_ids if value})
-        if not umo or not clean_ids:
-            return {}
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    _SELECT_COLS
-                    + " FROM chat_memory_records WHERE umo = :umo "
-                    "AND turn_id IN :turn_ids "
-                    "AND deleted_at IS NULL "
-                    "ORDER BY created_at ASC, id ASC"
-                ).bindparams(bindparam("turn_ids", expanding=True)),
-                {"umo": umo, "turn_ids": clean_ids},
-            )
-            targets: dict[tuple[str, str], dict] = {}
-            for row in result.fetchall():
-                record = _row_to_dict(row, self._tz)
-                key = (str(record.get("turn_id") or ""), str(record.get("role") or ""))
-                targets.setdefault(key, record)
-            return targets
+        await self._shadow_write(_mark)
+        return int(updated or 0)
 
     async def insert_tool_record(
         self,
@@ -1407,39 +772,20 @@ class DBManager:
         tool_args: str,
         tool_result: str,
     ) -> bool:
-        """写入一条工具调用记录；(turn_id, call_index) 幂等。
+        """写入一条工具调用记录（``(turn_id, call_index)`` 幂等）。
 
-        返回**是否真的插入**：``INSERT OR IGNORE`` 命中幂等键时 rowcount=0，静默当成功
-        会让"这一轮的工具段根本没落库"完全看不见（读侧随后回放不到任何工具调用）。
+        返回**这次是否新插入了行**：幂等键已存在时行本来就在，对调用方来说是"这一轮
+        的工具段确实在库里"，不是失败。所以这里不能直接把 ``mirror_tool_call`` 的
+        ``rowcount == 0`` 交给 ``_shadow_write``——那会把它记进 ``skipped`` 污染健康度，
+        上层若按失败重试还会永久重试同一个幂等键（事件重放、插件重载都会触发）。
         """
-        await self.init_db()
-        if not umo or not conversation_id or not turn_id or not tool_name:
-            raise ValueError("insert_tool_record requires umo/cid/turn_id/tool_name")
-        async with self.async_session() as session:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            result = await session.execute(
-                text(
-                    "INSERT OR IGNORE INTO chat_memory_tool_records "
-                    "(umo, conversation_id, turn_id, call_index, tool_name, "
-                    "tool_args, tool_result, created_at) "
-                    "VALUES (:umo, :cid, :turn_id, :call_index, :tool_name, "
-                    ":tool_args, :tool_result, :now)"
-                ),
-                {
-                    "umo": umo,
-                    "cid": conversation_id,
-                    "turn_id": turn_id,
-                    "call_index": int(call_index),
-                    "tool_name": tool_name,
-                    "tool_args": tool_args or "",
-                    "tool_result": tool_result or "",
-                    "now": now,
-                },
-            )
-            inserted = int(result.rowcount or 0)
-            await session.commit()
-        await self._shadow_write(
-            lambda session: shared_store.mirror_tool_call(
+        if not umo or not conversation_id or not turn_id:
+            return False
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        inserted = {"new": False}
+
+        async def _write(session):
+            inserted["new"] = await shared_store.mirror_tool_call(
                 session,
                 umo=umo,
                 conversation_id=conversation_id,
@@ -1450,56 +796,10 @@ class DBManager:
                 tool_result=tool_result or "",
                 now=now,
             )
-        )
-        return bool(inserted)
+            return True
 
-    async def query_tool_records(
-        self,
-        umo: str,
-        conversation_id: str,
-        turn_limit: int = 2,
-    ) -> list[dict]:
-        """查询最近 ``turn_limit`` 个轮次的工具调用记录（按时间正序）。
-
-        只查当前 umo + cid：工具调用天然属于当前会话，不参与
-        cross_session / full_group 的扩大范围。``turn_limit=0`` 返回空
-        （调用方用于关闭工具回放）。
-        """
-        await self.init_db()
-        turn_limit = min(50, max(0, int(turn_limit)))
-        if turn_limit <= 0:
-            return []
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT turn_id, call_index, tool_name, tool_args, "
-                    "tool_result, created_at "
-                    "FROM chat_memory_tool_records "
-                    "WHERE umo = :umo AND conversation_id = :cid "
-                    "AND deleted_at IS NULL "
-                    "AND turn_id IN ("
-                    "  SELECT turn_id FROM chat_memory_tool_records "
-                    "  WHERE umo = :umo AND conversation_id = :cid "
-                    "  AND deleted_at IS NULL "
-                    "  GROUP BY turn_id "
-                    "  ORDER BY MIN(created_at) DESC, MIN(id) DESC "
-                    "  LIMIT :turn_limit"
-                    ") "
-                    "ORDER BY created_at ASC, id ASC"
-                ),
-                {"umo": umo, "cid": conversation_id, "turn_limit": turn_limit},
-            )
-            return [
-                {
-                    "turn_id": row[0],
-                    "call_index": int(row[1]),
-                    "tool_name": row[2],
-                    "tool_args": row[3] or "",
-                    "tool_result": row[4] or "",
-                    "created_at": row[5],
-                }
-                for row in result.fetchall()
-            ]
+        await self._shadow_write(_write)
+        return bool(inserted["new"])
 
     async def delete_by_conversation(
         self, umo: str, conversation_id: str
@@ -1508,27 +808,38 @@ class DBManager:
 
         返回 ``(删除的记录数, 被删归档行列表)``；归档行含 file_name/created_at，
         由调用方负责删除对应媒体文件。
+
+        **媒体行与消息必须同一个事务**：拆成两个事务时，消息删除失败但媒体行已提交，
+        调用方拿到非空的 ``media_rows`` 就会把物理文件也删掉——消息还在库里、图永久
+        没了，而返回值又像"什么都没删"。失败一律外抛，由调用方决定是否继续删文件。
         """
         await self.init_db()
-        async with self.async_session() as session:
-            await session.execute(
-                text(
-                    "DELETE FROM chat_memory_tool_records "
-                    "WHERE umo = :umo AND conversation_id = :cid"
-                ),
+        if not self.shadow_enabled:
+            # 没有合并存储就没有"消息"可删；媒体归档仍是本插件数据，照常清理。
+            async with self.async_session() as session:
+                media_rows = await _collect_media_rows(
+                    session,
+                    "umo = :umo AND conversation_id = :cid",
+                    {"umo": umo, "cid": conversation_id},
+                )
+                await session.execute(
+                    text(
+                        "DELETE FROM chat_memory_media_archive "
+                        "WHERE umo = :umo AND conversation_id = :cid"
+                    ),
+                    {"umo": umo, "cid": conversation_id},
+                )
+                await session.commit()
+            return 0, media_rows
+
+        deleted = {"rows": 0, "media": []}
+
+        async def _drop(session):
+            deleted["media"] = await _collect_media_rows(
+                session,
+                "umo = :umo AND conversation_id = :cid",
                 {"umo": umo, "cid": conversation_id},
             )
-            media_result = await session.execute(
-                text(
-                    "SELECT file_name, created_at FROM chat_memory_media_archive "
-                    "WHERE umo = :umo AND conversation_id = :cid"
-                ),
-                {"umo": umo, "cid": conversation_id},
-            )
-            media_rows = [
-                {"file_name": row[0], "created_at": row[1]}
-                for row in media_result.fetchall()
-            ]
             await session.execute(
                 text(
                     "DELETE FROM chat_memory_media_archive "
@@ -1536,66 +847,63 @@ class DBManager:
                 ),
                 {"umo": umo, "cid": conversation_id},
             )
-            result = await session.execute(
-                text(
-                    "DELETE FROM chat_memory_records "
-                    "WHERE umo = :umo AND conversation_id = :cid"
-                ),
-                {"umo": umo, "cid": conversation_id},
-            )
-            await session.commit()
-            rowcount = int(result.rowcount or 0)
-        await self._shadow_write(
-            lambda session: shared_store.mirror_delete_conversation(
+            deleted["rows"] = await shared_store.mirror_delete_conversation(
                 session, umo, conversation_id
             )
-        )
-        return rowcount, media_rows
+            return True
+
+        if not await self._shadow_write(_drop):
+            # 事务已回滚：媒体行没删、消息也没删。抛出去，调用方不得去删物理文件。
+            raise RuntimeError(
+                f"清除会话存档失败（umo={umo}, cid={conversation_id}），"
+                f"未删除任何记录，详见服务端日志"
+            )
+        return int(deleted["rows"] or 0), deleted["media"]
 
     async def delete_old(self, before: datetime) -> tuple[int, list[dict]]:
         """删除 created_at 早于 ``before`` 的所有记录（用于 auto_cleanup_days）。
 
         工具表与媒体归档同步清理；返回 ``(删除的记录数, 被删归档行列表)``。
+
+        与 ``delete_by_conversation`` 同样的约束：媒体行与消息同一个事务，失败外抛，
+        否则"消息没删掉、媒体文件却被删了"。
         """
         await self.init_db()
-        async with self.async_session() as session:
+        if not self.shadow_enabled:
+            async with self.async_session() as session:
+                media_rows = await _collect_media_rows(
+                    session, "created_at < :before", {"before": before}
+                )
+                await session.execute(
+                    text("DELETE FROM chat_memory_media_archive WHERE created_at < :before"),
+                    {"before": before},
+                )
+                await session.commit()
+            return 0, media_rows
+
+        state = {"rows": 0, "media": []}
+
+        async def _drop(session):
+            state["media"] = await _collect_media_rows(
+                session, "created_at < :before", {"before": before}
+            )
             await session.execute(
-                text("DELETE FROM chat_memory_tool_records WHERE created_at < :before"),
+                text("DELETE FROM chat_memory_media_archive WHERE created_at < :before"),
                 {"before": before},
             )
-            media_result = await session.execute(
-                text(
-                    "SELECT file_name, created_at FROM chat_memory_media_archive "
-                    "WHERE created_at < :before"
-                ),
-                {"before": before},
+            state["rows"] = await shared_store.mirror_delete_before(session, before)
+            return True
+
+        if not await self._shadow_write(_drop):
+            raise RuntimeError(
+                f"按保留期清理存档失败（早于 {before}），未删除任何记录，详见服务端日志"
             )
-            media_rows = [
-                {"file_name": row[0], "created_at": row[1]}
-                for row in media_result.fetchall()
-            ]
-            await session.execute(
-                text(
-                    "DELETE FROM chat_memory_media_archive "
-                    "WHERE created_at < :before"
-                ),
-                {"before": before},
-            )
-            result = await session.execute(
-                text("DELETE FROM chat_memory_records WHERE created_at < :before"),
-                {"before": before},
-            )
-            await session.commit()
-            rowcount = int(result.rowcount or 0)
-        await self._shadow_write(
-            lambda session: shared_store.mirror_delete_before(session, before)
-        )
-        return rowcount, media_rows
+        return int(state["rows"] or 0), state["media"]
 
     async def purge_orphans(self) -> tuple[int, int]:
         """回收合并存储里的孤儿行（无参与行的消息 / 指向已删消息的参与行）。
 
-        返回 ``(消息数, 参与行数)``。影子层关闭时返回 ``(0, 0)``（那是"没有合并存储"，
+        返回 ``(消息数, 参与行数)``。存储未启用时返回 ``(0, 0)``（那是"没有合并存储"，
         不是"没有孤儿"——调用方据此区分，不打日志）。
         """
         if not self.shadow_enabled:
@@ -1605,53 +913,6 @@ class DBManager:
             removed = await shared_store.purge_orphan_rows(session)
             await session.commit()
             return removed
-
-    async def count_records_in_conversation(
-        self, umo: str, conversation_id: str
-    ) -> list[dict]:
-        """当前 CID 下的可见记录按 ``content_kind`` 分组计数（/reset 残留自检）。
-
-        返回 ``[{content_kind, count}]``，按数量降序；只统计未软删除的行。
-        """
-        await self.init_db()
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT content_kind, COUNT(*) AS n FROM chat_memory_records "
-                    "WHERE umo = :umo AND conversation_id = :cid "
-                    "AND deleted_at IS NULL "
-                    "GROUP BY content_kind ORDER BY n DESC LIMIT 10"
-                ),
-                {"umo": umo, "cid": str(conversation_id or "")},
-            )
-            return [
-                {"content_kind": str(row[0] or "[]"), "count": int(row[1] or 0)}
-                for row in result.fetchall()
-            ]
-
-    async def count_records_by_conversation(
-        self, umo: str, exclude_cid: str = ""
-    ) -> list[dict]:
-        """按 conversation_id 统计同 UMO 的记录数（/reset 残留诊断用）。
-
-        ``exclude_cid`` 排除刚清理的 CID；按记录数降序返回，最多 200 组。
-        """
-        await self.init_db()
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT conversation_id, COUNT(*) AS n "
-                    "FROM chat_memory_records "
-                    "WHERE umo = :umo AND conversation_id <> :cid "
-                    "AND deleted_at IS NULL "
-                    "GROUP BY conversation_id ORDER BY n DESC LIMIT 200"
-                ),
-                {"umo": umo, "cid": str(exclude_cid or "")},
-            )
-            return [
-                {"conversation_id": str(row[0] or ""), "count": int(row[1] or 0)}
-                for row in result.fetchall()
-            ]
 
     # ── 媒体归档表操作（schema v5）────────────────────
 
@@ -1851,33 +1112,6 @@ class DBManager:
             await session.commit()
             return result.rowcount
 
-    async def find_by_message_id(self, umo: str, message_id: str) -> Optional[dict]:
-        """按平台 message_id 查 user 记录（撤回 notice 的本地关联）。
-
-        返回原始 ``content`` / ``relation_data`` / ``sender_nickname``；
-        无命中返回 None。message_id 在平台实例内唯一，umo 已含实例 ID。
-        """
-        await self.init_db()
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT content, relation_data, sender_nickname "
-                    "FROM chat_memory_records "
-                    "WHERE umo = :umo AND message_id = :mid AND role = 'user' "
-                    "AND deleted_at IS NULL "
-                    "ORDER BY id DESC LIMIT 1"
-                ),
-                {"umo": umo, "mid": str(message_id or "")},
-            )
-            row = result.first()
-            if row is None:
-                return None
-            return {
-                "content": row[0] or "",
-                "relation_data": row[1],
-                "sender_nickname": row[2] or "",
-            }
-
     async def mark_recalled(self, umo: str, message_id: str) -> int:
         """把被撤回的 user 记录标记为已撤回（``recalled_at``，幂等）。
 
@@ -1887,351 +1121,159 @@ class DBManager:
         mid = str(message_id or "").strip()
         if not umo or not mid:
             return 0
-        await self.init_db()
-        async with self.async_session() as session:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            result = await session.execute(
-                text(
-                    "UPDATE chat_memory_records SET recalled_at = :now "
-                    "WHERE umo = :umo AND message_id = :mid AND role = 'user' "
-                    "AND recalled_at IS NULL AND deleted_at IS NULL"
-                ),
-                {
-                    "now": now,
-                    "umo": umo,
-                    "mid": mid,
-                },
-            )
-            await session.commit()
-            rowcount = int(result.rowcount or 0)
-        await self._shadow_write(
-            lambda session: shared_store.mirror_recall(session, umo, mid, now)
-        )
-        return rowcount
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        updated = 0
 
-    async def latest_sender_nickname(self, umo: str, user_id: str) -> Optional[str]:
-        """按 umo+user_id 查最近一条 user 记录的真实昵称。
+        async def _mark(session):
+            nonlocal updated
+            updated = await shared_store.mirror_recall(session, umo, mid, now)
+            return True
 
-        排除空昵称与「昵称=账号」（notice 事件的适配器兜底）；用于
-        事件（<cm_event>）的目标昵称解析。无命中返回 None。
-        """
-        await self.init_db()
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "SELECT sender_nickname FROM chat_memory_records "
-                    "WHERE umo = :umo AND user_id = :uid AND role = 'user' "
-                    "AND sender_nickname IS NOT NULL AND sender_nickname != '' "
-                    "AND sender_nickname != :uid AND deleted_at IS NULL "
-                    "ORDER BY id DESC LIMIT 1"
-                ),
-                {"umo": umo, "uid": str(user_id or "")},
-            )
-            row = result.first()
-            return str(row[0] or "") if row is not None else None
+        await self._shadow_write(_mark)
+        return int(updated or 0)
 
-    async def query_rounds_raw(
-        self,
-        umo: str,
-        conversation_id: Optional[str],
-        user_id: Optional[str],
-        limit_rounds: int,
-        include_kinds: Optional[set[str]] = None,
-        all_match: bool = False,
-        cross_umo: bool = False,
-        full_group: bool = False,
-        persona_id: Optional[str] = None,
-        filter_by_persona: bool = False,
-        skip_recalled: bool = False,
-        blacklist: Optional[list[str]] = None,
-        after: Optional[int] = None,
-    ) -> list[list[dict]]:
-        """内部方法：配对模式查询（takeover 专用）。
-
-        类似 ``query_rounds`` 但支持 ``include_kinds`` 白名单过滤。
-        仅返回**有 assistant 配对**的 user，每轮 ``[user_dict, assistant_dict]`` 两条。
-
-        scope 由 ``cross_umo`` × ``full_group`` 决定（见 ``_scope_filter``）：
-        - F/F：当前 umo 当前 user
-        - T/F：跨 umo 当前 user（群私聊互通）
-        - F/T：当前 umo 整群
-        - T/T：当前 umo 整群 + 其他 umo 当前 user（混合语义）
-
-        ``conversation_id`` 为 None 时跨 CID。EXISTS 子查的
-        ``a.umo = chat_memory_records.umo`` 是行内自连接，跨 umo 仍保证
-        user/assistant 在同一 umo 内配对；新记录优先使用 turn_id，旧记录才依赖
-        message_id/pair_id。
-
-        ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
-        - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
-        - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
-        仅在 user 查询时过滤（assistant 不过滤，与配对语义一致）。
-
-        ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤（user、assistant 和 EXISTS
-        子查都加条件，保证只返回完整的同 persona 配对）；
-        ``persona_id`` 为空时过滤 ``IS NULL OR ''`` 的记录（匹配老库补列后的旧行）。
-        """
-        await self.init_db()
-        # 与 query_rounds 同口径钳制：-1 在 SQLite 里等于"不限制"（整库返回）。
-        limit_rounds = max(1, min(1000, int(limit_rounds)))
-        async with self.async_session() as session:
-            scope_cond, scope_param = _scope_filter(
-                umo, user_id, cross_umo, full_group, blacklist
-            )
-            # EXISTS 子查：cid 非空时加 conversation_id 条件（防跨 cid 误配对）；
-            # cid=None（cross_session）时不加，允许跨 cid 配对
-            exists_parts = [
-                "EXISTS (SELECT 1 FROM chat_memory_records a",
-                "WHERE a.umo = chat_memory_records.umo",
-            ]
-            if conversation_id:
-                exists_parts.append(
-                    "AND a.conversation_id = chat_memory_records.conversation_id"
-                )
-            exists_parts.extend([
-                "AND a.role = 'assistant'",
-                "AND a.deleted_at IS NULL",
-                # 空串与 NULL 必须同等对待：写入侧历史上出现过 turn_id=''（唯一索引的
-                # 条件就是 `turn_id <> ''`），只判 IS NULL 会让这些行在配对里整段消失，
-                # 而 Python 侧用的是 falsy 判断——两处口径从此一致。
-                "AND ((COALESCE(chat_memory_records.turn_id, '') <> '' "
-                "AND a.turn_id = chat_memory_records.turn_id) OR "
-                "(COALESCE(chat_memory_records.turn_id, '') = '' "
-                "AND a.pair_id = chat_memory_records.message_id)))",
-            ])
-            conditions = [
-                scope_cond,
-                "role = 'user'",
-                " ".join(exists_parts),
-                "deleted_at IS NULL",
-            ]
-            if skip_recalled:
-                conditions.append("recalled_at IS NULL")
-            params: dict = {**scope_param, "lim": limit_rounds}
-            if after is not None:
-                # cache 友好窗口锚点：旧表用自增主键 id（AUTOINCREMENT，不复用），
-                # 与 V2 的会话内 seq 对应；条件必须放在 params 建好之后。
-                conditions.append("id >= :after")
-                params["after"] = int(after)
-            expanding_binds: list[str] = []
-
-            if conversation_id:
-                conditions.append("conversation_id = :cid")
-                params["cid"] = conversation_id
-
-            # persona 过滤：user、assistant 和 EXISTS 三处一致，保证严格完整配对。
-            persona_cond = None
-            if filter_by_persona:
-                if persona_id:
-                    persona_cond = "persona_id = :persona_id"
-                    conditions.append(persona_cond)
-                    params["persona_id"] = persona_id
-                    exists_parts.insert(-1, "AND a.persona_id = :persona_id")
-                else:
-                    persona_cond = "(persona_id IS NULL OR persona_id = '')"
-                    conditions.append(persona_cond)
-                    exists_parts.insert(-1, "AND (a.persona_id IS NULL OR a.persona_id = '')")
-                conditions[2] = " ".join(exists_parts)
-
-            # include_kinds：白名单
-            if include_kinds:
-                if all_match:
-                    # ALL：非空且全部 kind ∈ 白名单
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind)) "
-                        "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value NOT IN :include_kinds)"
-                    )
-                else:
-                    # ANY：任一 kind ∈ 白名单
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value IN :include_kinds)"
-                    )
-                params["include_kinds"] = list(include_kinds)
-                expanding_binds.append("include_kinds")
-
-            where = " AND ".join(conditions)
-            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
-            for name in expanding_binds:
-                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
-
-            result = await session.execute(sql_text, params)
-            user_rows = list(reversed(result.fetchall()))  # 升序
-
-            if not user_rows:
-                return []
-
-            user_msg_ids = [r[3] for r in user_rows if r[3]]  # message_id 在第 4 列
-            user_turn_ids = [r[20] for r in user_rows if r[20]]
-            assistant_map: dict[tuple[str, str], list[dict]] = {}
-            if user_msg_ids or user_turn_ids:
-                # assistant 查询：与 user 同 scope（保证配对在范围内），按 turn_id 或 pair_id 配对
-                asst_conditions = [
-                    scope_cond,
-                    "role = 'assistant'",
-                    "(turn_id IN :turn_ids OR pair_id IN :pids)",
-                    "deleted_at IS NULL",
-                ]
-                asst_params = {
-                    **scope_param,
-                    "turn_ids": user_turn_ids or ["__no_turn_id__"],
-                    "pids": user_msg_ids or ["__no_message_id__"],
-                }
-                if conversation_id:
-                    asst_conditions.append("conversation_id = :cid")
-                    asst_params["cid"] = conversation_id
-                if persona_cond:
-                    asst_conditions.append(persona_cond)
-                    asst_params["persona_id"] = persona_id
-                asst_sql = (
-                    _SELECT_COLS + " FROM chat_memory_records WHERE "
-                    + " AND ".join(asst_conditions) +
-                    " ORDER BY created_at ASC, id ASC"
-                )
-                asst_result = await session.execute(
-                    text(asst_sql)
-                    .bindparams(bindparam("turn_ids", expanding=True))
-                    .bindparams(bindparam("pids", expanding=True)),
-                    asst_params,
-                )
-                for r in asst_result.fetchall():
-                    record = _row_to_dict(r, self._tz)
-                    if r[20]:
-                        assistant_map.setdefault(("turn", r[20]), []).append(record)
-                    if r[4]:
-                        assistant_map.setdefault(("pair", r[4]), []).append(record)
-
-            rounds: list[list[dict]] = []
-            for r in user_rows:
-                if r[20]:
-                    assistants = assistant_map.get(("turn", r[20]), [])
-                else:
-                    assistants = assistant_map.get(("pair", r[3]), [])
-                if assistants:
-                    rounds.append([_row_to_dict(r, self._tz), assistants[0]])
-            return rounds
-
-    async def query_messages_raw(
-        self,
-        umo: str,
-        conversation_id: Optional[str],
-        user_id: Optional[str],
-        limit_messages: int,
-        statuses: set[str],
-        include_kinds: Optional[set[str]] = None,
-        all_match: bool = False,
-        cross_umo: bool = False,
-        full_group: bool = False,
-        persona_id: Optional[str] = None,
-        filter_by_persona: bool = False,
-        exclude_turn_id: Optional[str] = None,
-        skip_recalled: bool = False,
-        blacklist: Optional[list[str]] = None,
-        after: Optional[int] = None,
-    ) -> list[dict]:
-        """内部方法：混合模式查询（takeover 专用）。
-
-        查询全量消息（user + assistant），按 ``limit_messages`` 条数切片。
-        scope 由 ``cross_umo`` × ``full_group`` 决定（见 ``_scope_filter``）：
-        - F/F：当前 umo 当前 user
-        - T/F：跨 umo 当前 user（群私聊互通）
-        - F/T：当前 umo 整群
-        - T/T：当前 umo 整群 + 其他 umo 当前 user（混合语义）
-        ``conversation_id`` 为 None 时跨 CID。
-        ``statuses`` 过滤 llm_status（IN 语义）。
-
-        ``include_kinds``：白名单语义，空集合 = 不过滤；非空时配合 ``all_match``：
-        - ``all_match=False`` (ANY)：record 的 content_kind 与白名单**任一交集**即保留
-        - ``all_match=True`` (ALL)：record 的 content_kind **全部**属于白名单（且非空）才保留
-
-        ``filter_by_persona``：开启后按 ``persona_id`` 严格过滤；``persona_id`` 为空时
-        过滤 ``IS NULL OR ''`` 的记录（匹配老库补列后的旧行）。
-
-        ``exclude_turn_id``：排除当前正在请求 LLM 的轮次，避免当前 user 同时出现在
-        takeover history 与 ProviderRequest.prompt 中。
-        """
-        await self.init_db()
-        # 钳制：负数会变成 SQLite 的 LIMIT -1（等于不限制，整库返回）。同族的
-        # query_latest / query_rounds 一直是这么钳的，这里补齐。
-        limit_messages = max(1, min(1000, int(limit_messages)))
-        async with self.async_session() as session:
-            scope_cond, scope_param = _scope_filter(
-                umo, user_id, cross_umo, full_group, blacklist
-            )
-            conditions = [
-                scope_cond,
-                "role IN ('user', 'assistant')",
-                "deleted_at IS NULL",
-            ]
-            if skip_recalled:
-                conditions.append("recalled_at IS NULL")
-            params: dict = {**scope_param, "lim": limit_messages}
-            if after is not None:
-                # cache 友好窗口锚点（旧表自增主键），与 V2 的 seq 对应
-                conditions.append("id >= :after")
-                params["after"] = int(after)
-            expanding_binds: list[str] = []
-
-            if conversation_id:
-                conditions.append("conversation_id = :cid")
-                params["cid"] = conversation_id
-
-            if exclude_turn_id:
-                conditions.append("(turn_id IS NULL OR turn_id != :exclude_turn_id)")
-                params["exclude_turn_id"] = exclude_turn_id
-
-            if filter_by_persona:
-                if persona_id:
-                    conditions.append("persona_id = :persona_id")
-                    params["persona_id"] = persona_id
-                else:
-                    conditions.append("(persona_id IS NULL OR persona_id = '')")
-
-            if statuses:
-                conditions.append("llm_status IN :statuses")
-                params["statuses"] = list(statuses)
-                expanding_binds.append("statuses")
-
-            if include_kinds:
-                if all_match:
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind)) "
-                        "AND NOT EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value NOT IN :include_kinds)"
-                    )
-                else:
-                    conditions.append(
-                        "EXISTS (SELECT 1 FROM json_each(content_kind) "
-                        "WHERE value IN :include_kinds)"
-                    )
-                params["include_kinds"] = list(include_kinds)
-                expanding_binds.append("include_kinds")
-
-            where = " AND ".join(conditions)
-            sql_text = text(_SELECT_COLS + f" FROM chat_memory_records WHERE {where} "
-                                           "ORDER BY created_at DESC, id DESC LIMIT :lim")
-            for name in expanding_binds:
-                sql_text = sql_text.bindparams(bindparam(name, expanding=True))
-
-            result = await session.execute(sql_text, params)
-            rows = result.fetchall()
-            return [_row_to_dict(r, self._tz) for r in reversed(rows)]  # 升序
-
-
-    # ── V2 读路径（合并存储/影子层；V1 的旧表读法一行不改）──────────────
+    # ── 读路径（合并存储）──────────────────────────────────────────────
     #
-    # 为什么保留两份：切读要能对拍、能回退。V2 的方法名与 V1 一一对应，返回的 dict
-    # 也保持同形（额外多几个影子层字段：msg_uid / platform_seq / segments…）。
-    # 影子层没起来时**明确报错**，不返回空列表假装没数据。
+    # 全部读方法都走 `shadow_read`：合并存储是唯一读源，读不到明确报错，
+    # 不返回空列表假装没数据。
+
+    async def find_by_message_id_v2(
+        self, umo: str, message_id: str
+    ) -> Optional[dict]:
+        """按平台 message_id 查 user 消息（撤回 notice 的本地关联）。"""
+        if not umo or not message_id:
+            return None
+        scope_cond, scope_params = self._session_scope_v2(umo, None)
+        async with self._v2_session() as session:
+            rows = await shadow_read.fetch_messages(
+                session,
+                scope_cond=scope_cond,
+                scope_params=scope_params,
+                tz=self._tz,
+                limit=1,
+                role_filter="user",
+                from_oldest=False,
+                collapse_turns=False,
+                extra_conditions=["platform_message_id = :mid"],
+                extra_params={"mid": str(message_id)},
+            )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "content": row.get("content") or "",
+            "relation_data": row.get("relation_data"),
+            "sender_nickname": row.get("sender_nickname") or "",
+        }
+
+    async def latest_sender_nickname_v2(
+        self, umo: str, user_id: str
+    ) -> Optional[str]:
+        """按 umo+user_id 取最近一条 user 消息的真实昵称。
+
+        排除空昵称与「昵称=账号」（适配器兜底）；无命中返回 None。
+        """
+        if not umo or not user_id:
+            return None
+        scope_cond, scope_params = self._session_scope_v2(umo, user_id)
+        async with self._v2_session() as session:
+            rows = await shadow_read.fetch_messages(
+                session,
+                scope_cond=scope_cond,
+                scope_params=scope_params,
+                tz=self._tz,
+                limit=5,
+                role_filter="user",
+                collapse_turns=False,
+            )
+        for row in reversed(rows):
+            nick = str(row.get("sender_nickname") or "").strip()
+            if nick and nick != str(user_id):
+                return nick
+        return None
+
+    async def resolve_user_reply_target_v2(
+        self,
+        umo: str,
+        platform_id: str,
+        reply_id: str,
+    ) -> Optional[dict]:
+        """用平台 Reply.id 解析同一 UMO 内的 user 轮次；歧义时拒绝猜测。"""
+        if not umo or not reply_id:
+            return None
+        scope_cond, scope_params = self._session_scope_v2(umo, None)
+        extra = ["(platform_message_id = :mid)"]
+        params = {"mid": str(reply_id)}
+        if platform_id:
+            extra.append("platform_id = :pid_plat")
+            params["pid_plat"] = platform_id
+        async with self._v2_session() as session:
+            rows = await shadow_read.fetch_messages(
+                session,
+                scope_cond=scope_cond,
+                scope_params=scope_params,
+                tz=self._tz,
+                limit=2,
+                role_filter="user",
+                collapse_turns=False,
+                extra_conditions=extra,
+                extra_params=params,
+            )
+        if len(rows) != 1:
+            return None
+        if not str(rows[0].get("turn_id") or ""):
+            return None
+        return rows[0]
+
+    async def count_records_in_conversation_v2(
+        self, umo: str, conversation_id: str
+    ) -> list[dict]:
+        """当前 CID 下的可见消息按 ``content_kind`` 分组计数（/reset 残留自检）。"""
+        scope_cond, scope_params = self._session_scope_v2(umo, None)
+        async with self._v2_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT m.content_kind AS content_kind, COUNT(*) AS n "
+                    "FROM chat_memory_message_bots b "
+                    "JOIN chat_memory_messages m ON m.msg_uid = b.msg_uid "
+                    "WHERE b.umo = :umo AND b.conversation_id = :cid "
+                    "AND m.deleted_at IS NULL "
+                    "GROUP BY m.content_kind ORDER BY n DESC LIMIT 10"
+                ),
+                {"umo": umo, "cid": str(conversation_id or "")},
+            )
+            return [
+                {"content_kind": str(row[0] or "[]"), "count": int(row[1] or 0)}
+                for row in result.fetchall()
+            ]
+
+    async def count_records_by_conversation_v2(
+        self, umo: str, exclude_cid: str = ""
+    ) -> list[dict]:
+        """按 conversation_id 统计同 UMO 的消息数（/reset 残留诊断）。"""
+        async with self._v2_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT b.conversation_id, COUNT(*) AS n "
+                    "FROM chat_memory_message_bots b "
+                    "JOIN chat_memory_messages m ON m.msg_uid = b.msg_uid "
+                    "WHERE b.umo = :umo AND b.conversation_id <> :cid "
+                    "AND m.deleted_at IS NULL "
+                    "GROUP BY b.conversation_id ORDER BY n DESC LIMIT 200"
+                ),
+                {"umo": umo, "cid": str(exclude_cid or "")},
+            )
+            return [
+                {"conversation_id": str(row[0] or ""), "count": int(row[1] or 0)}
+                for row in result.fetchall()
+            ]
 
     @asynccontextmanager
     async def _v2_session(self):
-        """V2 读的统一入口：确认影子层可用 → 建连接 → 交出 session。"""
+        """读操作统一的 session 入口：确认合并存储可用 → 建连接 → 交出 session。"""
         if not self.shadow_enabled:
             raise RuntimeError(
-                "合并存储未启用（双写未开启或影子层未建立），V2 读接口不可用"
+                "合并存储未建立，读接口不可用"
             )
         await self.init_db()
         async with self.async_session() as session:
@@ -2239,10 +1281,10 @@ class DBManager:
 
     @staticmethod
     def _session_scope_v2(umo: str, user_id: Optional[str]) -> tuple[str, dict]:
-        """公开 V2 接口的会话范围：与 V1 ``query_latest`` / ``query_rounds`` 同语义。
+        """会话范围条件：与对外查询接口同一套语义。
 
         ``user_id`` 为空 = 该会话所有用户混排；非空 = ``user_id`` 列匹配（user 行是发送者、
-        assistant 行是被回复对象——影子视图里的 ``user_id`` 就是这么算的）。
+        assistant 行是被回复对象——合并视图里的 ``user_id`` 就是这么算的）。
         """
         uid = str(user_id or "").strip()
         if not uid:
@@ -2254,7 +1296,7 @@ class DBManager:
 
     @staticmethod
     def _as_list(value: Optional[Union[str, list[str]]]) -> Optional[set[str]]:
-        """``str | list[str] | None`` → ``set[str] | None``（V1 的 status/kind 参数口径）。"""
+        """``str | list[str] | None`` → ``set[str] | None``（对外查询的 status/kind 参数口径）。"""
         if not value:
             return None
         return {value} if isinstance(value, str) else set(value)
@@ -2281,9 +1323,9 @@ class DBManager:
         content_kind_all_match: bool = False,
         skip_recalled: bool = False,
     ) -> list[dict]:
-        """V2 版 ``query_latest``：同样的参数与语义，数据来自影子层。
+        """按会话范围取消息（消息级读路径）。
 
-        ``record_id`` / ``after_id`` 用影子层的**会话内序号**（``seq``），不是旧表行号。
+        ``record_id`` / ``after_id`` 用**会话内序号**（``seq``）。
         ``skip_recalled``：跳过被撤回的消息（消费者不希望撤回内容进入下游）。
         """
         self._check_after_id(after_id, since)
@@ -2325,7 +1367,7 @@ class DBManager:
         content_kind_all_match: bool = False,
         skip_recalled: bool = False,
     ) -> list[list[dict]]:
-        """V2 版 ``query_rounds``：每轮 ``[user, assistant]``；assistant 侧是合并后的完整回复。
+        """按轮次取 ``[user, assistant]``；assistant 侧是合并后的完整回复。
 
         ``skip_recalled``：跳过被撤回的 user（其 assistant 侧随之整轮不返回）。
         """
@@ -2357,7 +1399,7 @@ class DBManager:
         conversation_id: str,
         turn_limit: int = 2,
     ) -> list[dict]:
-        """V2 版 ``query_tool_records``：读合并存储的工具调用表，返回同形 dict。"""
+        """读工具调用表，返回同形 dict。"""
         turn_limit = min(50, max(0, int(turn_limit)))
         if turn_limit <= 0:
             return []
@@ -2398,7 +1440,7 @@ class DBManager:
         umo: str,
         turn_ids: list[str],
     ) -> dict[tuple[str, str], dict]:
-        """V2 版 ``query_turn_targets``：Reply 目标批量读取，key 为 ``(turn_id, role)``。"""
+        """Reply 目标批量读取，key 为 ``(turn_id, role)``。"""
         async with self._v2_session() as session:
             return await shadow_read.fetch_turn_targets(
                 session, umo=umo, turn_ids=turn_ids, tz=self._tz
@@ -2422,7 +1464,7 @@ class DBManager:
         blacklist: Optional[list[str]] = None,
         after: Optional[int] = None,
     ) -> list[dict]:
-        """V2 版 ``query_messages_raw``（takeover 混合模式）：scope 语义与 V1 完全一致。"""
+        """takeover 混合模式：按条件取消息（scope 语义与公开查询一致）。"""
         scope_cond, scope_param = _scope_filter(
             umo, user_id, cross_umo, full_group, blacklist
         )
@@ -2460,12 +1502,12 @@ class DBManager:
         blacklist: Optional[list[str]] = None,
         after: Optional[int] = None,
     ) -> list[list[dict]]:
-        """V2 版 ``query_rounds_raw``（takeover 配对模式）。
+        """takeover 配对模式：按条件取轮次。
 
-        与 V1 同语义：**不按 llm_status 过滤**——"配对"指这一轮有 assistant 回复
-        （由 ``fetch_rounds`` 按 turn_id 挂回时自然保证），V1 的 ``query_rounds_raw``
-        里也没有状态条件。曾经在这里硬编码 ``{"llm_success"}``，切读后会把所有
-        "有回复但 user 行状态不是 llm_success"的轮次整轮丢掉（静默失忆）。
+        语义：**不按 llm_status 过滤**——"配对"指这一轮有 assistant 回复
+        （由 ``fetch_rounds`` 按 turn_id 挂回时自然保证）。曾经在这里硬编码
+        ``{"llm_success"}``，会把所有"有回复但 user 行状态不是 llm_success"
+        的轮次整轮丢掉（静默失忆）。
         """
         scope_cond, scope_param = _scope_filter(
             umo, user_id, cross_umo, full_group, blacklist
@@ -2488,7 +1530,6 @@ class DBManager:
             )
 
 
-# SELECT 列顺序固定，_row_to_dict 按位置映射
 def _utc_now_str() -> str:
     """库里统一用 UTC naive 字符串（与 schema default CURRENT_TIMESTAMP 对齐）。"""
     return datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -2735,88 +1776,3 @@ def _scope_filter(
     )
 
 
-_SELECT_COLS = (
-    "SELECT role, content, user_id, message_id, pair_id, llm_status, content_kind, "
-    "platform_id, platform_name, message_type, session_id, self_id, "
-    "group_id, sender_nickname, raw_timestamp, at_id, reply_id, forward_id, "
-    "persona_id, created_at, turn_id, send_status, relation_data, id, recalled_at, "
-    "deleted_at"
-)
-
-# 列位置索引（与 _SELECT_COLS 一一对应）
-# 0 role | 1 content | 2 user_id | 3 message_id | 4 pair_id
-# 5 llm_status | 6 content_kind | 7 platform_id | 8 platform_name | 9 message_type
-# 10 session_id | 11 self_id | 12 group_id | 13 sender_nickname | 14 raw_timestamp
-# 15 at_id | 16 reply_id | 17 forward_id | 18 persona_id | 19 created_at
-# 20 turn_id | 21 send_status | 22 relation_data | 23 id | 24 recalled_at
-# 25 deleted_at
-
-
-def _row_to_dict(r, tz: Optional[ZoneInfo] = None) -> dict:
-    """把 SELECT 出来的行映射为 dict，content_kind 解析回 list。
-
-    ``tz`` 给定时把 ``created_at`` 从 UTC naive 转为配置时区 naive 输出；同时提供
-    ``created_at_utc`` 明确的 UTC ISO 8601 字符串。None 则原样返回 UTC 字符串。
-    """
-    try:
-        kind_list = json.loads(r[6]) if r[6] else []
-    except (json.JSONDecodeError, TypeError):
-        # 静默降级成 [] 会让这一行从此在任何 content_kind 白名单（json_each）下都不匹配，
-        # 等于从上下文里悄悄消失。至少留一条带 record_id 的 DEBUG（类型的原值不是正文）。
-        logger.debug(
-            "[ChatMemory] content_kind 不是合法 JSON（record_id=%s）: %r",
-            r[23] if len(r) > 23 else "-", r[6],
-        )
-        kind_list = []
-    created_at_raw = r[19]
-    if tz is not None and created_at_raw:
-        try:
-            dt = datetime.fromisoformat(str(created_at_raw).replace("T", " "))
-            created_at_utc = dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-            created_at_str = (
-                dt.replace(tzinfo=timezone.utc)
-                .astimezone(tz)
-                .strftime("%Y-%m-%d %H:%M:%S")
-            )
-        except (ValueError, TypeError):
-            created_at_str = str(created_at_raw)
-            created_at_utc = str(created_at_raw)
-    else:
-        created_at_str = str(created_at_raw)
-        created_at_utc = str(created_at_raw)
-    relation_data = parse_relation_data(r[22])
-    content_template = r[1]
-    return {
-        "role": r[0],
-        "content": render_content_template(content_template, relation_data),
-        "content_template": content_template,
-        "user_id": r[2],
-        "message_id": r[3],
-        "pair_id": r[4],
-        "llm_status": r[5],
-        "content_kind": kind_list,
-        "platform_id": r[7],
-        "platform_name": r[8],
-        "message_type": r[9],
-        "session_id": r[10],
-        "self_id": r[11],
-        "group_id": r[12],
-        "sender_nickname": r[13],
-        "raw_timestamp": r[14],
-        "at_id": r[15],
-        "reply_id": r[16],
-        "forward_id": r[17],
-        "persona_id": r[18],
-        "created_at": created_at_str,
-        # created_at 保持旧的配置时区 naive 字符串兼容；新调用方应使用明确 UTC 值。
-        "created_at_utc": created_at_utc,
-        "turn_id": r[20],
-        "send_status": r[21],
-        "relation_data": relation_data,
-        "record_id": int(r[23]),
-        # 撤回感知：非空表示该消息已被撤回（NULL=未撤回）
-        "recalled_at": r[24] if len(r) > 24 else None,
-        # 软删除（schema v7 加列；v8 加的是媒体归档的 content_hash）：
-        # 非空表示该行已被查询台标记删除（读路径默认已过滤）
-        "deleted_at": r[25] if len(r) > 25 else None,
-    }

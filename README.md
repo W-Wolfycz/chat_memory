@@ -1,10 +1,10 @@
-# ChatMemory 2.0
+# ChatMemory 2.1
 
 把群聊和私聊的每一条消息存下来，再让你的 Bot 用这份存档当上下文。
 
-从 1.x 的"每条消息按实例各存一份"，到 2.0 的"一条消息只存一份、三个 BOT 共享同一份事实"——这条合并存储的路拆过好几版设计、也踩过双写丢正文的坑，现在总算落地了。V2 上线。
+从 1.x 的"每条消息按实例各存一份"，到 2.0 的"一条消息只存一份、三个 BOT 共享同一份事实"，再到 2.1 的"只保留合并存储一套读写"——这条合并存储的路拆过好几版设计、也踩过双写丢正文的坑，现在只走一套表。
 
-- 版本 `2.0.2` ｜ 平台：NapCat（`aiocqhttp`）、`qq_official` ｜ AstrBot `>=4.16,<5`
+- 版本 `2.1.0` ｜ 平台：NapCat（`aiocqhttp`）、`qq_official` ｜ AstrBot `>=4.16,<5`
 - 仓库：<https://github.com/W-Wolfycz/chat_memory>
 
 ---
@@ -47,18 +47,18 @@ CM 要记录**你自己说了什么**——分段回复的每一段、平台改�
 
 ## 3. 从 1.x 升级
 
-**2.0.x 都处于「双写」阶段**（旧表和新表同时写）。它是从 1.x 过来的桥接版：
+**`2.1` 起只保留合并存储**：`chat_memory_records` / `chat_memory_tool_records` 不再建表、不再迁移、不再读写。
 
 ```
-1.x  ──升级──▶  2.0.x（双写开始计时）  ──等 7 天──▶  勾选切读  ──确认没问题──▶  2.1（停写旧表）
+1.x  ──▶  2.0.x（双写，旧表+新表同时写）  ──双写跑一段时间──▶  2.1（只写新表）
 ```
 
-- **不要跳过 2.0.x 直接升后续版本**：后续版本会停写旧表，而"双写满 7 天"这个窗口只在 2.0.x 里积累。跳过就永远凑不满条件，新表里也只是一段不完整的历史。
-- **推荐等切读生效（≥7 天）再往后升级**：先用旧表兜着跑几天，确认新表数据完整、查询台显示正常，再勾 `shadow_read`；切读稳定后再升后续版本。
-- 升级是自动的：加载时检测结构版本并迁移，**数据一行不丢**，消息行号与工具调用 id 都保持不变。
-- 双写期间磁盘占用会翻倍（两份数据），7 天后切读、后续版本停写旧表就会回落。
+- **从 1.x 直接升到 2.1 会丢一段历史**：2.1 不写旧表，合并存储里没有双写期之前的数据。要么先升 2.0.x 让双写跑一段时间，要么接受旧历史只在库里躺着、本插件不再读它。
+- 升级是自动的：加载时检测合并存储结构版本并迁移，消息行号不变。
+- **旧表不会自动删除**：`chat_memory_records` / `chat_memory_tool_records` 留在数据库文件里，占用空间但不影响运行，需要腾地方时自己用 SQLite 工具删掉。
+- 双写期间磁盘占用会翻倍（两份数据），2.1 停写旧表后不再增长。
 
-详细信息见 [CHANGELOG](CHANGELOG.md) 的 2.0.x 段。
+详细信息见 [CHANGELOG](CHANGELOG.md) 的 2.1.0 段。
 
 ---
 
@@ -67,7 +67,6 @@ CM 要记录**你自己说了什么**——分段回复的每一段、平台改�
 **只想存档，不碰上下文**（最省心）
 ```text
 context_takeover.enable = false
-shadow_read = false
 ```
 
 **让 CM 当唯一上下文源**（私聊/群聊各自记忆）
@@ -124,17 +123,12 @@ AstrBot → 插件 → ChatMemory，三个页面：
 - **一轮回复可以是多段**：同一轮的多段回复会按平台顺序拼回一句（查询台与上下文都是合并后的样子）。
 - **事件也有记录**：禁言、成员变动、撤回、戳一戳、表情回应等作为"事件行"存在，不当成谁说的话。
 
-旧的 1.x 表还在写，但只为"切读回退"服务；新功能一律用新表。
-
 ---
 
 ## 7. 常见问题
 
 **自己的回复在存档里显示不全 / 只有一段？**
 先看 §0 的回显有没有开；启动日志里没有"已订阅…回显"就是没开。
-
-**勾了切读，为什么没生效？**
-双写没满 7 天。启动日志会写还差几天；门槛是全局规则，勾选开关本身不绕过它。
 
 **查询台空白 / 打不开？**
 检查插件实时库路径是否存在；数据源被切成别的只读副本时写操作会禁用（只读仍可查）。
@@ -149,10 +143,10 @@ AstrBot → 插件 → ChatMemory，三个页面：
 
 ## 8. 已知限制
 
-1. **切读只覆盖双写之后**：切读后看不到 2.0.0 装上之前的历史（查询台仍能看到旧表段，两侧口径不同）。
+1. **看不到双写起点之前的历史**：合并存储从双写那天开始记，更早的记录留在旧表里，本插件不再读。
 2. **自己发言的形态依赖回显**：宽限内没认领到轮次的段只写物理行，这一轮会退回"草稿正文"（同一轮多段时按序拼接）。
-3. **上下文窗口是"最近 N 轮"**：超限后窗口左移，对模型侧的前缀缓存不是最优（改成块对齐窗口是下一步）。
-4. **旧表还没删**：2.0.0 双写，后续版本才停写并移除。
+3. **上下文窗口是"最近 N 轮"**：超限时按 `context_takeover.retain_ratio` 回退到块对齐的起点再补满，前缀缓存命中率约等于该比例；`100` 等于逐条裁剪。
+4. **旧表仍在库里**：`chat_memory_records` / `chat_memory_tool_records` 停用但不自动删除，需要腾空间时自己清理。
 
 ---
 
@@ -165,7 +159,6 @@ AstrBot → 插件 → ChatMemory，三个页面：
 | `max_content_length` | int | `0` | 单条正文落库上限（0＝不截断） |
 | `auto_cleanup_days` | int | `0` | 自动清理阈值（0＝不清理） |
 | `log_with_bot_id` | bool | `false` | 日志前缀加 `[platform:{platform_id}]` |
-| `shadow_read` | bool | `false` | 切读开关（受 7 天门槛约束） |
 | `sent_capture_history` | bool | `false` | 发送后拉群历史（回显的兜底） |
 | `context_takeover.enable` | bool | `false` | 接管上下文 |
 | `context_takeover.cross_session` | bool | `false` | 跨 UMO 取数 |
@@ -215,10 +208,10 @@ rounds = await cm.query_rounds(umo, cid, user_id="10001", limit_rounds=10)
 
 | 方法 | 读源 |
 |---|---|
-| `query_history` / `query_rounds` | 跟随 `shadow_read`（含 7 天门槛） |
-| `query_history_v2` / `query_rounds_v2` | 强制合并存储（对拍/灰度用） |
+| `query_history` / `query_rounds` | 合并存储（唯一读源） |
+| `query_history_v2` / `query_rounds_v2` | 与上一行等价（保留下来的显式入口，老调用方不必改） |
 | `build_takeover_contexts` | 复用接管配置拼上下文（不写库、不清原生历史） |
-| `get_shared_store_status` | 只读状态：`source` / `schema_version` / `dual_write_started_at` / `shadow_read_ready` |
+| `get_shared_store_status` | 只读状态：`schema_version` / `expected_schema_version` / `dual_write_started_at` |
 | `count_unrendered_tokens(text)` | **同步**：统计正文里残留的已知内部 token（`{"⟦CM_IMAGE": 2}`），空字典＝渲染干净 |
 
 四个查询方法都支持 `skip_recalled=True`：跳过被撤回的消息（默认 `False`，与旧版行为一致）。
@@ -269,6 +262,6 @@ SELECT msg_uid, platform_id, self_id, conversation_id, umo, role, platform_messa
 
 ### 9.7 版本与结构
 
-- 插件版本 `2.0.2`；合并存储结构线 `6`；旧表 `user_version = 8`（退役中）。
-- 结构变更走 `SHADOW_MIGRATIONS` 累积迁移，不丢弃重建；切读窗口 `dual_write_started_at` 随迁移保留。
-- 后续路线：停写旧表 → 删旧表与旧索引 → 去掉 `shadow_read` 开关与 7 天门槛 → 去掉查询台的双 id 偏移（`record_id = rowid + 1e9`）。
+- 插件版本 `2.1.0`；合并存储结构线 `6`。
+- 结构变更走 `SHADOW_MIGRATIONS` 累积迁移，不丢弃重建；起点时间 `dual_write_started_at` 随迁移保留。
+- 后续路线：删旧表与旧索引（本版只停用不删）→ 合并存储结构线继续演进。

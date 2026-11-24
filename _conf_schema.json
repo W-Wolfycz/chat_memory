@@ -17,12 +17,6 @@
     "default": false,
     "hint": "日志前缀附加实例 ID，多 Bot 环境便于定位；日志等级在 WebUI 插件详情页调整。"
   },
-  "shadow_read": {
-    "description": "读取改用合并存储（切读）",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后接管上下文与公开查询 API 都读合并存储（模型看到的是实际发出的分段拼接）；双写起点＝本版首次加载那一刻，跑满 7 天才生效（重启/重载不重置），读失败自动回退旧表。"
-  },
   "sent_capture_history": {
     "description": "发送后拉群历史（兜底通道）",
     "type": "bool",

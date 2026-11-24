@@ -10,11 +10,11 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import quote
 
 from astrbot.api import logger
 from quart import request
 
-from ..shared_store import SHADOW_SCHEMA_VERSION
 from .repository import ChatMemoryRepository, DatabaseUnavailableError
 
 
@@ -277,8 +277,6 @@ class ChatMemoryUiWebApi:
         kind = str(row.get("kind") or "")
         disposition = "attachment" if kind == "file" else "inline"
         if kind == "file":
-            from urllib.parse import quote
-
             disposition += f"; filename*=UTF-8''{quote(str(row.get('file_name') or ''))}"
         common = {
             "Content-Type": mime,
@@ -376,8 +374,9 @@ class ChatMemoryUiWebApi:
             return _error("导出失败（内部错误，详见服务端日志）", 500)
         try:
             await asyncio.to_thread(self._cleanup_exports)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - 清理失败不该让导出失败
+            # 静默 pass 会让导出目录无限增长（旧快照永不回收），而且没有任何痕迹。
+            logger.warning("[ChatMemoryUI] 旧导出快照清理失败: %s", type(exc).__name__)
         return _ok({"file_name": file_name, "size_bytes": int(size)})
 
     async def export_file(self, file_name):
@@ -391,7 +390,6 @@ class ChatMemoryUiWebApi:
             data = await asyncio.to_thread(path.read_bytes)
         except OSError:
             return _error("导出快照已过期或不存在", 404)
-        from urllib.parse import quote
 
         return (
             data,
@@ -407,14 +405,28 @@ class ChatMemoryUiWebApi:
         )
 
     def _cleanup_exports(self) -> None:
-        """清理超期的导出快照（尽力而为，失败静默）。"""
+        """清理超期的导出快照（尽力而为）。
+
+        逐文件的清理失败必须记下来：静默 ``continue`` 会让旧快照无限累积，
+        而导出端点每次都报成功——磁盘被吃满前没有任何痕迹。
+        """
         now = datetime.now().timestamp()
+        failures = 0
         for path in self.export_dir.glob("chat_memory_*.db"):
             try:
                 if now - path.stat().st_mtime > _EXPORT_RETENTION_SEC:
                     path.unlink(missing_ok=True)
-            except OSError:
-                continue
+            except OSError as exc:
+                failures += 1
+                logger.warning(
+                    "[ChatMemoryUI] 清理旧导出快照失败（%s）: %s",
+                    path.name,
+                    type(exc).__name__,
+                )
+        if failures:
+            logger.warning(
+                "[ChatMemoryUI] 旧导出快照清理未完成：%d 个文件清理失败", failures
+            )
 
     async def _apply_settings(
         self, database_path: str, immutable_fallback: bool
@@ -548,9 +560,8 @@ def _downscale_image(data: bytes, max_side: int = 512):
         return None
 
 
-# 视频内联播放的客户端大小闸门：超过此值的视频不再整段 fetch 成 blob
-# （几十 MB 的视频会让 dashboard 页面内存暴涨卡死），直接引导下载观看。
-_INLINE_PLAYBACK_MAX_BYTES = 32 * 1024 * 1024
+# 视频内联播放的大小闸门由 `_BASE64_MAX_BYTES`（16MB）承担：超过它的视频
+# 后端直接 413、前端提示「视频过大」并引导下载，不会再整段 fetch 成 blob。
 
 
 def _sniff_video_codec(path) -> str:

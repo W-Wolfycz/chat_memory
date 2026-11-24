@@ -1,3 +1,8 @@
+"""查询台（repository）读路径：合并存储投影、过滤、软删、媒体、损坏回退。
+
+2.1 起旧表不再参与读取，夹具只造合并存储表。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,120 +16,133 @@ from unittest.mock import patch
 
 from chat_memory.ui.repository import ChatMemoryRepository, DatabaseUnavailableError
 
-
-SCHEMA = """
-CREATE TABLE chat_memory_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    umo TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL DEFAULT '',
-    message_id TEXT,
-    pair_id TEXT,
-    llm_status TEXT NOT NULL DEFAULT '',
-    content_kind TEXT NOT NULL DEFAULT '[]',
-    platform_id TEXT,
-    platform_name TEXT,
-    message_type TEXT,
-    session_id TEXT,
-    self_id TEXT,
-    group_id TEXT,
-    sender_nickname TEXT,
-    raw_timestamp INTEGER,
-    at_id TEXT,
-    reply_id TEXT,
-    forward_id TEXT,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    persona_id TEXT,
-    turn_id TEXT,
-    send_status TEXT NOT NULL DEFAULT '',
-    relation_data TEXT,
-    recalled_at DATETIME
-)
+# 合并存储结构（2.1 起唯一存储）：查询台只读这几张表。
+SHADOW_DDL = """\
+CREATE TABLE IF NOT EXISTS chat_memory_shadow_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_memory_messages (
+    msg_uid TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, seq INTEGER NOT NULL,
+    platform_name TEXT NOT NULL, message_type TEXT NOT NULL, session_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL, sender_nickname TEXT NOT NULL DEFAULT '',
+    platform_timestamp INTEGER NOT NULL, content TEXT NOT NULL DEFAULT '',
+    content_kind TEXT NOT NULL DEFAULT '[]', relation_data TEXT, recalled_at DATETIME,
+    deleted_at DATETIME, platform_seq INTEGER, created_at DATETIME NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_memory_message_bots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, msg_uid TEXT NOT NULL,
+    platform_id TEXT NOT NULL, self_id TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL, umo TEXT NOT NULL, role TEXT NOT NULL,
+    platform_message_id TEXT, turn_id TEXT, llm_status TEXT NOT NULL DEFAULT '',
+    send_status TEXT NOT NULL DEFAULT '', persona_id TEXT, target_id TEXT,
+    raw_timestamp INTEGER, created_at DATETIME NOT NULL,
+    UNIQUE (msg_uid, platform_id, self_id, conversation_id));
 """
 
-
-TOOL_SCHEMA = """
-CREATE TABLE chat_memory_tool_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    umo TEXT NOT NULL,
-    conversation_id TEXT NOT NULL,
-    turn_id TEXT NOT NULL,
-    call_index INTEGER NOT NULL,
-    tool_name TEXT NOT NULL,
-    tool_args TEXT NOT NULL DEFAULT '',
-    tool_result TEXT NOT NULL DEFAULT '',
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-)
+TOOL_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS chat_memory_tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, msg_uid TEXT, umo TEXT NOT NULL,
+    conversation_id TEXT NOT NULL, turn_id TEXT NOT NULL, call_index INTEGER NOT NULL,
+    tool_name TEXT NOT NULL, tool_args TEXT NOT NULL DEFAULT '',
+    tool_result TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL,
+    deleted_at DATETIME, UNIQUE (turn_id, call_index));
 """
+
+MEDIA_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS chat_memory_media_archive (
+    media_id TEXT PRIMARY KEY, umo TEXT NOT NULL, conversation_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL, kind TEXT NOT NULL, file_name TEXT NOT NULL,
+    content_hash TEXT, ext TEXT NOT NULL, mime_type TEXT, size_bytes INTEGER NOT NULL,
+    created_at DATETIME NOT NULL);
+"""
+
+# 归档 id 必须是 32 位 hex（查询台只按这个形态查归档表）。
+MEDIA_ID_IMAGE = "a1" * 16
 
 
 def make_database(path: Path, include_tools: bool = True) -> None:
+    """造一份只有合并存储的库（与线上 2.1 形态一致）。"""
     connection = sqlite3.connect(path)
-    connection.execute(SCHEMA)
-    connection.execute(f"PRAGMA user_version = {6 if include_tools else 3}")
-    rows = [
-        (
-            "bot:FriendMessage:u1", "cid-a", "u1", "user",
-            "你好 ⟦CM_AT:0⟧", "m1", None, "llm_success", '["text"]',
-            "bot", "aiocqhttp", "FriendMessage", "u1", "bot-id", "", "Zulu-old",
-            1, None, None, None, "2026-08-10 01:00:00", "persona-a", "turn-a", "",
-            json.dumps({"v": 1, "mentions": [{"nickname": "Bob"}], "reply": None}, ensure_ascii=False),
-        ),
-        (
-            "bot:FriendMessage:u1", "cid-a", "u1", "assistant",
-            "你好，Alice", None, "m1", "llm_success", '["text"]',
-            "bot", "aiocqhttp", "FriendMessage", "u1", "bot-id", "", "Alpha-new",
-            2, None, None, None, "2026-08-10 01:00:01", "persona-a", "turn-a", "send_attempted", None,
-        ),
-        (
-            "bot:GroupMessage:g1", "cid-b", "u2", "user",
-            "只有图片", "m2", None, "", '["image"]',
-            "bot", "aiocqhttp", "GroupMessage", "g1", "bot-id", "g1", "Carol",
-            3, None, None, None, "2026-08-11 02:00:00", None, "turn-b", "", None,
-        ),
-        (
-            "bot:GroupMessage:g1", "cid-b", "u2", "assistant",
-            "主动消息", None, None, "proactive", '["text"]',
-            "bot", "aiocqhttp", "GroupMessage", "g1", "bot-id", "g1", "Carol",
-            4, None, None, None, "2026-08-12 03:00:00", None, "turn-c", "prepared", None,
-        ),
+    connection.executescript(SHADOW_DDL)
+    connection.executescript(MEDIA_SCHEMA)
+    connection.execute(
+        "INSERT INTO chat_memory_shadow_meta (key, value) VALUES ('schema_version', '6')"
+    )
+    connection.execute(
+        "INSERT INTO chat_memory_shadow_meta (key, value) "
+        "VALUES ('dual_write_started_at', '2025-01-01 00:00:00.000000')"
+    )
+    messages = [
+        # (msg_uid, seq, platform, mtype, session, sender, nick, ts, content,
+        #  kind, relation, created_at, platform_seq)
+        ("p:a1", 1, "aiocqhttp", "FriendMessage", "u1", "u1", "Zulu-old", 1,
+         "你好 ⟦CM_AT:0⟧", '["text"]',
+         json.dumps({"v": 1, "mentions": [{"user_id": "u2", "nickname": "Bob"}],
+                     "reply": {"resolution": "turn", "target_turn_id": "turn-b"}},
+                    ensure_ascii=False),
+         "2026-08-10 01:00:00", 1),
+        ("p:a2", 2, "aiocqhttp", "FriendMessage", "u1", "bot-id", "Alpha-new", 2,
+         "你好，Alice", '["text"]',
+         json.dumps({"v": 1, "reply": {"resolution": "snapshot",
+                                       "target_nickname": "快照昵称",
+                                       "fallback_text": "快照原文"}},
+                    ensure_ascii=False),
+         "2026-08-10 01:00:01", 2),
+        ("p:b1", 3, "aiocqhttp", "GroupMessage", "g1", "u2", "Carol", 3,
+         "只有图片", '["image"]',
+         json.dumps({"v": 1, "media": [
+             {"kind": "image", "id": MEDIA_ID_IMAGE},
+             {"kind": "file", "id": "not-hex32", "name": "报告.pdf"},
+         ]}, ensure_ascii=False),
+         "2026-08-11 02:00:00", 3),
+        ("p:c1", 4, "aiocqhttp", "GroupMessage", "g1", "bot-id", "Carol", 4,
+         "主动消息", '["text"]', None, "2026-08-12 03:00:00", 4),
     ]
     connection.executemany(
-        """
-        INSERT INTO chat_memory_records (
-            umo, conversation_id, user_id, role, content, message_id, pair_id,
-            llm_status, content_kind, platform_id, platform_name, message_type,
-            session_id, self_id, group_id, sender_nickname, raw_timestamp,
-            at_id, reply_id, forward_id, created_at, persona_id, turn_id,
-            send_status, relation_data
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        rows,
+        "INSERT INTO chat_memory_messages (msg_uid, fingerprint, seq, platform_name, "
+        "message_type, session_id, sender_id, sender_nickname, platform_timestamp, "
+        "content, content_kind, relation_data, created_at, platform_seq) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(m[0], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10],
+          m[11], m[12]) for m in messages],
+    )
+    bots = [
+        # (msg_uid, umo, cid, role, mid, turn, llm, send, persona, created_at)
+        ("p:a1", "bot:FriendMessage:u1", "cid-a", "user", "m1", "turn-a",
+         "llm_success", "", "persona-a", "2026-08-10 01:00:00"),
+        ("p:a2", "bot:FriendMessage:u1", "cid-a", "assistant", None, "turn-a",
+         "llm_success", "send_attempted", "persona-a", "2026-08-10 01:00:01"),
+        ("p:b1", "bot:GroupMessage:g1", "cid-b", "user", "m2", "turn-b", "", "",
+         None, "2026-08-11 02:00:00"),
+        ("p:c1", "bot:GroupMessage:g1", "cid-b", "assistant", None, "turn-c",
+         "proactive", "prepared", None, "2026-08-12 03:00:00"),
+    ]
+    connection.executemany(
+        "INSERT INTO chat_memory_message_bots (msg_uid, platform_id, self_id, "
+        "conversation_id, umo, role, platform_message_id, turn_id, llm_status, "
+        "send_status, persona_id, raw_timestamp, created_at) "
+        "VALUES (?, 'bot', 'bot-id', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        [(b[0], b[2], b[1], b[3], b[4], b[5], b[6], b[7], b[8], b[9])
+         for b in bots],
+    )
+    # 媒体归档行：图片已归档（用于断言 media_view 的归档字段），file 那条故意不归档。
+    connection.execute(
+        "INSERT INTO chat_memory_media_archive (media_id, umo, conversation_id, "
+        "turn_id, kind, file_name, ext, mime_type, size_bytes, created_at) "
+        "VALUES (?, 'bot:GroupMessage:g1', 'cid-b', 'turn-b', 'image', "
+        "'202608/cat.jpg', 'jpg', 'image/jpeg', 12345, '2026-08-11 02:00:05')",
+        (MEDIA_ID_IMAGE,),
     )
     if include_tools:
         connection.execute(TOOL_SCHEMA)
         connection.executemany(
-            """
-            INSERT INTO chat_memory_tool_records (
-                umo, conversation_id, turn_id, call_index, tool_name,
-                tool_args, tool_result, created_at
-            ) VALUES (?,?,?,?,?,?,?,?)
-            """,
+            "INSERT INTO chat_memory_tool_calls (msg_uid, umo, conversation_id, "
+            "turn_id, call_index, tool_name, tool_args, tool_result, created_at) "
+            "VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (
-                    "bot:FriendMessage:u1", "cid-a", "turn-a", 1, "draw",
-                    '{"prompt": "猫"}', "任务 x 已创建", "2026-08-10 01:00:02",
-                ),
-                (
-                    "bot:FriendMessage:u1", "cid-a", "turn-a", 2, "query",
-                    "{}", "运行中：任务 x", "2026-08-10 01:00:04",
-                ),
-                (
-                    "bot:GroupMessage:g1", "cid-b", "turn-b", 1, "draw",
-                    '{"prompt": "狗"}', "第二任务已创建", "2026-08-11 02:00:02",
-                ),
+                ("bot:FriendMessage:u1", "cid-a", "turn-a", 1, "draw",
+                 '{"prompt": "猫"}', "任务 x 已创建", "2026-08-10 01:00:02"),
+                ("bot:FriendMessage:u1", "cid-a", "turn-a", 2, "query",
+                 "{}", "运行中：任务 x", "2026-08-10 01:00:04"),
+                ("bot:GroupMessage:g1", "cid-b", "turn-b", 1, "draw",
+                 '{"prompt": "狗"}', "第二任务已创建", "2026-08-11 02:00:02"),
             ],
         )
     connection.commit()
@@ -147,208 +165,20 @@ class RepositoryTestCase(unittest.TestCase):
         self.repository.close()
         self.temp_dir.cleanup()
 
-    def test_overview_and_health(self):
-        # 小节：概览与健康检查（含工具表与工具计数）
-        overview = asyncio.run(self.repository.overview())
-        self.assertEqual(overview["summary"]["total_records"], 4)
-        self.assertEqual(overview["summary"]["total_conversations"], 2)
-        self.assertEqual(overview["summary"]["total_users"], 2)
-        self.assertEqual(overview["database"]["user_version"], 6)
-        self.assertEqual(overview["database"]["mode"], "wal_aware")
-        self.assertTrue(overview["database"]["tool_table_present"])
-        self.assertTrue(overview["tools"]["present"])
-        self.assertEqual(overview["tools"]["total_calls"], 3)
-        self.assertEqual(overview["tools"]["tool_names"]["draw"], 2)
-
-        health = asyncio.run(self.repository.health())
-        self.assertTrue(health["healthy"])
-        self.assertEqual(health["total_records"], 4)
-
-        # 小节：media 归档概览（无表 → 有表 + 行数/字节统计）
-        path = Path(self.temp_dir.name) / "media_ov.db"
-        make_database(path)
-        repo = ChatMemoryRepository(
-            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
-        )
-        overview = asyncio.run(repo.overview())
-        self.assertFalse(overview["media"]["present"])
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "CREATE TABLE chat_memory_media_archive ("
-            "media_id TEXT PRIMARY KEY, umo TEXT NOT NULL, "
-            "conversation_id TEXT NOT NULL, turn_id TEXT NOT NULL, "
-            "kind TEXT NOT NULL, file_name TEXT NOT NULL, ext TEXT NOT NULL, "
-            "mime_type TEXT, size_bytes INTEGER NOT NULL, created_at DATETIME NOT NULL)"
-        )
-        connection.execute(
-            "INSERT INTO chat_memory_media_archive VALUES (?,?,?,?,?,?,?,?,?,?)",
-            ("ab" * 16, "umo_demo", "cid_demo", "turn_demo", "voice",
-             "ab" * 16 + ".amr", "amr", "audio/amr", 2048, "2026-08-11 02:00:00"),
-        )
-        connection.commit()
-        connection.close()
-        overview = asyncio.run(repo.overview())
-        self.assertTrue(overview["media"]["present"])
-        self.assertEqual(overview["media"]["total_files"], 1)
-        self.assertEqual(overview["media"]["total_bytes"], 2048)
-
-    def test_tool_records(self):
-        # 小节：按名称/轮次/范围过滤工具记录
-        result = asyncio.run(
-            self.repository.tool_records(
-                {"tool_name": "draw", "page": 1, "page_size": 20}
-            )
-        )
-        self.assertEqual(result["total"], 2)
-        self.assertEqual(
-            {item["tool_name"] for item in result["items"]}, {"draw"}
-        )
-        first = result["items"][0]
-        self.assertEqual(first["tool_args"], '{"prompt": "狗"}')
-        self.assertEqual(first["created_at"], "2026-08-11 10:00:02")
-
-        # turn_id 精确搜索已取消：按 BOT + QQ 号筛更符合人的用法
-        by_bot = asyncio.run(
-            self.repository.tool_records(
-                {"platform_id": "bot", "session_id": "u1", "page_size": 50}
-            )
-        )
-        self.assertEqual([item["call_index"] for item in by_bot["items"]], [2, 1])
-
-        scoped = asyncio.run(
-            self.repository.tool_records(
-                {"umo": "bot:GroupMessage:g1", "conversation_id": "cid-b",
-                 "page_size": 50}
-            )
-        )
-        self.assertEqual(scoped["total"], 1)
-
-        # 小节：无工具表的旧库降级为空结果
-        legacy_path = Path(self.temp_dir.name) / "legacy.db"
-        make_database(legacy_path, include_tools=False)
-        legacy_repo = ChatMemoryRepository(
-            legacy_path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
-        )
-        overview = asyncio.run(legacy_repo.overview())
-        self.assertFalse(overview["tools"]["present"])
-        self.assertFalse(overview["database"]["tool_table_present"])
-        result = asyncio.run(legacy_repo.tool_records({"page_size": 20}))
-        self.assertEqual(result["total"], 0)
-        self.assertEqual(result["items"], [])
-
-    def test_corrupt_database_fallback(self):
-        # 小节：WAL 损坏时 immutable 回退并报告 main_snapshot
-        original_connect = self.repository._connect
-
-        def fake_connect(*, immutable: bool):
-            if not immutable:
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            return original_connect(immutable=True)
-
-        with patch.object(self.repository, "_connect", side_effect=fake_connect):
-            result = asyncio.run(self.repository.overview())
-        self.assertEqual(result["database"]["mode"], "main_snapshot")
-        self.assertIn("WAL/SHM", result["database"]["warning"])
-
-        # 小节：禁用回退后直接失败
-        repository = ChatMemoryRepository(
-            self.db_path, allow_immutable_fallback=False
-        )
-
-        def fail_connect(*, immutable: bool):
-            raise sqlite3.DatabaseError("database disk image is malformed")
-
-        with patch.object(repository, "_connect", side_effect=fail_connect):
-            with self.assertRaisesRegex(DatabaseUnavailableError, "不可读"):
-                asyncio.run(repository.health())
-
-    def test_reply_view_turn_and_snapshot(self):
-        path = Path(self.temp_dir.name) / "reply.db"
-        make_database(path)
-        connection = sqlite3.connect(path)
-        connection.execute(
-            """
-            INSERT INTO chat_memory_records (
-                umo, conversation_id, user_id, role, content, llm_status,
-                content_kind, platform_id, created_at, turn_id, sender_nickname,
-                send_status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                "bot:FriendMessage:u1", "cid-reply", "u2", "user", "被引用的那句话",
-                "", '["text"]', "bot", "2026-08-13 05:00:00", "turn-target", "目标昵称", "",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO chat_memory_records (
-                umo, conversation_id, user_id, role, content, llm_status,
-                content_kind, platform_id, created_at, turn_id, relation_data,
-                send_status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                "bot:FriendMessage:u1", "cid-reply", "u1", "user", "我同意",
-                "", '["text"]', "bot", "2026-08-13 05:01:00", "turn-reply",
-                json.dumps({"v": 1, "mentions": [], "reply": {
-                    "resolution": "turn", "target_turn_id": "turn-target",
-                    "target_role": "user"}}, ensure_ascii=False),
-                "",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO chat_memory_records (
-                umo, conversation_id, user_id, role, content, llm_status,
-                content_kind, platform_id, created_at, turn_id, relation_data,
-                send_status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                "bot:FriendMessage:u1", "cid-reply", "u1", "user", "快照回复",
-                "", '["text"]', "bot", "2026-08-13 05:02:00", "turn-snap",
-                json.dumps({"v": 1, "mentions": [], "reply": {
-                    "resolution": "snapshot", "target_nickname": "快照昵称",
-                    "fallback_text": "快照原文"}}, ensure_ascii=False),
-                "",
-            ),
-        )
-        connection.commit()
-        connection.close()
-
-        repo = ChatMemoryRepository(
-            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
-        )
-        result = asyncio.run(
-            repo.query({"umo": "bot:FriendMessage:u1", "page_size": 50})
-        )
-        by_turn = {item["turn_id"]: item for item in result["items"]}
-        turn_view = by_turn["turn-reply"]["reply_view"]
-        self.assertEqual(turn_view["resolution"], "turn")
-        self.assertEqual(turn_view["target"], "目标昵称")
-        self.assertEqual(turn_view["text"], "被引用的那句话")
-        snap_view = by_turn["turn-snap"]["reply_view"]
-        self.assertEqual(snap_view["resolution"], "snapshot")
-        self.assertEqual(snap_view["target"], "快照昵称")
-        self.assertEqual(snap_view["text"], "快照原文")
-        # 无 relation 的记录 reply_view 为 None
-        self.assertIsNone(by_turn["turn-a"]["reply_view"])
-
-        # 详情接口同样返回 reply_view(单条目标查询)
-        detail = asyncio.run(repo.record(result["items"][0]["record_id"]))
-        self.assertIn("reply_view", detail["record"])
-
     def test_soft_delete_filter_and_restore(self):
-        # 小节：软删除（schema v8）——默认只看未删除、三态筛选、单条软删除/恢复
+        """守的静默失效：软删除三态筛选与写入口。
+
+        ① 默认列表若不排除 `deleted_at` 非空的行，被删的消息照旧出现——用户以为删了；
+        ② 工具行 id 没有合并存储的 `_MERGED_ID_OFFSET` 偏移，写路径若照记录那套减偏移
+           去查会算成负 rowid，删除按钮永远报"记录不存在"；
+        ③ 写入口只应对实时库开放，快照库上能改就等于改了个假象。
+        """
         path = Path(self.temp_dir.name) / "soft_delete.db"
         make_database(path)
         connection = sqlite3.connect(path)
         connection.execute(
-            "ALTER TABLE chat_memory_records ADD COLUMN deleted_at DATETIME"
-        )
-        connection.execute(
-            "UPDATE chat_memory_records SET deleted_at = '2026-08-12 00:00:00' "
-            "WHERE turn_id = 'turn-b'"
+            "UPDATE chat_memory_messages SET deleted_at = '2026-08-12 00:00:00' "
+            "WHERE msg_uid = 'p:b1'"
         )
         connection.commit()
         connection.close()
@@ -358,10 +188,11 @@ class RepositoryTestCase(unittest.TestCase):
             writable_path=path,
         )
 
+        # 默认（缺省/visible）只看未删除；all 全看；deleted 只看已删除
         result = asyncio.run(repo.query({"page_size": 50}))
         self.assertEqual(result["total"], 3)
         self.assertNotIn("turn-b", [item["turn_id"] for item in result["items"]])
-        # 默认（缺省/visible）只看未删除；all 全看；deleted 只看已删除
+
         result = asyncio.run(repo.query({"page_size": 50, "deleted_state": "visible"}))
         self.assertEqual(result["total"], 3)
 
@@ -374,7 +205,6 @@ class RepositoryTestCase(unittest.TestCase):
 
         result = asyncio.run(repo.query({"page_size": 50, "deleted_state": "deleted"}))
         self.assertEqual([item["turn_id"] for item in result["items"]], ["turn-b"])
-        # 未知取值 → 400 语义（ValueError）
         with self.assertRaises(ValueError):
             asyncio.run(repo.query({"page_size": 50, "deleted_state": "unknown"}))
 
@@ -386,33 +216,28 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(health["total_records"], 3)
         self.assertEqual(health["deleted_records"], 1)
 
-        # 恢复（写入口）：writable 时成功，记录重新进入默认列表
+        # 恢复（写入口）：记录重新进入默认列表；重复恢复 / 不存在的 ID → ValueError
         restored = asyncio.run(repo.restore_record(by_turn["turn-b"]["record_id"]))
         self.assertFalse(restored["deleted"])
-        result = asyncio.run(repo.query({"page_size": 50}))
-        self.assertEqual(result["total"], 4)
-        # 重复恢复 / 不存在的 ID → ValueError
+        self.assertEqual(asyncio.run(repo.query({"page_size": 50}))["total"], 4)
         with self.assertRaises(ValueError):
             asyncio.run(repo.restore_record(by_turn["turn-b"]["record_id"]))
         with self.assertRaises(ValueError):
-            asyncio.run(repo.restore_record(999999))
+            asyncio.run(repo.restore_record(1_000_000_999))
 
-        # 单条软删除（写入口）：标记后立刻从默认列表消失，并可再恢复
+        # 单条软删除：标记后立刻从默认列表消失，并可再恢复
         marked = asyncio.run(
             repo.soft_delete_record(by_turn["turn-a"]["record_id"])
         )
         self.assertTrue(marked["deleted"])
         self.assertTrue(marked["deleted_at"])
-        self.assertEqual(
-            asyncio.run(repo.query({"page_size": 50}))["total"], 3
-        )
+        self.assertEqual(asyncio.run(repo.query({"page_size": 50}))["total"], 3)
         self.assertEqual(
             [item["turn_id"] for item in asyncio.run(
                 repo.query({"page_size": 50, "deleted_state": "deleted"})
             )["items"]],
             ["turn-a"],
         )
-        # 已软删的记录再次软删 → ValueError
         with self.assertRaises(ValueError):
             asyncio.run(repo.soft_delete_record(by_turn["turn-a"]["record_id"]))
         asyncio.run(repo.restore_record(by_turn["turn-a"]["record_id"]))
@@ -424,17 +249,11 @@ class RepositoryTestCase(unittest.TestCase):
         )
         self.assertFalse(readonly.writable)
         with self.assertRaises(PermissionError):
-            asyncio.run(readonly.restore_record(1))
+            asyncio.run(readonly.restore_record(1_000_000_001))
         with self.assertRaises(PermissionError):
-            asyncio.run(readonly.soft_delete_record(1))
+            asyncio.run(readonly.soft_delete_record(1_000_000_001))
 
-        # 工具调用表同一套逻辑：三态筛选 + 单条软删除/恢复（target=tool）
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "ALTER TABLE chat_memory_tool_records ADD COLUMN deleted_at DATETIME"
-        )
-        connection.commit()
-        connection.close()
+        # 工具调用表同一套逻辑（id 无偏移）：三态筛选 + 单条软删除/恢复
         tools = asyncio.run(repo.tool_records({"page": 1, "page_size": 20}))
         self.assertEqual(len(tools["items"]), 3)
         self.assertFalse(any(item["deleted"] for item in tools["items"]))
@@ -468,228 +287,255 @@ class RepositoryTestCase(unittest.TestCase):
         # 被软删的是最新一条（turn-b 的 draw）：draw 计数从 2 降到 1，query 不受影响
         self.assertEqual(overview["tools"]["tool_names"]["draw"], 1)
         self.assertEqual(overview["tools"]["tool_names"]["query"], 1)
-        # 恢复后回到可见列表
-        restored_tool = asyncio.run(
-            repo.restore_record(marked_tool["id"], "tool")
-        )
+        restored_tool = asyncio.run(repo.restore_record(marked_tool["id"], "tool"))
         self.assertFalse(restored_tool["deleted"])
         self.assertEqual(
             len(asyncio.run(repo.tool_records({"page": 1, "page_size": 20}))["items"]),
             3,
         )
-        # 未知 target → ValueError
         with self.assertRaises(ValueError):
             asyncio.run(repo.soft_delete_record(1, "unknown"))
 
-        # 旧库（无 deleted_at 列）：过滤条件自动降级，不报错也不误判
-        legacy = Path(self.temp_dir.name) / "legacy_no_soft.db"
-        make_database(legacy)
-        repo_legacy = ChatMemoryRepository(
-            legacy, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
+    def test_reply_view_turn_and_snapshot(self):
+        """守的静默失效：引用块解析错会静默降级成「普通消息」。
+
+        ① `resolution="turn"` 走目标轮次查询，查不到目标时昵称回落「未知成员」、
+           正文变空——卡片长得和"这条没引用别人"一模一样，只有对照过才看得出引用丢了；
+        ② `resolution="snapshot"` 直接取快照字段，取错字段会显示空引用原文；
+        ③ 两条路径的 `target` / `text` 都必须断言到实际值（只查键存在等于没测）。
+        """
+        page = asyncio.run(self.repository.query({"page_size": 50}))
+        # turn-a 有两条（user + assistant），按 role 区分
+        turn_rows = [i for i in page["items"] if i["turn_id"] == "turn-a"]
+        self.assertEqual(len(turn_rows), 2)
+        turn_row = next(i for i in turn_rows if i["role"] == "user")
+
+        self.assertEqual(turn_row["reply_view"], {
+            "resolution": "turn",
+            # turn-b 的 user 行是 p:b1（Carol），内容"只有图片"
+            "target": "Carol",
+            "text": "只有图片",
+        })
+
+        snapshot_row = next(i for i in page["items"] if i["turn_id"] == "turn-a"
+                            and i["role"] == "assistant")
+        self.assertEqual(snapshot_row["reply_view"], {
+            "resolution": "snapshot",
+            "target": "快照昵称",
+            "text": "快照原文",
+        })
+
+        # 没有 reply 结构的记录不得凭空造出引用块
+        proactive = next(i for i in page["items"] if i["turn_id"] == "turn-c")
+        self.assertIsNone(proactive["reply_view"])
+
+        # 详情必须与列表同一口径（否则列表有引用、点进去变没有）
+        detail = asyncio.run(self.repository.record(turn_row["record_id"]))
+        self.assertEqual(detail["record"]["reply_view"]["target"], "Carol")
+        self.assertEqual(detail["record"]["reply_view"]["text"], "只有图片")
+
+        # 目标轮次不存在 → 「未知成员」+ 空原文（这是"引用解析失败"的可见形态，
+        # 不是静默空值；查询本身抛错的情况由 DatabaseUnavailableError 承担）
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            "UPDATE chat_memory_messages SET relation_data = ? WHERE msg_uid = 'p:a1'",
+            (json.dumps({"v": 1, "reply": {"resolution": "turn",
+                                           "target_turn_id": "turn-missing"}}),),
         )
-        legacy_result = asyncio.run(repo_legacy.query({"page_size": 50}))
-        self.assertEqual(legacy_result["total"], 4)
-        legacy_tools = asyncio.run(repo_legacy.tool_records({"page": 1, "page_size": 20}))
-        self.assertEqual(len(legacy_tools["items"]), 3)
-        self.assertFalse(any(item["deleted"] for item in legacy_tools["items"]))
-        self.assertFalse(any(item["deleted"] for item in legacy_result["items"]))
-        self.assertEqual(
-            asyncio.run(repo_legacy.overview())["summary"]["deleted_records"], 0
+        connection.commit()
+        connection.close()
+        repo = ChatMemoryRepository(
+            self.db_path,
+            timezone=timezone(timedelta(hours=8), name="Asia/Shanghai"),
         )
+        try:
+            orphan = asyncio.run(repo.query({"page_size": 50}))
+            view = next(i for i in orphan["items"] if i["turn_id"] == "turn-a"
+                        and i["role"] == "user")
+            self.assertEqual(view["reply_view"]["target"], "未知成员")
+            self.assertEqual(view["reply_view"]["text"], "")
+        finally:
+            repo.close()
 
     def test_media_view_and_archive(self):
-        # 小节：归档 join（archived/mime/size/name/poke_label）+ media_file 单查
-        path = Path(self.temp_dir.name) / "media.db"
-        make_database(path)
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "CREATE TABLE chat_memory_media_archive ("
-            "media_id TEXT PRIMARY KEY, umo TEXT NOT NULL, "
-            "conversation_id TEXT NOT NULL, turn_id TEXT NOT NULL, "
-            "kind TEXT NOT NULL, file_name TEXT NOT NULL, ext TEXT NOT NULL, "
-            "mime_type TEXT, size_bytes INTEGER NOT NULL, created_at DATETIME NOT NULL)"
-        )
-        media_id = "ab" * 16
-        connection.execute(
-            "INSERT INTO chat_memory_media_archive VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                media_id, "bot:GroupMessage:g1", "cid-b", "turn-b", "image",
-                f"{media_id}.jpg", "jpg", "image/jpeg", 12345, "2026-08-11 02:00:00",
-            ),
-        )
-        relation = json.dumps({
-            "v": 1, "mentions": [],
-            "media": [
-                {"kind": "image", "id": media_id},
-                {"kind": "file", "id": "cd" * 16, "name": "课程表.pdf"},
-                {"kind": "poke", "id": "10001", "type": "666"},
-                {"kind": "emoji", "id": "123"},
-            ],
-        }, ensure_ascii=False)
-        connection.execute(
-            "UPDATE chat_memory_records SET relation_data = ? WHERE turn_id = ?",
-            (relation, "turn-b"),
-        )
-        connection.commit()
-        connection.close()
+        """守的静默失效：归档 join 错会让已归档媒体显示成「未归档」。
 
-        repo = ChatMemoryRepository(
-            path, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
-        )
-        result = asyncio.run(
-            repo.query({"umo": "bot:GroupMessage:g1", "page_size": 50})
-        )
-        by_turn = {item["turn_id"]: item for item in result["items"]}
-        view = by_turn["turn-b"]["media_view"]
-        self.assertEqual([item["kind"] for item in view],
-                         ["image", "file", "poke", "emoji"])
-        image = view[0]
+        后果是音视频的播放/下载入口整块消失、语音气泡被禁用，而卡片正文照旧，
+        页面上看不出是"查询坏了"还是"本来就没存文件"。
+        """
+        page = asyncio.run(self.repository.query({"page_size": 50}))
+        row = next(i for i in page["items"] if i["turn_id"] == "turn-b")
+        view = {item["kind"]: item for item in row["media_view"]}
+
+        # 已归档的图片：归档状态与元信息必须逐字段对上
+        image = view["image"]
         self.assertTrue(image["archived"])
-        self.assertEqual(image["media_id"], media_id)
+        self.assertEqual(image["media_id"], MEDIA_ID_IMAGE)
         self.assertEqual(image["mime"], "image/jpeg")
         self.assertEqual(image["size"], 12345)
-        # 未归档文件：archived=False，但 name 保留
-        file_item = view[1]
-        self.assertFalse(file_item["archived"])
-        self.assertEqual(file_item["name"], "课程表.pdf")
-        # poke 标签映射；未知类型显示原始编号
-        self.assertEqual(view[2]["poke_label"], "比心")
-        self.assertEqual(view[2]["id"], "10001")
-        # media_file 单查：命中与未命中
-        row = asyncio.run(repo.media_file(media_id))
-        self.assertEqual(row["kind"], "image")
+        self.assertEqual(image["file"], "202608/cat.jpg")
+        self.assertEqual(image["label"], "⟦图片⟧")
+
+        # 未归档的 file 条目：保持 archived=False，原始文件名不能丢
+        file_entry = view["file"]
+        self.assertFalse(file_entry["archived"])
+        self.assertEqual(file_entry["name"], "报告.pdf")
+        self.assertNotIn("media_id", file_entry)
+
+        # 媒体端点必须能按同一个 id 真取到归档行
+        fetched = asyncio.run(self.repository.media_file(MEDIA_ID_IMAGE))
+        self.assertEqual(fetched["media_id"], MEDIA_ID_IMAGE)
+        self.assertEqual(fetched["file_name"], "202608/cat.jpg")
+        self.assertEqual(fetched["size_bytes"], 12345)
         with self.assertRaises(ValueError):
-            asyncio.run(repo.media_file("ff" * 16))
+            asyncio.run(self.repository.media_file("b2" * 16))
 
-        # 小节：表缺失时 media_file 报 ValueError，详情仍带 media_view（未归档）
-        path2 = Path(self.temp_dir.name) / "media_detail.db"
-        make_database(path2)
-        connection = sqlite3.connect(path2)
-        media_id = "ab" * 16
-        relation = json.dumps({"v": 1, "mentions": [], "media": [
-            {"kind": "image", "id": media_id}]}, ensure_ascii=False)
-        connection.execute(
-            "UPDATE chat_memory_records SET relation_data = ? WHERE turn_id = ?",
-            (relation, "turn-b"),
-        )
-        connection.commit()
-        connection.close()
-        repo2 = ChatMemoryRepository(
-            path2, timezone=timezone(timedelta(hours=8), name="Asia/Shanghai")
-        )
-        with self.assertRaises(ValueError):
-            asyncio.run(repo2.media_file(media_id))
-        result = asyncio.run(repo2.query({"page_size": 50}))
-        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
-        detail = asyncio.run(repo2.record(item["record_id"]))
-        self.assertEqual(len(detail["record"]["media_view"]), 1)
-        self.assertFalse(detail["record"]["media_view"][0]["archived"])
 
-        # 小节：_render_content 的文件名占位与图片缩略图标记
-        from chat_memory.ui.repository import _render_content
-        rel = {"v": 1, "mentions": [], "reply": None, "media": [
-            {"kind": "file", "id": "cd" * 16, "name": "课程 表⟦x⟧.pdf"},
-            {"kind": "image", "id": media_id},
-        ]}
-        template = "看⟦CM_FILE:0⟧和⟦CM_IMAGE:1⟧"
-        assert _render_content(template, rel, ["text"]) == "看⟦课程 表x.pdf⟧和⟦图片⟧"
-        archived = {media_id: {"kind": "image"}}
-        rendered = _render_content(template, rel, ["text"], media_archive=archived)
-        assert rendered == f"看⟦课程 表x.pdf⟧和⟦CM_IMG:{media_id}⟧"
 
-        # 小节：system_event 详情内容渲染为自然语言句子（UI 纯文本、无 cm 标签）
-        from chat_memory.relation_codec import build_event_sentence
-        assert build_event_sentence({
-            "action": "群禁言", "detail": "10分钟",
-            "target": "长风", "operator": "小明",
-        }) == "长风 被 小明 禁言了 10分钟"
-        assert build_event_sentence({
-            "action": "撤回消息", "detail": "", "target": "", "operator": "",
-        }) == "撤回消息"
-        connection = sqlite3.connect(path)
-        event_relation = json.dumps({"v": 1, "mentions": [], "media": [],
-                                     "event": {"type": "ban", "action": "群禁言",
-                                               "detail": "10分钟",
-                                               "target": "长风",
-                                               "operator": "小明"}},
-                                    ensure_ascii=False)
-        connection.execute(
-            "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
-            "relation_data = ? WHERE turn_id = ?",
-            ('["event"]', "[群禁言 10分钟]", event_relation, "turn-b"),
-        )
-        connection.commit()
-        connection.close()
-        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
-                                         "page_size": 50}))
-        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
-        assert item["content"] == "长风 被 小明 禁言了 10分钟"
-        # 无 event 结构的旧记录保持原摘要文本
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "UPDATE chat_memory_records SET relation_data = NULL "
-            "WHERE turn_id = ?",
-            ("turn-b",),
-        )
-        connection.commit()
-        connection.close()
-        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
-                                         "page_size": 50}))
-        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
-        assert item["content"] == "[群禁言 10分钟]"
+    def test_read_failures_are_not_disguised_as_empty(self):
+        """守的静默失效：把 SQL 失败伪装成"没有数据"。
 
-        # 小节：纯图片消息——已归档输出缩略图标记，未归档保持 ⟦图片⟧ 占位
-        image_relation = json.dumps({"v": 1, "mentions": [], "media": [
-            {"kind": "image", "id": media_id}]}, ensure_ascii=False)
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
-            "relation_data = ? WHERE turn_id = ?",
-            ('["image"]', "[image]", image_relation, "turn-b"),
-        )
-        connection.commit()
-        connection.close()
-        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
-                                         "page_size": 50}))
-        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
-        assert item["content"] == f"⟦CM_IMG:{media_id}⟧"
-        # 未归档图片保持占位文本
-        unarchived = json.dumps({"v": 1, "mentions": [], "media": [
-            {"kind": "image", "id": "ff" * 16}]}, ensure_ascii=False)
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "UPDATE chat_memory_records SET relation_data = ? WHERE turn_id = ?",
-            (unarchived, "turn-b"),
-        )
-        connection.commit()
-        connection.close()
-        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
-                                         "page_size": 50}))
-        item = next(x for x in result["items"] if x["turn_id"] == "turn-b")
-        assert item["content"] == "⟦图片⟧"
+        每一条被吞掉都会让页面显示一个**看起来正常**的空结果，且与"真的没有数据"
+        无法区分：昵称全是号码、高级注解整块消失、persona 下拉变空、已归档媒体显示
+        未归档（播放/下载入口消失）、引用显示「未知成员」、工具调用显示无归属、
+        工具表缺表显示零次调用。全部必须变成可诊断的不可用。
+        """
+        cases = [
+            # (标签, 建表语句, 需要断言的错因关键词)
+            (
+                "昵称补全",
+                "CREATE TABLE chat_memory_messages (sender_id TEXT, content TEXT);",
+            ),
+            (
+                "高级注解",
+                "CREATE TABLE chat_memory_message_bots ("
+                " msg_uid TEXT, turn_id TEXT, llm_status TEXT, persona_id TEXT,"
+                " role TEXT);",
+            ),
+        ]
 
-        # 小节：事件子类过滤（event_type → relation_data.event.type）
-        ban_relation = json.dumps({"v": 1, "mentions": [], "media": [],
-                                   "event": {"type": "ban", "action": "群禁言",
-                                             "detail": "10分钟",
-                                             "target": "长风",
-                                             "operator": "小明"}},
-                                  ensure_ascii=False)
-        connection = sqlite3.connect(path)
-        connection.execute(
-            "UPDATE chat_memory_records SET content_kind = ?, content = ?, "
-            "relation_data = ? WHERE turn_id = ?",
-            ('["event"]', "[群禁言 10分钟]", ban_relation, "turn-b"),
+        def broken(ddl):
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.executescript(ddl)
+            return connection
+
+        # 1) 昵称补全：sender_nickname 列不可用
+        connection = broken(cases[0][1])
+        try:
+            with self.assertRaisesRegex(DatabaseUnavailableError, "昵称"):
+                self.repository._fetch_sender_names(
+                    connection, [{"sender_id": "10001", "sender_nickname": "10001"}],
+                )
+        finally:
+            connection.close()
+
+        # 2) 高级注解：send_status 列不可用
+        connection = broken(cases[1][1])
+        try:
+            with self.assertRaisesRegex(DatabaseUnavailableError, "注解"):
+                self.repository._advanced_notes(
+                    connection, [{"msg_uid": "p:a1"}], "persona-a",
+                )
+        finally:
+            connection.close()
+
+        # 3) persona 候选：先过可用性校验，再让内层查询失败
+        connection = broken(
+            "CREATE TABLE chat_memory_shadow_meta (key TEXT PRIMARY KEY, value TEXT);"
+            "INSERT INTO chat_memory_shadow_meta VALUES ('schema_version', '6');"
+            "CREATE TABLE chat_memory_messages (msg_uid TEXT);"
+            "CREATE TABLE chat_memory_message_bots (msg_uid TEXT, umo TEXT);"
         )
-        connection.commit()
-        connection.close()
-        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
-                                         "event_type": "ban", "page_size": 50}))
-        assert any(x["turn_id"] == "turn-b" for x in result["items"])
-        result = asyncio.run(repo.query({"umo": "bot:GroupMessage:g1",
-                                         "event_type": "recall", "page_size": 50}))
-        assert not any(x["turn_id"] == "turn-b" for x in result["items"])
-        with self.assertRaises(ValueError):
-            asyncio.run(repo.query({"event_type": "not_a_type"}))
-        # reaction 是合法子类（NapCat 表情回应），不抛异常即可
-        asyncio.run(repo.query({"event_type": "reaction", "page_size": 50}))
+        try:
+            with self.assertRaisesRegex(DatabaseUnavailableError, "persona"):
+                self.repository._persona_facets_query(connection)
+        finally:
+            connection.close()
+
+        # 4) 媒体归档：归档表缺列
+        connection = broken("CREATE TABLE chat_memory_media_archive (media_id TEXT);")
+        try:
+            relation = json.dumps({"v": 1, "media": [
+                {"kind": "image", "id": MEDIA_ID_IMAGE},
+            ]})
+            with self.assertRaisesRegex(DatabaseUnavailableError, "归档"):
+                self.repository._fetch_media_archive(
+                    connection, [{"relation_data": relation}],
+                )
+        finally:
+            connection.close()
+
+        # 5) 引用目标：messages.content 不可用
+        connection = broken(
+            "CREATE TABLE chat_memory_message_bots ("
+            " msg_uid TEXT, turn_id TEXT, role TEXT, umo TEXT);"
+            "CREATE TABLE chat_memory_messages (msg_uid TEXT, content_kind TEXT,"
+            " relation_data TEXT, sender_nickname TEXT, created_at TEXT);"
+        )
+        try:
+            relation = json.dumps({"v": 1, "reply": {
+                "resolution": "turn", "target_turn_id": "t1",
+            }})
+            with self.assertRaisesRegex(DatabaseUnavailableError, "引用"):
+                self.repository._fetch_reply_targets(
+                    connection,
+                    [{"umo": "bot:GroupMessage:g1", "relation_data": relation}],
+                )
+        finally:
+            connection.close()
+
+        # 6) 工具归属：message_bots.self_id 不可用
+        connection = broken(
+            "CREATE TABLE chat_memory_message_bots ("
+            " umo TEXT, turn_id TEXT, persona_id TEXT);"
+        )
+        try:
+            with self.assertRaisesRegex(DatabaseUnavailableError, "归属"):
+                self.repository._fetch_tool_callers(
+                    connection,
+                    [{"umo": "bot:FriendMessage:u1", "turn_id": "turn-a"}],
+                )
+        finally:
+            connection.close()
+
+        # 7) 工具表整体缺失：契约里它是必需的，不能被报成"零次调用"
+        path = Path(self.temp_dir.name) / "no_tools.db"
+        make_database(path, include_tools=False)
+        repo = ChatMemoryRepository(
+            path,
+            writable_path=path,
+            timezone=timezone(timedelta(hours=8), name="Asia/Shanghai"),
+        )
+        try:
+            with self.assertRaisesRegex(DatabaseUnavailableError, "工具调用表"):
+                asyncio.run(repo.tool_records({"page": 1, "page_size": 20}))
+        finally:
+            repo.close()
+
+    def test_corrupt_database_fallback(self):
+        # 小节：WAL 损坏时 immutable 回退并报告 main_snapshot
+        original_connect = self.repository._connect
+
+        def fake_connect(*, immutable: bool):
+            if not immutable:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return original_connect(immutable=True)
+
+        with patch.object(self.repository, "_connect", side_effect=fake_connect):
+            result = asyncio.run(self.repository.overview())
+        self.assertEqual(result["database"]["mode"], "main_snapshot")
+        self.assertIn("WAL/SHM", result["database"]["warning"])
+
+        # 小节：禁用回退后直接失败
+        repository = ChatMemoryRepository(
+            self.db_path, allow_immutable_fallback=False
+        )
+
+        def fail_connect(*, immutable: bool):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        with patch.object(repository, "_connect", side_effect=fail_connect):
+            with self.assertRaisesRegex(DatabaseUnavailableError, "不可读"):
+                asyncio.run(repository.health())
+
